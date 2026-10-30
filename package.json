@@ -1,0 +1,20 @@
+{
+  "name": "renata-crp-whatsapp-order-bot",
+  "version": "2.0.0",
+  "description": "Auto WhatsApp Group CRP Order Tracker & Google Sheets Sync with Fuzzy Spell-Correction, Unsend/Delete Removal, and Render Free-Tier Cloud Session Persistence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --max-old-space-size=400 server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^140.0.0",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4"
+  }
+}
