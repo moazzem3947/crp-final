@@ -1,18 +1,19 @@
 /**
  * ============================================================================
- * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER & AUTO SYNC
+ * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER (v3.0 PRO)
  * ============================================================================
- * Features:
- * 1. Baileys Multi-Device WhatsApp Web Client (Lightweight <80MB RAM for Render Free Tier)
- * 2. Web Dashboard with Live QR Scanner & 1-Click WhatsApp Group Selector
- * 3. Permanent Cloud Session & Group Config Persistence inside Google Sheets (_Bot_State)
- *    -> Never lose WhatsApp login or group selection even when Render restarts!
- * 4. Built-in Master Data of all 78 CRP Products & 46 Delivery Assistants (DAs)
- * 5. Multi-Layer Fuzzy Spell-Checker & Variant Disambiguator (handles severe typos)
- * 6. Unsend ("Delete for Everyone") & Message Edit Auto-Sync:
- *    -> Automatically removes unsent orders from Live_Orders & logs to Deleted_Unsent_Log
- *    -> Automatically updates edited messages in Live_Orders
- * 7. Render Free-Tier Keep-Alive Self-Pinger (prevents 15-minute idle spin-down)
+ * What's New in v3.0:
+ * 1. Exact TRADE PRICE for all 78+ CRP Products from "Current Pricie List (30-10-26).xlsx"
+ *    + Auto-migration of existing Google Sheet Product_Wise_Summary & Live_Orders prices!
+ * 2. Handwritten / Paper Photo Order OCR (Image-to-Order) strictly restricted to:
+ *    -> +8801732273944 and +8801793362829 ONLY (ignores images from all other numbers)
+ * 3. Instant WhatsApp Order Confirmation Reply on Image Orders + "/cnl" Cancel System:
+ *    -> Saves order to Google Sheet & replies with full itemized breakdown.
+ *    -> If user replies "/cnl" to that message, it immediately cancels & deletes the order
+ *       from Google Sheets! If anything else (or nothing) is replied, it stays saved.
+ * 4. Manual "Clear Live Orders" & "Clear Server Logs" buttons on Dashboard to keep
+ *    Render Free-Tier RAM/storage ultra-lightweight.
+ * 5. Enhanced Baileys @lid -> Phone Number resolver & clean "Cus name:" party parser.
  * ============================================================================
  */
 
@@ -30,7 +31,8 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   BufferJSON,
-  Browsers
+  Browsers,
+  downloadMediaMessage
 } = require('@whiskeysockets/baileys');
 
 // ============================================================================
@@ -39,9 +41,11 @@ const {
 const PORT = process.env.PORT || 3000;
 const GOOGLE_SHEET_ID = (process.env.GOOGLE_SHEET_ID || '1lvZG2PWV0HjjbVBZjrV14brxYDizfmGm4yYj2mUYkF0').trim();
 const RENDER_EXTERNAL_URL = (process.env.RENDER_EXTERNAL_URL || '').trim();
-const ADMIN_PIN = (process.env.ADMIN_PIN || '').trim(); // Optional PIN protection for dashboard
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
 const LOCAL_CONFIG_PATH = path.join(__dirname, 'bot_config.json');
+
+// Strictly Authorized Phone Numbers for Image-to-Order OCR (Normalized to 8801XXXXXXXXX)
+const AUTHORIZED_IMAGE_PHONES = ['8801732273944', '8801793362829'];
 
 const SHEET_TABS = {
   LIVE_ORDERS: 'Live_Orders',
@@ -52,90 +56,91 @@ const SHEET_TABS = {
 };
 
 // ============================================================================
-// 2. MASTER DATABASE: 78 OFFICIAL CRP PRODUCTS (FROM CRP.XLSX)
+// 2. MASTER DATABASE: 79 CRP PRODUCTS WITH EXACT TRADE PRICE (30-10-2026)
 // ============================================================================
 const DEFAULT_CRP_PRODUCTS = [
-  { code: '919', name: 'TOTIFEN SYRUP 100ML', unit: 'Bottle (100ml)', price: 63.00, family: 'TOTIFEN', aliases: ['totifen', 'totipen', 'totifin', 'totefen', 'totifen syp', 'totifen syr', 'totifen sry', 'totifen 100ml', 'totifen syrh'] },
-  { code: '81', name: "DOXICAP 100MG CAP 100'S", unit: "Box (100's)", price: 220.00, family: 'DOXICAP', aliases: ['doxicap', 'doxicup', 'doxycap', 'doxy cap', 'doxicap 100mg', 'doxicap cap', 'doxecap'] },
-  { code: '990', name: "DOMIREN SUSPENSION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 55.00, family: 'DOMIREN', aliases: ['domiren 100ml', 'domiren syp', 'domiren syr', 'domiren sry', 'domeren 100ml', 'domiren 100', 'domiren susp'] },
-  { code: '286', name: "DOMIREN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 35.00, family: 'DOMIREN', aliases: ['domiren 60ml', 'domeren 60ml', 'domiren 60', 'sy domira 60'] },
-  { code: '60', name: "DOMIREN FC TAB 10MG 100'S", unit: "Box (100's)", price: 350.00, family: 'DOMIREN', aliases: ['domiren tab', 'domeren tab', 'domiren fc tab', 'domiren 10mg', 'domiren tablet', 'domiren tb', 'domniren tab'] },
-  { code: '636', name: "DELTASONE ORAL SOLUTION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 60.00, family: 'DELTASONE', aliases: ['deltasone 50ml', 'deltason 50ml', 'daltasone 50ml', 'daltason 50ml', 'delta sone 50ml', 'delta som', 'dellthesun', 'deltasone syp', 'deltason syr', 'deltason sry', 'delterson 50ml', 'deltarson 50ml'] },
-  { code: '637', name: "DELTASONE ORAL SOLUTION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 95.00, family: 'DELTASONE', aliases: ['deltasone 100ml', 'deltason 100ml', 'daltasone 100ml', 'delta sone 100ml', 'deltasone 100'] },
-  { code: 'CS7', name: "DELTASONE 5MG TAB 17X30'S", unit: "Box (17x30's)", price: 969.00, family: 'DELTASONE', aliases: ['deltasone tab', 'deltason tab', 'daltasone tap', 'deltasone 5mg', 'deltason 5mg', 'deltasonne tab', 'deltasone 17x30'] },
-  { code: '922', name: "PRAZOLE 20MG CAP 6X10'S", unit: "Box (6x10's)", price: 300.00, family: 'PRAZOLE', aliases: ['prazole', 'prazol', 'parzol', 'prajol', 'frazol', 'prazole 20mg', 'prazol cap'] },
-  { code: '271', name: 'ZITHRIN DRY SYRUP 35ML', unit: 'Bottle (35ml)', price: 125.00, family: 'ZITHRIN', aliases: ['zithrin 35ml', 'zitrin 35ml', 'zithrin 35', 'zitrin 35', 'zitthrin', 'zithren', 'zithrin dry syrup', 'zithrin syp', 'zithrin syr'] },
-  { code: '290', name: 'ZITHRIN DRY SYRUP 50ML', unit: 'Bottle (50ml)', price: 165.00, family: 'ZITHRIN', aliases: ['zithrin 50ml', 'zitrin 50ml', 'zithrin 50', 'zitrin 50', 'zrithrin 50ml'] },
-  { code: '270', name: 'ZITHRIN DRY SYRUP 20ML', unit: 'Bottle (20ml)', price: 90.00, family: 'ZITHRIN', aliases: ['zithrin 20ml', 'zitrin 20ml', 'zithirin 20ml', 'zithrin 20'] },
-  { code: '173', name: 'ZITHRIN DRY SYRUP 15ML', unit: 'Bottle (15ml)', price: 75.00, family: 'ZITHRIN', aliases: ['zithrin 15ml', 'ziyhrin 15ml', 'zithrin 15'] },
-  { code: '834', name: "ZITHRIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 115.00, family: 'ZITHRIN', aliases: ['zithrin 30ml', 'zitrin 30ml', 'zithrin 30'] },
-  { code: '278', name: "XAMIC 500MG CAP (2X10'S)", unit: "Box (2x10's)", price: 440.00, family: 'XAMIC', aliases: ['xamic', 'xamic cap', 'xamic 500mg', 'xamic capsule', 'xmaic', 'examic'] },
-  { code: '635', name: "RECOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 50.00, family: 'RECOF', aliases: ['recof', 'recop', 'recof syp', 'recof syr', 'recof sry', 'recof 100ml', 'recof syraf'] },
-  { code: '299', name: "TRULAX SYRUP 1MG/5ML 100ML 1'S", unit: 'Bottle (100ml)', price: 45.00, family: 'TRULAX', aliases: ['trulax', 'tulax', 'trulex', 'trulax syr', 'trulax syp', 'trulax sry', 'trulax 100ml'] },
-  { code: '112', name: 'LUCAN-R SUSP. 35ML', unit: 'Bottle (35ml)', price: 92.00, family: 'LUCAN-R', aliases: ['lucan r 35ml', 'lucan-r 35ml', 'locan r sry', 'lucan r syp', 'lucan r syr', 'lukan r syp', 'luknar syraf', 'lokanar', 'lucon r syp', 'lucanar syp', 'lucar sry'] },
-  { code: '876', name: "LUCAN-R 50MG CAP 4x10'S", unit: "Box (4x10's)", price: 360.00, family: 'LUCAN-R', aliases: ['lucan r 50mg', 'locan r 50mg', 'lucan-r 50mg', 'lukan r 50', 'lacan r 50mg', 'lucan r 50'] },
-  { code: '605', name: 'LUCAN-R 150MG CAPS 2X6', unit: "Box (2x6's)", price: 264.96, family: 'LUCAN-R', aliases: ['lucan r 150mg', 'locan r 150mg', 'lucan-r 150mg', 'lucan r 150', 'locan r 150', 'luknar 150', 'lucon r 150', 'lunch 150'] },
-  { code: '621', name: 'LUCAN-R 200MG CAPS 2X6', unit: "Box (2x6's)", price: 336.00, family: 'LUCAN-R', aliases: ['lucan r 200mg', 'locan r 200mg', 'lucan-r 200mg', 'lucan r 200', 'locan r 200', 'lucanar 200'] },
-  { code: '96', name: "FLONTIN 500MG TAB 3X10'S", unit: "Box (3x10's)", price: 450.00, family: 'FLONTIN', aliases: ['flontin tab', 'flontin 500mg', 'flontine tab', 'foltin', 'flotin tab', 'falntin', 'flonten tab'] },
-  { code: '226', name: "FLONTIN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 100.00, family: 'FLONTIN', aliases: ['flontin syp', 'flontin syr', 'flontin sry', 'flontin sryp', 'flontin syrp', 'flontin 60ml', 'flotin sry', 'flontin susp'] },
-  { code: '179', name: "NORMANAL 500MG FC TAB (3X10'S)", unit: "Box (3x10's)", price: 270.00, family: 'NORMANAL', aliases: ['normanal', 'normal', 'normanol', 'normonal', 'narmonal', 'nomanal', 'normanal 500mg', 'normanal tab'] },
-  { code: '102', name: "FUROCEF FC SUSPENSION 70ML 1X1'S", unit: 'Bottle (70ml)', price: 205.00, family: 'FUROCEF', aliases: ['furocef 70ml', 'feurocef 70ml', 'furosef 70ml', 'furocef sry', 'furocef syrp', 'furoccfe 70ml', 'reocef'] },
-  { code: 'S72', name: "FUROCEF DS SUSPENSION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 250.00, family: 'FUROCEF', aliases: ['furocef ds', 'feurocef ds', 'furosef ds', 'furocef 50ml', 'furocef ds sry'] },
-  { code: 'S16', name: "VITA D3 40000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 300.00, family: 'VITA', aliases: ['vita d3 40000', 'vita 40000', 'vita d3', 'vita d', 'bita d3'] },
-  { code: 'S15', name: "VITA D3 20000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 200.00, family: 'VITA', aliases: ['vita d3 20000', 'vita 20000', 'bita d3 20000'] },
-  { code: 'SA4', name: "NEXDEX 30MG CAP 6X10'S", unit: "Box (6x10's)", price: 600.00, family: 'NEXDEX', aliases: ['nexdex 30mg', 'nexdex 30', 'nexdex'] },
-  { code: 'SA1', name: "NEXDEX 60MG CAP 5X6'S", unit: "Box (5x6's)", price: 600.00, family: 'NEXDEX', aliases: ['nexdex 60mg', 'nexdex 60'] },
-  { code: 'C2Z', name: "PCAB FC 20MG TAB 3X10'S", unit: "Box (3x10's)", price: 600.00, family: 'PCAB', aliases: ['pcab 20mg', 'pcab 20', 'p cab 20', 'pcab', 'p cab', 'pacb', 'pcap', 'picap 20', 'p-cap'] },
-  { code: 'C2Y', name: "PCAB FC 10MG TAB 3X10'S", unit: "Box (3x10's)", price: 360.00, family: 'PCAB', aliases: ['pcab 10mg', 'pcab 10', 'p cab 10', 'pcap 10'] },
-  { code: 'C25', name: "FERIX-V CAP 6X10'S", unit: "Box (6x10's)", price: 270.00, family: 'FERIX-V', aliases: ['ferix v', 'ferix-v', 'farix v', 'frix v', 'ferix v cap'] },
-  { code: '959', name: "DESOLON TAB 1X21'S", unit: "Pack (1x21's)", price: 75.00, family: 'DESOLON', aliases: ['desolon', 'desolone', 'deselon', 'desolan', 'dasalon', 'deslon', 'deslor', 'desolon tab'] },
-  { code: '633', name: "EMCON-1 1X1'S", unit: "Pack (1x1's)", price: 70.00, family: 'EMCON-1', aliases: ['emcon', 'emcon-1', 'emcon 1', 'emcon tab', 'emon', 'incone', 'em con'] },
-  { code: '67', name: 'CONASYD CREAM 10MG', unit: 'Tube (10g)', price: 63.00, family: 'CONASYD', aliases: ['conasyd', 'conasid', 'conased', 'conacid', 'conasyd cream', 'conasid creem', 'conased crem'] },
-  { code: 'SA3', name: "REDUCOF 100ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 100.00, family: 'REDUCOF', aliases: ['reducof', 'redicof', 'rducof', 'reducop', 'reducof syr', 'reducof syp'] },
-  { code: '961', name: "GESTRENOL TAB 5MG 3X10'S", unit: "Box (3x10's)", price: 270.00, family: 'GESTRENOL', aliases: ['gestrenol', 'gestronal', 'gestonal', 'gestrnol', 'gestanol', 'gestnol', 'gestronol', 'gastronal', 'gestrennol'] },
-  { code: 'SM1', name: "EXICOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 65.00, family: 'EXICOF', aliases: ['exicof', 'exicop', 'exicap', 'exicof syp', 'exicof syr'] },
-  { code: 'SY1', name: "RENASONE 10G CREAM 1X1'S", unit: 'Tube (10g)', price: 50.00, family: 'RENASONE', aliases: ['renasone', 'renason', 'renasol', 'renasone cream', 'renason crem', 'renason creem', 'renasone crm', 'renasone crime'] },
-  { code: '34', name: "BECONEX SYRUP 200ML 1'S", unit: 'Bottle (200ml)', price: 65.00, family: 'BECONEX', aliases: ['beconex 200ml', 'biconex 200ml', 'beconex 200', 'beconex syp', 'biconex', 'beconez'] },
-  { code: '33', name: "BECONEX SYRUP 100ML 1'S", unit: 'Bottle (100ml)', price: 35.00, family: 'BECONEX', aliases: ['beconex 100ml', 'biconex 100ml', 'beconex 100', 'beconix 100'] },
-  { code: '233', name: 'BECONEX ZI SYRUP 100ML', unit: 'Bottle (100ml)', price: 55.00, family: 'BECONEX', aliases: ['beconex zi', 'be conex zi', 'becoxnex zi', 'biconex zi'] },
-  { code: 'C82', name: "STARK 60ML ORAL SOLUTION 1X1'S", unit: 'Bottle (60ml)', price: 75.00, family: 'STARK', aliases: ['stark', 'strak', 'stark syp', 'stark syr', 'stark sry', 'stark 60ml'] },
-  { code: '267', name: "PROTONIL EC 40MG TAB 3X10'S", unit: "Box (3x10's)", price: 240.00, family: 'PROTONIL', aliases: ['protonil 40mg', 'protonil 40'] },
-  { code: '266', name: "PROTONIL EC 20MG TAB 5X10'S", unit: "Box (5x10's)", price: 250.00, family: 'PROTONIL', aliases: ['protonil 20mg', 'protonil 20', 'protonil'] },
-  { code: '138', name: 'POLYCEF SYRUP 100ML', unit: 'Bottle (100ml)', price: 140.00, family: 'POLYCEF', aliases: ['polycef', 'policef', 'polycef syp', 'policef sry'] },
-  { code: '875', name: "BREDICON TAB 28'S", unit: "Pack (28's)", price: 80.00, family: 'BREDICON', aliases: ['bredicon', 'bedicon', 'bredecon', 'bredcon', 'baredicon', 'badicon', 'bredicon tab'] },
-  { code: 'S34', name: "PANGESIC TAB 5X6'S", unit: "Box (5x6's)", price: 240.00, family: 'PANGESIC', aliases: ['pangesic', 'pengesic', 'pangisic', 'pangasic', 'pengecic', 'pengasice', 'pangesic tab'] },
-  { code: '934', name: "CALCIN-D TAB 6X10'S", unit: "Box (6x10's)", price: 480.00, family: 'CALCIN-D', aliases: ['calcin d', 'calcin-d', 'calcind', 'calcin d tab'] },
-  { code: '607', name: "FLUSTAR 500MG CAP 7X4'S", unit: "Box (7x4's)", price: 364.00, family: 'FLUSTAR', aliases: ['flustar 500mg', 'flustar cap', 'fluster cap', 'fullstar cap', 'fulustar cap', 'flustar 500'] },
-  { code: 'N33', name: "FLUSTAR 100ML DRY SYS 1X1'S", unit: 'Bottle (100ml)', price: 80.00, family: 'FLUSTAR', aliases: ['flustar syp', 'flustar syr', 'fullstar syr', 'fulustar syrup', 'fluster syp', 'flustar 100ml'] },
-  { code: '282', name: "NORRY 3MG TAB 5X10'S", unit: "Box (5x10's)", price: 250.00, family: 'NORRY', aliases: ['norry', 'nory', 'norry 3mg', 'norry tab'] },
-  { code: 'CO6', name: "ZODEF 60ML SUSP 1X1'S", unit: 'Bottle (60ml)', price: 85.00, family: 'ZODEF', aliases: ['zodef', 'zodef sy', 'zodef sry', 'zodef syp', 'zodef 60ml'] },
-  { code: '902', name: "SALINE-R 20'S", unit: "Box (20's)", price: 100.00, family: 'SALINE-R', aliases: ['saline r', 'saline-r', 'slain r', 'salaine r', 'seline r', 'salin r'] },
-  { code: '232', name: 'HONYCOL LINCTUS 100ML', unit: 'Bottle (100ml)', price: 40.00, family: 'HONYCOL', aliases: ['honycol', 'hunycol', 'hanycol', 'hanicol', 'honeycol', 'honycal', 'hanicon', 'honycol syp'] },
-  { code: '955', name: "THYROX 50MCG 3X30'S", unit: "Box (3x30's)", price: 180.00, family: 'THYROX', aliases: ['thyrox', 'thyrox 50mcg', 'thyrox 50'] },
-  { code: 'T28', name: "NUTRILINA 500MG VEG CAP 5X6'S", unit: "Box (5x6's)", price: 450.00, family: 'NUTRILINA', aliases: ['nutrilina', 'neutilina', 'nutinila', 'nutrilina 500mg'] },
-  { code: 'N49', name: "RECOX FC 120MG TAB 2X10'S", unit: "Box (2x10's)", price: 300.00, family: 'RECOX', aliases: ['recox 120mg', 'recox 120'] },
-  { code: 'N47', name: "RECOX FC 90MG TAB 2X10'S", unit: "Box (2x10's)", price: 240.00, family: 'RECOX', aliases: ['recox 90mg', 'recox 90', 'recox'] },
-  { code: 'SZ5', name: "COPNAT N OINTMENT 15GM 1'S", unit: 'Tube (15g)', price: 65.00, family: 'COPNAT', aliases: ['copnat n ointment', 'copnet n ointment', 'copnet n oientment', 'copnat n olntment', 'copnat n', 'copnet n'] },
-  { code: 'SZ4', name: "COPNAT N CREAM 15GM 1'S", unit: 'Tube (15g)', price: 65.00, family: 'COPNAT', aliases: ['copnat n cream', 'copnat n crem', 'cophnet-n cream', 'copnet n cream', 'copmate n creem'] },
-  { code: 'SI1', name: "FUROCLAV 70ML DRY PWD SUSP 1X1'S", unit: 'Bottle (70ml)', price: 265.00, family: 'FUROCLAV', aliases: ['furoclav', 'feuroclav', 'furoclav 70ml'] },
-  { code: 'H39', name: 'MOODS ALL-NIGHT', unit: "Pack (3's)", price: 30.00, family: 'MOODS', aliases: ['moods all night', 'moods all-night', 'ps-moods all night'] },
-  { code: 'H37', name: 'MOODS DOTTED', unit: "Pack (3's)", price: 30.00, family: 'MOODS', aliases: ['moods dotted', 'mood dotted'] },
-  { code: 'H89', name: "MOODS GOLD 1500 DOTS 3'S", unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods gold 1500', 'moods gold', 'moods gola'] },
-  { code: 'H88', name: "MOODS GOLD ELECTRIFY 3'S", unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods gold electrify', 'moods gold electrifry', 'moods electrify'] },
-  { code: 'H34', name: 'MOODS ULTA-THIN', unit: "Pack (3's)", price: 30.00, family: 'MOODS', aliases: ['moods ulta thin', 'moods ulta-thin', 'moods ultra thin'] },
-  { code: 'CY7', name: "HYDROGEST DS 2ML (500MG/2ML) INJ 1X1'S", unit: "Ampoule (1x1's)", price: 220.00, family: 'HYDROGEST', aliases: ['hydrogest ds', 'hydrogenst ds', 'hydrogest'] },
-  { code: '73', name: "DELENTIN SUSPENSION 10ML 1'S", unit: 'Bottle (10ml)', price: 25.00, family: 'DELENTIN', aliases: ['delentin', 'dilentin', 'delentin 10ml'] },
-  { code: '933', name: 'FENADIN SUSPENSION 50ML', unit: 'Bottle (50ml)', price: 50.00, family: 'FENADIN', aliases: ['fenadin 50ml', 'fenadin syr', 'fenadin sry', 'fenadin'] },
-  { code: '69', name: "FENADIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 35.00, family: 'FENADIN', aliases: ['fenadin 30ml', 'fenadin sry small', 'fenadin sry smal', 'fenadin small'] },
-  { code: 'N45', name: "NOVELON LITE FC TAB 1X24'S", unit: "Pack (1x24's)", price: 150.00, family: 'NOVELON', aliases: ['novelon lite', 'novelon'] },
-  { code: '840', name: "EMEREN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 55.00, family: 'EMEREN', aliases: ['emeren', 'emiren', 'emiren syr', 'emeren 50ml'] },
-  { code: '989', name: "ALGIN SYRP 100ML 1X1'S", unit: 'Bottle (100ml)', price: 85.00, family: 'ALGIN', aliases: ['algin 100ml', 'algin syrp', 'algin syr'] },
-  { code: 'C62', name: "ALGIN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 45.00, family: 'ALGIN', aliases: ['algin 50ml', 'algin 50'] },
-  { code: '16', name: "MAZIC JR 100ML 4.05MG/5ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 40.00, family: 'MAZIC', aliases: ['mazic jr', 'mazic jr sy', 'magic jr'] },
-  { code: '18', name: "MAZIC 10MG/5ML 100ML 1X1'S", unit: 'Bottle (100ml)', price: 50.00, family: 'MAZIC', aliases: ['mazic 100ml', 'mazic', 'magic syp'] }
+  { code: '919', name: 'TOTIFEN SYRUP 100ML', unit: 'Bottle (100ml)', price: 47.23, family: 'TOTIFEN', aliases: ['totifen', 'totipen', 'totifin', 'totefen', 'totifen syp', 'totifen syr', 'totifen sry', 'totifen 100ml', 'totifen syrh'] },
+  { code: '81', name: "DOXICAP 100MG CAP 100'S", unit: "Box (100's)", price: 165.00, family: 'DOXICAP', aliases: ['doxicap', 'doxicup', 'doxycap', 'doxy cap', 'doxicap 100mg', 'doxicap cap', 'doxecap'] },
+  { code: '990', name: "DOMIREN SUSPENSION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 28.49, family: 'DOMIREN', aliases: ['domiren 100ml', 'domiren syp', 'domiren syr', 'domiren sry', 'domeren 100ml', 'domiren 100', 'domiren susp'] },
+  { code: '286', name: "DOMIREN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 26.24, family: 'DOMIREN', aliases: ['domiren 60ml', 'domeren 60ml', 'domiren 60', 'sy domira 60'] },
+  { code: '60', name: "DOMIREN FC TAB 10MG 100'S", unit: "Box (100's)", price: 151.00, family: 'DOMIREN', aliases: ['domiren tab', 'domeren tab', 'domiren fc tab', 'domiren 10mg', 'domiren tablet', 'domiren tb', 'domniren tab'] },
+  { code: '636', name: "DELTASONE ORAL SOLUTION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 44.98, family: 'DELTASONE', aliases: ['deltasone 50ml', 'deltason 50ml', 'daltasone 50ml', 'daltason 50ml', 'delta sone 50ml', 'delta som', 'dellthesun', 'deltasone syp', 'deltason syr', 'deltason sry', 'delterson 50ml', 'deltarson 50ml'] },
+  { code: '637', name: "DELTASONE ORAL SOLUTION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 71.21, family: 'DELTASONE', aliases: ['deltasone 100ml', 'deltason 100ml', 'daltasone 100ml', 'delta sone 100ml', 'deltasone 100'] },
+  { code: 'CS7', name: "DELTASONE 5MG TAB 17X30'S", unit: "Box (17x30's)", price: 657.90, family: 'DELTASONE', aliases: ['deltasone tab', 'deltason tab', 'daltasone tap', 'deltasone 5mg', 'deltason 5mg', 'deltasonne tab', 'deltasone 17x30'] },
+  { code: '922', name: "PRAZOLE 20MG CAP 6X10'S", unit: "Box (6x10's)", price: 225.00, family: 'PRAZOLE', aliases: ['prazole', 'prazol', 'parzol', 'prajol', 'frazol', 'prazole 20mg', 'prazol cap'] },
+  { code: '271', name: 'ZITHRIN DRY SYRUP 35ML', unit: 'Bottle (35ml)', price: 104.95, family: 'ZITHRIN', aliases: ['zithrin 35ml', 'zitrin 35ml', 'zithrin 35', 'zitrin 35', 'zitthrin', 'zithren', 'zithrin dry syrup', 'zithrin syp', 'zithrin syr'] },
+  { code: '290', name: 'ZITHRIN DRY SYRUP 50ML', unit: 'Bottle (50ml)', price: 149.93, family: 'ZITHRIN', aliases: ['zithrin 50ml', 'zitrin 50ml', 'zithrin 50', 'zitrin 50', 'zrithrin 50ml'] },
+  { code: '270', name: 'ZITHRIN DRY SYRUP 20ML', unit: 'Bottle (20ml)', price: 74.96, family: 'ZITHRIN', aliases: ['zithrin 20ml', 'zitrin 20ml', 'zithirin 20ml', 'zithrin 20'] },
+  { code: '173', name: 'ZITHRIN DRY SYRUP 15ML', unit: 'Bottle (15ml)', price: 71.21, family: 'ZITHRIN', aliases: ['zithrin 15ml', 'ziyhrin 15ml', 'zithrin 15'] },
+  { code: '834', name: "ZITHRIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 103.45, family: 'ZITHRIN', aliases: ['zithrin 30ml', 'zitrin 30ml', 'zithrin 30'] },
+  { code: '278', name: "XAMIC 500MG CAP (2X10'S)", unit: "Box (2x10's)", price: 329.80, family: 'XAMIC', aliases: ['xamic', 'xamic cap', 'xamic 500mg', 'xamic capsule', 'xmaic', 'examic'] },
+  { code: '635', name: "RECOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 29.99, family: 'RECOF', aliases: ['recof', 'recop', 'recof syp', 'recof syr', 'recof sry', 'recof 100ml', 'recof syraf'] },
+  { code: '299', name: "TRULAX SYRUP 1MG/5ML 100ML 1'S", unit: 'Bottle (100ml)', price: 33.73, family: 'TRULAX', aliases: ['trulax', 'tulax', 'trulex', 'trulax syr', 'trulax syp', 'trulax sry', 'trulax 100ml'] },
+  { code: '112', name: 'LUCAN-R SUSP. 35ML', unit: 'Bottle (35ml)', price: 58.70, family: 'LUCAN-R', aliases: ['lucan r 35ml', 'lucan-r 35ml', 'locan r sry', 'lucan r syp', 'lucan r syr', 'lukan r syp', 'luknar syraf', 'lokanar', 'lucon r syp', 'lucanar syp', 'lucar sry'] },
+  { code: '876', name: "LUCAN-R 50MG CAP 4x10'S", unit: "Box (4x10's)", price: 240.80, family: 'LUCAN-R', aliases: ['lucan r 50mg', 'locan r 50mg', 'lucan-r 50mg', 'lukan r 50', 'lacan r 50mg', 'lucan r 50'] },
+  { code: '605', name: 'LUCAN-R 150MG CAPS 2X6', unit: "Box (2x6's)", price: 198.60, family: 'LUCAN-R', aliases: ['lucan r 150mg', 'locan r 150mg', 'lucan-r 150mg', 'lucan r 150', 'locan r 150', 'luknar 150', 'lucon r 150', 'lunch 150'] },
+  { code: '621', name: 'LUCAN-R 200MG CAPS 2X6', unit: "Box (2x6's)", price: 224.88, family: 'LUCAN-R', aliases: ['lucan r 200mg', 'locan r 200mg', 'lucan-r 200mg', 'lucan r 200', 'locan r 200', 'lucanar 200'] },
+  { code: '96', name: "FLONTIN 500MG TAB 3X10'S", unit: "Box (3x10's)", price: 337.20, family: 'FLONTIN', aliases: ['flontin tab', 'flontin 500mg', 'flontine tab', 'foltin', 'flotin tab', 'falntin', 'flonten tab'] },
+  { code: '226', name: "FLONTIN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 74.96, family: 'FLONTIN', aliases: ['flontin syp', 'flontin syr', 'flontin sry', 'flontin sryp', 'flontin syrp', 'flontin 60ml', 'flotin sry', 'flontin susp'] },
+  { code: '179', name: "NORMANAL 500MG FC TAB (3X10'S)", unit: "Box (3x10's)", price: 202.50, family: 'NORMANAL', aliases: ['normanal', 'normal', 'normanol', 'normonal', 'narmonal', 'nomanal', 'normanal 500mg', 'normanal tab'] },
+  { code: '102', name: "FUROCEF FC SUSPENSION 70ML 1X1'S", unit: 'Bottle (70ml)', price: 168.67, family: 'FUROCEF', aliases: ['furocef 70ml', 'feurocef 70ml', 'furosef 70ml', 'furocef sry', 'furocef syrp', 'furoccfe 70ml', 'reocef'] },
+  { code: 'S72', name: "FUROCEF DS SUSPENSION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 187.41, family: 'FUROCEF', aliases: ['furocef ds', 'feurocef ds', 'furosef ds', 'furocef 50ml', 'furocef ds sry'] },
+  { code: 'S16', name: "VITA D3 40000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 262.40, family: 'VITA', aliases: ['vita d3 40000', 'vita 40000', 'vita d3', 'vita d', 'bita d3'] },
+  { code: 'S15', name: "VITA D3 20000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 149.90, family: 'VITA', aliases: ['vita d3 20000', 'vita 20000', 'bita d3 20000'] },
+  { code: 'SA4', name: "NEXDEX 30MG CAP 6X10'S", unit: "Box (6x10's)", price: 450.00, family: 'NEXDEX', aliases: ['nexdex 30mg', 'nexdex 30', 'nexdex'] },
+  { code: 'SA1', name: "NEXDEX 60MG CAP 5X6'S", unit: "Box (5x6's)", price: 404.70, family: 'NEXDEX', aliases: ['nexdex 60mg', 'nexdex 60'] },
+  { code: 'C2Z', name: "PCAB FC 20MG TAB 3X10'S", unit: "Box (3x10's)", price: 225.00, family: 'PCAB', aliases: ['pcab 20mg', 'pcab 20', 'p cab 20', 'pcab', 'p cab', 'pacb', 'pcap', 'picap 20', 'p-cap'] },
+  { code: 'C2Y', name: "PCAB FC 10MG TAB 3X10'S", unit: "Box (3x10's)", price: 157.50, family: 'PCAB', aliases: ['pcab 10mg', 'pcab 10', 'p cab 10', 'pcap 10'] },
+  { code: 'C25', name: "FERIX-V CAP 6X10'S", unit: "Box (6x10's)", price: 202.20, family: 'FERIX-V', aliases: ['ferix v', 'ferix-v', 'farix v', 'frix v', 'ferix v cap'] },
+  { code: '959', name: "DESOLON TAB 1X21'S", unit: "Pack (1x21's)", price: 90.51, family: 'DESOLON', aliases: ['desolon', 'desolone', 'deselon', 'desolan', 'dasalon', 'deslon', 'deslor', 'desolon tab'] },
+  { code: '633', name: "EMCON-1 1X1'S", unit: "Pack (1x1's)", price: 60.34, family: 'EMCON-1', aliases: ['emcon', 'emcon-1', 'emcon 1', 'emcon tab', 'emon', 'incone', 'em con'] },
+  { code: '67', name: 'CONASYD CREAM 10MG', unit: 'Tube (10g)', price: 47.23, family: 'CONASYD', aliases: ['conasyd', 'conasid', 'conased', 'conacid', 'conasyd cream', 'conasid creem', 'conased crem'] },
+  { code: 'SA3', name: "REDUCOF 100ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 74.96, family: 'REDUCOF', aliases: ['reducof', 'redicof', 'rducof', 'reducop', 'reducof syr', 'reducof syp'] },
+  { code: '961', name: "GESTRENOL TAB 5MG 3X10'S", unit: "Box (3x10's)", price: 180.60, family: 'GESTRENOL', aliases: ['gestrenol', 'gestronal', 'gestonal', 'gestrnol', 'gestanol', 'gestnol', 'gestronol', 'gastronal', 'gestrennol'] },
+  { code: 'SM1', name: "EXICOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 59.97, family: 'EXICOF', aliases: ['exicof', 'exicop', 'exicap', 'exicof syp', 'exicof syr'] },
+  { code: 'SY1', name: "RENASONE 10G CREAM 1X1'S", unit: 'Tube (10g)', price: 38.98, family: 'RENASONE', aliases: ['renasone', 'renason', 'renasol', 'renasone cream', 'renason crem', 'renason creem', 'renasone crm', 'renasone crime'] },
+  { code: '34', name: "BECONEX SYRUP 200ML 1'S", unit: 'Bottle (200ml)', price: 46.48, family: 'BECONEX', aliases: ['beconex 200ml', 'biconex 200ml', 'beconex 200', 'beconex syp', 'biconex', 'beconez'] },
+  { code: '33', name: "BECONEX SYRUP 100ML 1'S", unit: 'Bottle (100ml)', price: 26.24, family: 'BECONEX', aliases: ['beconex 100ml', 'biconex 100ml', 'beconex 100', 'beconix 100'] },
+  { code: '233', name: 'BECONEX ZI SYRUP 100ML', unit: 'Bottle (100ml)', price: 43.48, family: 'BECONEX', aliases: ['beconex zi', 'be conex zi', 'becoxnex zi', 'biconex zi'] },
+  { code: 'C82', name: "STARK 60ML ORAL SOLUTION 1X1'S", unit: 'Bottle (60ml)', price: 56.22, family: 'STARK', aliases: ['stark', 'strak', 'stark syp', 'stark syr', 'stark sry', 'stark 60ml'] },
+  { code: '267', name: "PROTONIL EC 40MG TAB 3X10'S", unit: "Box (3x10's)", price: 202.50, family: 'PROTONIL', aliases: ['protonil 40mg', 'protonil 40'] },
+  { code: '266', name: "PROTONIL EC 20MG TAB 5X10'S", unit: "Box (5x10's)", price: 225.00, family: 'PROTONIL', aliases: ['protonil 20mg', 'protonil 20', 'protonil'] },
+  { code: '138', name: 'POLYCEF SYRUP 100ML', unit: 'Bottle (100ml)', price: 67.47, family: 'POLYCEF', aliases: ['polycef', 'policef', 'polycef syp', 'policef sry'] },
+  { code: '875', name: "BREDICON TAB 28'S", unit: "Pack (28's)", price: 52.08, family: 'BREDICON', aliases: ['bredicon', 'bedicon', 'bredecon', 'bredcon', 'baredicon', 'badicon', 'bredicon tab'] },
+  { code: 'S34', name: "PANGESIC TAB 5X6'S", unit: "Box (5x6's)", price: 180.00, family: 'PANGESIC', aliases: ['pangesic', 'pengesic', 'pangisic', 'pangasic', 'pengecic', 'pengasice', 'pangesic tab'] },
+  { code: '934', name: "CALCIN-D TAB 6X10'S", unit: "Box (6x10's)", price: 360.00, family: 'CALCIN-D', aliases: ['calcin d', 'calcin-d', 'calcind', 'calcin d tab'] },
+  { code: '607', name: "FLUSTAR 500MG CAP 7X4'S", unit: "Box (7x4's)", price: 210.00, family: 'FLUSTAR', aliases: ['flustar 500mg', 'flustar cap', 'fluster cap', 'fullstar cap', 'fulustar cap', 'flustar 500'] },
+  { code: 'N33', name: "FLUSTAR 100ML DRY SYS 1X1'S", unit: 'Bottle (100ml)', price: 44.98, family: 'FLUSTAR', aliases: ['flustar syp', 'flustar syr', 'fullstar syr', 'fulustar syrup', 'fluster syp', 'flustar 100ml'] },
+  { code: '282', name: "NORRY 3MG TAB 5X10'S", unit: "Box (5x10's)", price: 262.50, family: 'NORRY', aliases: ['norry', 'nory', 'norry 3mg', 'norry tab'] },
+  { code: 'CO6', name: "ZODEF 60ML SUSP 1X1'S", unit: 'Bottle (60ml)', price: 149.93, family: 'ZODEF', aliases: ['zodef', 'zodef sy', 'zodef sry', 'zodef syp', 'zodef 60ml'] },
+  { code: '902', name: "SALINE-R 20'S", unit: "Box (20's)", price: 90.00, family: 'SALINE-R', aliases: ['saline r', 'saline-r', 'slain r', 'salaine r', 'seline r', 'salin r'] },
+  { code: '232', name: 'HONYCOL LINCTUS 100ML', unit: 'Bottle (100ml)', price: 29.99, family: 'HONYCOL', aliases: ['honycol', 'hunycol', 'hanycol', 'hanicol', 'honeycol', 'honycal', 'hanicon', 'honycol syp'] },
+  { code: '955', name: "THYROX 50MCG 3X30'S", unit: "Box (3x30's)", price: 148.50, family: 'THYROX', aliases: ['thyrox', 'thyrox 50mcg', 'thyrox 50'] },
+  { code: 'T28', name: "NUTRILINA 500MG VEG CAP 5X6'S", unit: "Box (5x6's)", price: 310.35, family: 'NUTRILINA', aliases: ['nutrilina', 'neutilina', 'nutinila', 'nutrilina 500mg'] },
+  { code: 'N49', name: "RECOX FC 120MG TAB 2X10'S", unit: "Box (2x10's)", price: 209.80, family: 'RECOX', aliases: ['recox 120mg', 'recox 120'] },
+  { code: 'N47', name: "RECOX FC 90MG TAB 2X10'S", unit: "Box (2x10's)", price: 180.00, family: 'RECOX', aliases: ['recox 90mg', 'recox 90', 'recox'] },
+  { code: 'SZ5', name: "COPNAT N OINTMENT 15GM 1'S", unit: 'Tube (15g)', price: 52.47, family: 'COPNAT', aliases: ['copnat n ointment', 'copnet n ointment', 'copnet n oientment', 'copnat n olntment', 'copnat n', 'copnet n'] },
+  { code: 'SZ4', name: "COPNAT N CREAM 15GM 1'S", unit: 'Tube (15g)', price: 52.47, family: 'COPNAT', aliases: ['copnat n cream', 'copnat n crem', 'cophnet-n cream', 'copnet n cream', 'copmate n creem'] },
+  { code: 'SI1', name: "FUROCLAV 70ML DRY PWD SUSP 1X1'S", unit: 'Bottle (70ml)', price: 198.65, family: 'FUROCLAV', aliases: ['furoclav', 'feuroclav', 'furoclav 70ml'] },
+  { code: 'H39', name: 'MOODS ALL-NIGHT', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods all night', 'moods all-night', 'ps-moods all night'] },
+  { code: 'H37', name: 'MOODS DOTTED', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods dotted', 'mood dotted'] },
+  { code: 'H89', name: "MOODS GOLD 1500 DOTS 3'S", unit: "Pack (3's)", price: 65.00, family: 'MOODS', aliases: ['moods gold 1500', 'moods gold', 'moods gola'] },
+  { code: 'H88', name: "MOODS GOLD ELECTRIFY 3'S", unit: "Pack (3's)", price: 65.00, family: 'MOODS', aliases: ['moods gold electrify', 'moods gold electrifry', 'moods electrify'] },
+  { code: 'H34', name: 'MOODS ULTA-THIN', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods ulta thin', 'moods ulta-thin', 'moods ultra thin'] },
+  { code: 'CY7', name: "HYDROGEST DS 2ML (500MG/2ML) INJ 1X1'S", unit: "Ampoule (1x1's)", price: 487.26, family: 'HYDROGEST', aliases: ['hydrogest ds', 'hydrogenst ds', 'hydrogest'] },
+  { code: '73', name: "DELENTIN SUSPENSION 10ML 1'S", unit: 'Bottle (10ml)', price: 12.03, family: 'DELENTIN', aliases: ['delentin', 'dilentin', 'delentin 10ml'] },
+  { code: '933', name: 'FENADIN SUSPENSION 50ML', unit: 'Bottle (50ml)', price: 41.23, family: 'FENADIN', aliases: ['fenadin 50ml', 'fenadin syr', 'fenadin sry', 'fenadin'] },
+  { code: '69', name: "FENADIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 26.24, family: 'FENADIN', aliases: ['fenadin 30ml', 'fenadin sry small', 'fenadin sry smal', 'fenadin small'] },
+  { code: 'N45', name: "NOVELON LITE FC TAB 1X24'S", unit: "Pack (1x24's)", price: 366.38, family: 'NOVELON', aliases: ['novelon lite', 'novelon'] },
+  { code: '840', name: "EMEREN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 22.49, family: 'EMEREN', aliases: ['emeren', 'emiren', 'emiren syr', 'emeren 50ml'] },
+  { code: '989', name: "ALGIN SYRP 100ML 1X1'S", unit: 'Bottle (100ml)', price: 67.47, family: 'ALGIN', aliases: ['algin 100ml', 'algin syrp', 'algin syr'] },
+  { code: 'C62', name: "ALGIN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 41.23, family: 'ALGIN', aliases: ['algin 50ml', 'algin 50'] },
+  { code: '16', name: "MAZIC JR 100ML 4.05MG/5ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 28.49, family: 'MAZIC', aliases: ['mazic jr', 'mazic jr sy', 'magic jr'] },
+  { code: '18', name: "MAZIC 10MG/5ML 100ML 1X1'S", unit: 'Bottle (100ml)', price: 26.24, family: 'MAZIC', aliases: ['mazic 100ml', 'mazic', 'magic syp'] },
+  { code: 'DF4', name: 'ALLUREN 100G PWD', unit: 'Pack (100g)', price: 262.37, family: 'ALLUREN', aliases: ['alluren', 'aluren', 'alluren 100g'] }
 ];
 
-// Active product list (can be updated dynamically from Google Sheet Product_Wise_Summary tab)
+const TRADE_PRICE_MAP = new Map(DEFAULT_CRP_PRODUCTS.map((p) => [p.code, p.price]));
 let activeProducts = [...DEFAULT_CRP_PRODUCTS];
 
 // ============================================================================
@@ -187,16 +192,13 @@ const DA_MASTER = [
   { daId: 'C210024', altId: '', name: 'Ilias Hossain', phones: ['8801621668496'], aliases: ['ilias hossain'] },
   { daId: 'C210028', altId: '', name: 'Abdur Rahman', phones: [], aliases: ['abdur rahman nk depot ren', 'abdur rahman'] },
   { daId: 'C122230', altId: '', name: 'DA ID C122230', phones: ['8801777824386'], aliases: ['c122230'] },
-  { daId: 'CF10145', altId: '', name: 'Moajjem', phones: [], aliases: ['moajjem', 'moazzem'] }
+  { daId: 'CF10145', altId: '', name: 'Moajjem', phones: ['8801732273944', '8801793362829'], aliases: ['moajjem', 'moazzem'] }
 ];
 
 // ============================================================================
 // 4. FUZZY SPELL-CHECKING & VARIANT DISAMBIGUATION ENGINE
 // ============================================================================
 
-/**
- * Computes Levenshtein Edit Distance between two strings
- */
 function levenshtein(a, b) {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -215,9 +217,6 @@ function levenshtein(a, b) {
   return v0[b.length];
 }
 
-/**
- * Normalized String Similarity (0.0 to 1.0) combining Levenshtein & Prefix bonus
- */
 function stringSimilarity(s1, s2) {
   const a = s1.toLowerCase().trim();
   const b = s2.toLowerCase().trim();
@@ -226,14 +225,10 @@ function stringSimilarity(s1, s2) {
   const maxLen = Math.max(a.length, b.length);
   const dist = levenshtein(a, b);
   let score = 1 - dist / maxLen;
-  // Phonetic & prefix bonus for Bengali-English transliteration typos (e.g. totipen vs totifen, biconex vs beconex)
   if (a.slice(0, 3) === b.slice(0, 3)) score += 0.06;
   return Math.min(1.0, Math.max(0, score));
 }
 
-/**
- * Resolves exact product within a multi-variant brand family based on dosage/strength/form cues
- */
 function resolveBrandFamilyVariant(family, rawTextLower) {
   const t = rawTextLower;
   const byCode = (c) => activeProducts.find((p) => p.code === c);
@@ -243,13 +238,13 @@ function resolveBrandFamilyVariant(family, rawTextLower) {
       if (/\b(tab|tap|tb|5\s*mg|17\s*[\*x]\s*30)\b/i.test(t)) return byCode('CS7');
       if (/\b50\s*ml\b/i.test(t) || /\bdeltas[oa]ne?\s*50\b/i.test(t)) return byCode('636');
       if (/\b100\s*ml\b/i.test(t) || /\bdeltas[oa]ne?\s*100\b(?=.*?\b\d+)/i.test(t)) return byCode('637');
-      return byCode('636'); // Default 50ML
+      return byCode('636');
 
     case 'DOMIREN':
       if (/\b(tab|tap|tb|fc|tablet|10\s*mg)\b/i.test(t)) return byCode('60');
       if (/\b100\s*ml\b/i.test(t) || /\bdom[iey]?r[ea]n\s*100\b(?=.*?\b\d+)/i.test(t)) return byCode('990');
       if (/\b60\s*ml\b/i.test(t) || /\bdom[iey]?r[ea]n\s*60\b(?=.*?\b\d+)/i.test(t)) return byCode('286');
-      return byCode('990'); // Default 100ML
+      return byCode('990');
 
     case 'ZITHRIN':
       if (/\b35\s*ml\b/i.test(t) || /\bz[ri]?th?r[ie]n\s*35\b/i.test(t)) return byCode('271');
@@ -257,7 +252,7 @@ function resolveBrandFamilyVariant(family, rawTextLower) {
       if (/\b30\s*ml\b/i.test(t)) return byCode('834');
       if (/\b20\s*ml\b/i.test(t)) return byCode('270');
       if (/\b15\s*ml\b/i.test(t)) return byCode('173');
-      return byCode('271'); // Default 35ML
+      return byCode('271');
 
     case 'LUCAN-R':
       if (/\b200\s*(mg)?\b/i.test(t)) return byCode('621');
@@ -266,75 +261,74 @@ function resolveBrandFamilyVariant(family, rawTextLower) {
       if (/\b50\s*mg\b/i.test(t) || (/\b(cap|caps|capsule)\b/i.test(t) && !/\b(150|200)\b/.test(t)) || /\b(lucan|locan|lukan|lucon|lacan)\s*[\-]?r?\s*50\b(?=.*?\b\d+)/i.test(t)) {
         return byCode('876');
       }
-      return byCode('112'); // Default 35ML Suspension
+      return byCode('112');
 
     case 'FUROCEF':
       if (/\b(ds|50\s*ml)\b/i.test(t)) return byCode('S72');
-      return byCode('102'); // Default 70ML
+      return byCode('102');
 
     case 'BECONEX':
       if (/\bzi\b/i.test(t)) return byCode('233');
       if (/\b200\s*ml\b/i.test(t) || /\bb[ei]conex\s*200\b/i.test(t)) return byCode('34');
       if (/\b100\s*ml\b/i.test(t) || /\bb[ei]conex\s*100\b(?=.*?\b\d+)/i.test(t)) return byCode('33');
-      return byCode('34'); // Default 200ML
+      return byCode('34');
 
     case 'FLONTIN':
       if (/\b(syp|syr|sry|srp|sryp|syrp|sy|syrup|syrap|susp|60\s*ml)\b/i.test(t)) return byCode('226');
-      return byCode('96'); // Default 500MG Tab
+      return byCode('96');
 
     case 'FLUSTAR':
       if (/\b(cap|caps|500\s*mg|500)\b/i.test(t)) return byCode('607');
-      return byCode('N33'); // Default 100ML Dry Syrup
+      return byCode('N33');
 
     case 'VITA':
       if (/\b(20000|20k)\b/i.test(t)) return byCode('S15');
-      return byCode('S16'); // Default 40000 IU
+      return byCode('S16');
 
     case 'NEXDEX':
       if (/\b60\s*mg\b/i.test(t) || /\bnexdex\s*60\b(?=.*?\b\d+)/i.test(t)) return byCode('SA1');
-      return byCode('SA4'); // Default 30MG
+      return byCode('SA4');
 
     case 'PCAB':
       if (/\b10\s*mg\b/i.test(t) || /\bp\s*[\-]?ca[bp]\s*10\b(?=.*?\b\d+)/i.test(t)) return byCode('C2Y');
-      return byCode('C2Z'); // Default 20MG
+      return byCode('C2Z');
 
     case 'PROTONIL':
       if (/\b40\s*(mg)?\b/i.test(t)) return byCode('267');
-      return byCode('266'); // Default 20MG
+      return byCode('266');
 
     case 'RECOX':
       if (/\b120\s*(mg)?\b/i.test(t)) return byCode('N49');
-      return byCode('N47'); // Default 90MG
+      return byCode('N47');
 
     case 'COPNAT':
       if (/\b(cream|crem|creem|crm)\b/i.test(t) && !/\boint/i.test(t)) return byCode('SZ4');
-      return byCode('SZ5'); // Default Ointment
+      return byCode('SZ5');
 
     case 'FENADIN':
       if (/\b(30\s*ml|small|smal)\b/i.test(t)) return byCode('69');
-      return byCode('933'); // Default 50ML
+      return byCode('933');
 
     case 'ALGIN':
       if (/\b50\s*(ml)?\b/i.test(t)) return byCode('C62');
-      return byCode('989'); // Default 100ML
+      return byCode('989');
 
     case 'MAZIC':
       if (/\bjr\b/i.test(t)) return byCode('16');
-      return byCode('18'); // Default 100ML
+      return byCode('18');
 
     case 'MOODS':
       if (/\b(ulta|ultra|thin)\b/i.test(t)) return byCode('H34');
       if (/\belectr/i.test(t)) return byCode('H88');
       if (/\b(gold|gola|1500)\b/i.test(t)) return byCode('H89');
       if (/\bdot/i.test(t)) return byCode('H37');
-      return byCode('H39'); // Default MOODS ALL-NIGHT
+      return byCode('H39');
 
     default:
       return activeProducts.find((p) => p.family === family);
   }
 }
 
-// Brand root keyword patterns for fast & accurate family detection
 const BRAND_FAMILY_PATTERNS = [
   { family: 'TOTIFEN', regex: /\b(tot[iey]?[fpv][eai]?n|toti[fp]en|totifen|totipen|totifin)\b/i },
   { family: 'DOXICAP', regex: /\b(dox[iy]?\s*c[auo]p|doxicap|doxicup)\b/i },
@@ -384,26 +378,21 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'NOVELON', regex: /\b(novelon)\b/i },
   { family: 'EMEREN', regex: /\b(em[ei]ren)\b/i },
   { family: 'ALGIN', regex: /\b(algin)\b/i },
-  { family: 'MAZIC', regex: /\b(ma[zj]ic)\b/i }
+  { family: 'MAZIC', regex: /\b(ma[zj]ic)\b/i },
+  { family: 'ALLUREN', regex: /\b(all?uren)\b/i }
 ];
 
-/**
- * Matches a raw WhatsApp product line to an official CRP product (with fuzzy spell correction)
- */
 function matchCRPProduct(rawLine) {
   if (!rawLine || typeof rawLine !== 'string') return null;
-  // Normalize glued numbers like "doxicap20" -> "doxicap 20", "totifen100ml" -> "totifen 100ml"
   const normalized = rawLine
     .replace(/([a-zA-Z])(\d)/g, '$1 $2')
     .replace(/(\d)([a-zA-Z])/g, '$1 $2')
     .toLowerCase();
 
-  // Ignore conversational/question lines that are not orders
   if (/\b(mrp|koto\s*tk|kina\s*porbe|list\s*te\s*ache|sell\s*koris|video|thanks|welcome|joined|added)\b/i.test(normalized)) {
     return null;
   }
 
-  // Stage 1: Regex Brand Family + Variant Disambiguation
   for (const item of BRAND_FAMILY_PATTERNS) {
     if (item.regex.test(normalized)) {
       const product = resolveBrandFamilyVariant(item.family, normalized);
@@ -413,7 +402,6 @@ function matchCRPProduct(rawLine) {
     }
   }
 
-  // Stage 2: Check custom products added dynamically in Google Sheet Product_Wise_Summary
   for (const prod of activeProducts) {
     const cleanProdName = prod.name.toLowerCase().split(/\s+/)[0];
     if (cleanProdName.length >= 4 && normalized.includes(cleanProdName)) {
@@ -422,7 +410,6 @@ function matchCRPProduct(rawLine) {
     }
   }
 
-  // Stage 3: Fuzzy Levenshtein Word-by-Word Spell Checker against all Product Aliases
   const STOP_WORDS = new Set([
     'syp', 'syr', 'sry', 'srp', 'syrup', 'syrap', 'syraf', 'sy', 'susp', 'tab', 'tap', 'tb', 'tablet',
     'cap', 'caps', 'capsule', 'cream', 'crem', 'creem', 'crm', 'ointment', 'ta', 'tah', 'pes', 'pcs',
@@ -430,7 +417,8 @@ function matchCRPProduct(rawLine) {
     'ec', 'ds', 'jr', 'pso', 'code', 'pharmacy', 'pharmechy', 'pharmecy', 'phy', 'pharma', 'medical',
     'medecal', 'hall', 'hal', 'mh', 'bazar', 'bazer', 'bz', 'market', 'road', 'hat', 'new', 'al', 'ma',
     'maa', 'jannat', 'janani', 'popular', 'model', 'unique', 'laxmipur', 'ramgonj', 'raipur', 'hatiya',
-    'chowmuhani', 'noakhali', 'mandari', 'hasnabad', 'chatkhil', 'sonapur', 'kabirhat', 'company', 'dr'
+    'chowmuhani', 'noakhali', 'mandari', 'hasnabad', 'chatkhil', 'sonapur', 'kabirhat', 'company', 'dr',
+    'cus', 'name', 'customer', 'party'
   ]);
 
   const tokens = normalized
@@ -476,37 +464,24 @@ function matchCRPProduct(rawLine) {
 // 5. QUANTITY EXTRACTOR & MULTI-ITEM LINE SPLITTER
 // ============================================================================
 
-/**
- * Extracts ordered pack/bottle/box quantity from a product line without confusing
- * dosage numbers (e.g., 50ml, 100ml, 40000, 500mg, 20mg, 17*30, Emcon-1, Vita D3)
- */
 function extractOrderQuantity(rawLine, matchedProduct) {
   let s = rawLine;
-
-  // 1. Remove leading list numbering like "1/", "2)", "1.", "#1"
   s = s.replace(/^\s*\d+\s*[\/)\.]\s*/, ' ');
-
-  // 2. Remove DA codes and PSO codes if written inline on the same line
   s = s.replace(/\b(cf|rf|c)\s*[\-_]?\s*\d{4,6}\b/gi, ' ');
   s = s.replace(/\bpso\s*[\-:=]?\s*[a-z]?\s*\d{2,3}\b/gi, ' ');
-
-  // 3. Remove known product strength/pack tokens so they are never mistaken for quantity
   s = s.replace(/\b(40000|20000|1500)\s*(iu|dots)?\b/gi, ' ');
-  s = s.replace(/\b\d+\s*[\*x]\s*\d+\b/gi, ' '); // e.g., 17*30, 6x10, 3x10
-  s = s.replace(/\bd\s*3\b/gi, ' '); // Vita D3
+  s = s.replace(/\b\d+\s*[\*x]\s*\d+\b/gi, ' ');
+  s = s.replace(/\bd\s*3\b/gi, ' ');
   s = s.replace(/\bemcon\s*[\-_]?\s*1\b/gi, 'emcon ');
   s = s.replace(/\b(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5|3)\s*(ml|mg|mcg|gm|g)\b/gi, ' ');
 
-  // Strip bare strength numbers when attached after the brand name AND followed by another number (the actual quantity)
   s = s.replace(/\b(dom[iey]?r[ea]n|deltas[oa]ne?|daltas[oa]ne?|beconex|biconex|zith?r[ie]n|zitrin|lucan\s*[\-]?r?|locan\s*[\-]?r?|lokanar|lunch|furocef|feurocef|p\s*[\-]?ca[bp]|nexdex|protonil|recox|flontin|flustar|algin|fenadin|normanal|pangesic)\s*(?:syp|syr|sry|srp|sarape|tab|tap|cap)?\s*[\-_:=.]*\s*(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\b(?=.*?\b\d+)/gi, '$1 ');
 
-  // 4. Check for addition expressions like "100+25" (e.g. "Deltasone 50ml 100+25")
   const plusMatch = s.match(/(\d+)\s*\+\s*(\d+)/);
   if (plusMatch) {
     return parseFloat(plusMatch[1]) + parseFloat(plusMatch[2]);
   }
 
-  // 5. Find all remaining numbers in the line; the last number is the ordered quantity
   const numMatches = [...s.matchAll(/(\d+(?:\.\d+)?)/g)];
   if (numMatches.length > 0) {
     const lastNum = parseFloat(numMatches[numMatches.length - 1][1]);
@@ -516,14 +491,10 @@ function extractOrderQuantity(rawLine, matchedProduct) {
   return null;
 }
 
-/**
- * Splits a single line if it contains multiple products or multiple variants
- */
 function expandLineSegments(line) {
   const trimmed = line.trim();
   if (!trimmed) return [];
 
-  // Case A: Same-brand multi-size line like "Deltason 50ml 5 ta 100ml 5 ta"
   const multiSizeMatch = trimmed.match(/^(.*?\b(?:deltas[oa]ne?|dom[iey]?r[ea]n|zith?r[ie]n|beconex|biconex)\b)\s*(\d+\s*ml\s*[\-:=]?\s*\d+\s*(?:ta|pes|pcs|pc|box)?)\s+(\d+\s*ml\s*[\-:=]?\s*\d+.*)$/i);
   if (multiSizeMatch) {
     const brandPrefix = multiSizeMatch[1];
@@ -533,7 +504,6 @@ function expandLineSegments(line) {
     ];
   }
 
-  // Case B: Comma-separated or period-separated inline multi-product message
   if (trimmed.includes(',')) {
     const parts = trimmed.split(',').map((p) => p.trim()).filter(Boolean);
     const matchedParts = parts.filter((p) => matchCRPProduct(p) !== null);
@@ -554,17 +524,98 @@ function expandLineSegments(line) {
 }
 
 // ============================================================================
-// 6. DA (DELIVERY ASSISTANT), PSO CODE & PHARMACY RESOLVER
+// 6. DA (DELIVERY ASSISTANT), PHONE/LID, PSO CODE & PHARMACY RESOLVER
 // ============================================================================
 
 const senderContextCache = new Map();
+const lidToPhoneMap = new Map(); // Maps WhatsApp @lid IDs -> normalized 8801XXXXXXXXX phone numbers
+
+/**
+ * Normalizes any phone number string to 8801XXXXXXXXX format if it's a valid BD number
+ */
+function normalizeBdPhone(raw) {
+  if (!raw) return '';
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('01')) {
+    return '88' + digits;
+  }
+  if (digits.length === 13 && digits.startsWith('8801')) {
+    return digits;
+  }
+  if (digits.length === 10 && digits.startsWith('1')) {
+    return '880' + digits;
+  }
+  return digits;
+}
+
+/**
+ * Resolves the real phone number of a WhatsApp message sender (even when group uses @lid)
+ */
+function resolveRealSenderPhone(msg) {
+  if (!msg) return '';
+  const candidatos = [
+    msg.key?.participantPn,
+    msg.participantPn,
+    msg.key?.participant,
+    msg.participant,
+    msg.key?.remoteJidAlt,
+    !msg.key?.remoteJid?.endsWith('@g.us') ? msg.key?.remoteJid : ''
+  ];
+
+  // If message was sent from the connected bot phone itself
+  if (msg.key?.fromMe && connectedUser?.id) {
+    candidatos.unshift(connectedUser.id);
+  }
+
+  for (const c of candidatos) {
+    if (!c) continue;
+    const rawId = String(c).split('@')[0].split(':')[0];
+    if (String(c).endsWith('@lid') && lidToPhoneMap.has(rawId)) {
+      return lidToPhoneMap.get(rawId);
+    }
+    const norm = normalizeBdPhone(rawId);
+    if (norm.length === 13 && norm.startsWith('8801')) {
+      // Also record in lidToPhoneMap if msg.key.participant was an @lid
+      const pJid = msg.key?.participant || '';
+      if (pJid.endsWith('@lid')) {
+        lidToPhoneMap.set(pJid.split('@')[0].split(':')[0], norm);
+      }
+      return norm;
+    }
+  }
+
+  const fallbackRaw = (msg.key?.participant || msg.key?.remoteJid || '').split('@')[0].split(':')[0];
+  if (lidToPhoneMap.has(fallbackRaw)) {
+    return lidToPhoneMap.get(fallbackRaw);
+  }
+  return normalizeBdPhone(fallbackRaw);
+}
+
+/**
+ * Checks if a message was sent by one of the two strictly authorized Image Order numbers:
+ * +8801732273944 or +8801793362829
+ */
+function isAuthorizedForImageOrder(msg, resolvedPhone) {
+  const norm = normalizeBdPhone(resolvedPhone);
+  for (const authPhone of AUTHORIZED_IMAGE_PHONES) {
+    if (norm === authPhone || norm.endsWith(authPhone.slice(-10))) {
+      return true;
+    }
+  }
+  // Also check if the raw participant LID was explicitly bound to one of the 2 authorized numbers
+  const rawParticipant = (msg?.key?.participant || msg?.key?.remoteJid || '').split('@')[0].split(':')[0];
+  if (rawParticipant && botConfig.authorizedImageLids && botConfig.authorizedImageLids.includes(rawParticipant)) {
+    return true;
+  }
+  return false;
+}
 
 function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, senderJid) {
   const cleanText = (fullText || '').toUpperCase();
-  const cleanPhone = (senderPhone || '').replace(/\D/g, '');
+  const cleanPhone = normalizeBdPhone(senderPhone);
   const cleanPush = (senderPushName || '').toLowerCase().trim();
 
-  // 1. Check explicit DA ID inside the message text (e.g., CF9054, Cf 4526, RF 20363, C122210, C-122229, C_122230)
+  // 1. Explicit DA ID inside message text
   const explicitMatch = cleanText.match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b/);
   if (explicitMatch) {
     const candidateId = `${explicitMatch[1]}${explicitMatch[2]}`;
@@ -578,13 +629,13 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     const customDA = {
       daId: candidateId,
       altId: '',
-      name: senderPushName || `DA ${candidateId}`
+      name: senderPushName || `DA ${candidateId}`,
+      phones: []
     };
     if (senderJid) senderContextCache.set(senderJid, customDA);
     return customDA;
   }
 
-  // Check bare 6-digit DA code like "210012"
   const bareMatch = cleanText.match(/\b(2100\d{2}|122\d{3}|055167)\b/);
   if (bareMatch) {
     const candidateId = `C${bareMatch[1]}`;
@@ -617,30 +668,25 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // 4. Fallback to cached context for this WhatsApp JID
+  // 4. Fallback to cached context
   if (senderJid && senderContextCache.has(senderJid)) {
     return senderContextCache.get(senderJid);
   }
 
-  // 5. Fallback to sender's WhatsApp display name / phone
   return {
     daId: cleanPhone ? `WA-${cleanPhone.slice(-6)}` : 'UNKNOWN',
     altId: '',
-    name: senderPushName || (cleanPhone ? `+${cleanPhone}` : 'Unknown Sender')
+    name: senderPushName || (cleanPhone ? `+${cleanPhone}` : 'Unknown Sender'),
+    phones: []
   };
 }
 
-/**
- * Extracts PSO Code from a line or block (e.g. "Pso E71", "/ G24", "(Q99)", "Pso- 475", "-470")
- */
 function extractPSOCode(line) {
   if (!line) return null;
-  // Pattern 1: Explicit "pso E71", "pso- 475", "pso: Q79", "pso_G30"
   const psoExplicit = line.match(/\bpso\s*(?:code)?\s*[\-:=_.]?\s*([A-Z]\s*\d{2,3}|\d{3})\b/i);
   if (psoExplicit) {
     return psoExplicit[1].replace(/\s+/g, '').toUpperCase();
   }
-  // Pattern 2: Slash or Parenthesis or Dash PSO code on a pharmacy/address line: "/ G24", "(Q99)", "-E75", "-470"
   const slashOrParen = line.match(/(?:\/|\(|,\s*\-|\s\-)\s*([A-TV-Z]\s*\d{2}|345|44\d|45\d|46\d|47\d)\b/i);
   if (slashOrParen) {
     const code = slashOrParen[1].replace(/\s+/g, '').toUpperCase();
@@ -648,7 +694,6 @@ function extractPSOCode(line) {
       return code;
     }
   }
-  // Pattern 3: Standalone PSO code line (e.g. "E76", "M58", "S79", "475")
   const standalone = line.trim().match(/^([A-Z]\d{2}|345|44\d|45\d|46\d|47\d)$/i);
   if (standalone) {
     return standalone[1].toUpperCase();
@@ -656,13 +701,12 @@ function extractPSOCode(line) {
   return null;
 }
 
-/**
- * Checks if a non-product line looks like a Pharmacy / Medical Hall / Party header
- */
 function isPharmacyCandidateLine(line) {
   const clean = line.trim();
   if (!clean || clean.length < 3) return false;
   if (/^(pso|cf|rf|c[\-_]?\d|assalamu|salam|hi|hello|crp\b)/i.test(clean)) return false;
+  // Support "Cus:", "Cus name:", "Customer:", "Party:" prefixes used in live orders
+  if (/^(cus|customer|party)\s*(?:name)?\s*[\-:=]/i.test(clean)) return true;
   if (/^(md\s+|ikbal\s+hossain|robiul\s+hossain|dawdul\s+islam|jahid\s+mondol|rezaul\s+haque|rejaul\s+hoque|mizan\b|sharif\b|rakib\b)/i.test(clean) && !/\b(pharmacy|pharma|phy|p\/h|medical|med|hall|mh|m\.h|drug|clinic|hospital|store|corner|center|centre)\b/i.test(clean)) {
     return false;
   }
@@ -672,9 +716,14 @@ function isPharmacyCandidateLine(line) {
   return false;
 }
 
-/**
- * Full Multi-Party & Multi-Line WhatsApp Order Message Parser
- */
+function cleanPharmacyName(raw) {
+  return raw
+    .replace(/^\s*\d+\s*[\)\/.]\s*\.*/, '')
+    .replace(/^(?:cus|customer|party)\s*(?:name)?\s*[\-:=]+\s*/i, '')
+    .replace(/\bpso\s*(?:code)?\s*[\-:=_.]?\s*[A-Z0-9]+/gi, '')
+    .trim();
+}
+
 function parseWhatsAppOrderMessage({
   messageText,
   messageId = `MSG_${Date.now()}`,
@@ -699,7 +748,6 @@ function parseWhatsAppOrderMessage({
 
   const daInfo = resolveDAFromMessageAndSender(messageText, senderPhone, senderPushName, senderJid);
 
-  // Find global PSO code in message if present (used as fallback only if a party block hasn't set its own PSO yet)
   let globalPso = null;
   for (const l of rawLines) {
     const p = extractPSOCode(l);
@@ -747,22 +795,18 @@ function parseWhatsAppOrderMessage({
       }
 
       if (isPharmacyCandidateLine(seg)) {
-        currentPharmacy = seg
-          .replace(/^\s*\d+\s*[\)\/.]\s*\.*/, '')
-          .replace(/\bpso\s*(?:code)?\s*[\-:=_.]?\s*[A-Z0-9]+/gi, '')
-          .trim();
+        currentPharmacy = cleanPharmacyName(seg);
       } else if (
         !potentialPartyHeader &&
         seg.length >= 3 &&
         seg.length <= 45 &&
         !/^(cf|rf|c[\-_]?\d|pso\b|\d+$)/i.test(seg)
       ) {
-        potentialPartyHeader = seg.replace(/^\s*\d+\s*[\)\/.]\s*\.*/, '').trim();
+        potentialPartyHeader = cleanPharmacyName(seg);
       }
     }
   }
 
-  // Check if this short message is a Follow-Up Context Patch (e.g. DA sends "C210012" or "S79" right after an order)
   if (parsedItems.length === 0 && rawLines.length <= 2 && messageText.length <= 35) {
     const onlyDaMatch = messageText.toUpperCase().match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b|\b(2100\d{2}|122\d{3})\b/);
     const onlyPsoMatch = extractPSOCode(messageText);
@@ -795,6 +839,12 @@ function parseWhatsAppOrderMessage({
     hour12: true
   });
 
+  // Prefer real BD phone number (from senderPhone or DA_MASTER) over raw @lid digits
+  let displayPhone = normalizeBdPhone(senderPhone);
+  if (!displayPhone.startsWith('8801') && daInfo.phones && daInfo.phones.length > 0) {
+    displayPhone = daInfo.phones[0];
+  }
+
   const finalOrders = parsedItems.map((item, idx) => ({
     orderLineId: `${messageId}_${idx + 1}`,
     whatsappMsgId: messageId,
@@ -803,7 +853,7 @@ function parseWhatsAppOrderMessage({
     daId: daInfo.daId,
     altId: daInfo.altId || '-',
     daName: daInfo.name,
-    senderPhone: senderPhone ? `+${senderPhone.replace(/\D/g, '')}` : '-',
+    senderPhone: displayPhone ? `+${displayPhone}` : '-',
     psoCode: item.psoCode,
     pharmacyName: item.pharmacyName,
     rawText: item.rawLine,
@@ -826,7 +876,125 @@ function parseWhatsAppOrderMessage({
 }
 
 // ============================================================================
-// 7. GOOGLE SHEETS API & CLOUD PERSISTENCE ENGINE
+// 7. HANDWRITTEN / PAPER PHOTO OCR ENGINE (GEMINI VISION + OCR.SPACE FALLBACK)
+// ============================================================================
+
+/**
+ * Extracts text from a handwritten or printed order photo buffer.
+ * Supports:
+ * 1. Google Gemini Flash Vision API (if GEMINI_API_KEY is set in Env or Web Dashboard - 100% Free Tier, highest handwriting accuracy)
+ * 2. Built-in OCR.space Engine 2 API (works out-of-the-box with zero config for camera/handwritten/printed text)
+ */
+async function extractTextFromOrderImage(imageBuffer, mimeType = 'image/jpeg') {
+  const base64Image = imageBuffer.toString('base64');
+  const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+
+  // Engine 1: Google Gemini Vision API (Best for Handwritten Paper Orders)
+  if (geminiKey) {
+    const models = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+    const productNamesHint = activeProducts.map((p) => `${p.name} (${p.code})`).join(', ');
+    const promptText =
+      'You are an expert OCR system for Renata PLC Bangladesh pharmaceutical order sheets. ' +
+      'Read this handwritten or printed order photo and output ONLY the plain text lines exactly as structured for order parsing: ' +
+      'Include any DA Code (like CF9054, RF20363, C122210), DA Name, Pharmacy/Customer Name, PSO Code (like PSO E71, G24, 450), ' +
+      'and every Product Name with its ordered Quantity (one product per line, e.g. "Totifen 100ml 50", "Doxicap 10"). ' +
+      `Known official products include: ${productNamesHint}. ` +
+      'Do NOT add markdown formatting or commentary—output only the raw extracted order lines.';
+
+    for (const modelName of models) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: promptText },
+                { inline_data: { mime_type: mimeType, data: base64Image } }
+              ]
+            }],
+            generationConfig: { temperature: 0.1 }
+          })
+        });
+        const data = await response.json();
+        const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
+        if (extracted) {
+          addLog(`📸 Image OCR (Gemini Vision ${modelName}) extracted ${extracted.split('\n').length} line(s).`);
+          return { text: extracted, engine: `Gemini Vision (${modelName})` };
+        }
+      } catch (err) {
+        addLog(`⚠️ Gemini Vision (${modelName}) warning: ${err.message}`);
+      }
+    }
+  }
+
+  // Engine 2: Built-in Zero-Config OCR.space Engine 2 (supports handwriting & camera photos)
+  try {
+    const ocrKey = (process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
+    const formBody = new URLSearchParams();
+    formBody.append('apikey', ocrKey);
+    formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
+    formBody.append('language', 'eng');
+    formBody.append('isOverlayRequired', 'false');
+    formBody.append('OCREngine', '2'); // Engine 2 is specialized for handwritten & weird fonts/camera photos
+    formBody.append('scale', 'true');
+    formBody.append('isTable', 'true');
+
+    const res = await fetch('https://api.ocr.space/parse/image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody.toString()
+    });
+    const json = await res.json();
+    const parsedText = (json?.ParsedResults || [])
+      .map((r) => r.ParsedText || '')
+      .join('\n')
+      .trim();
+
+    if (parsedText) {
+      addLog(`📸 Image OCR (Cloud Engine 2) extracted ${parsedText.split('\n').length} line(s).`);
+      return { text: parsedText, engine: 'Cloud OCR Engine 2' };
+    }
+  } catch (err) {
+    addLog(`⚠️ Cloud OCR Engine 2 error: ${err.message}`);
+  }
+
+  return { text: '', engine: 'None' };
+}
+
+/**
+ * Formats the WhatsApp confirmation reply message sent after saving an image order
+ */
+function buildImageOrderReplyMessage(orders, ocrEngine) {
+  const first = orders[0];
+  const totalAmount = orders.reduce((sum, o) => sum + o.totalAmount, 0);
+
+  const lines = [
+    '✅ *ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!*',
+    `👤 *DA:* [${first.daId}] ${first.daName}`,
+    `🏥 *Party:* ${first.pharmacyName} (PSO: ${first.psoCode})`,
+    '',
+    '📦 *অর্ডার বিস্তারিত (Trade Price অনুযায়ী):*'
+  ];
+
+  orders.forEach((o, i) => {
+    lines.push(
+      `${i + 1}. *${o.productName}* (Code: ${o.crpCode})\n   পরিমাণ: ${o.orderedQty} × ৳${o.unitPrice.toFixed(2)} = *৳${o.totalAmount.toFixed(2)}*`
+    );
+  });
+
+  lines.push('');
+  lines.push(`💰 *সর্বমোট (Grand Total): ৳${totalAmount.toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*`);
+  lines.push('');
+  lines.push('⚠️ _এই অর্ডারটি বাতিল করতে চাইলে এই মেসেজের Reply-তে লিখুন:_ */cnl*');
+  lines.push('_(অন্য কিছু লিখলে বা কিছু না লিখলে অর্ডারটি সেভ থাকবে)_');
+
+  return lines.join('\n');
+}
+
+// ============================================================================
+// 8. GOOGLE SHEETS API & CLOUD PERSISTENCE ENGINE
 // ============================================================================
 let sheetsClient = null;
 let googleAuthReady = false;
@@ -836,8 +1004,15 @@ let botConfig = {
   targetGroupId: process.env.TARGET_GROUP_ID || '',
   targetGroupName: process.env.TARGET_GROUP_NAME || 'CRP sales NK Depot',
   autoReactOnOrder: true,
+  geminiApiKey: process.env.GEMINI_API_KEY || '',
+  authorizedImageLids: [],
+  priceVersion: 'TRADE_PRICE_2026_10_30',
   updatedAt: null
 };
+
+// Map of Bot Reply Message ID (and Original Image Msg ID) -> Order WhatsApp Msg ID for "/cnl" cancellation
+const cancellableOrderMap = new Map();
+const lastOrderBySenderMap = new Map();
 
 if (fs.existsSync(LOCAL_CONFIG_PATH)) {
   try {
@@ -896,7 +1071,10 @@ async function initGoogleSheetsClient() {
   }
 }
 
-async function ensureSpreadsheetStructure() {
+/**
+ * Ensures all 5 tabs exist and upgrades Product_Wise_Summary & Live_Orders to official TRADE PRICE
+ */
+async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
   if (!sheetsClient || !GOOGLE_SHEET_ID) return false;
   try {
     const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
@@ -941,7 +1119,7 @@ async function ensureSpreadsheetStructure() {
             'Order Line ID', 'WhatsApp Msg ID', 'Date', 'Time', 'Primary DA ID',
             'Old / Alt ID', 'DA Name', 'Sender Phone', 'PSO Code', 'Pharmacy / Party Name',
             'Raw WhatsApp Text', 'CRP Code', 'Official Product Name', 'Pack Unit',
-            'Ordered Qty', 'Unit Price (BDT)', 'Total Amount (BDT)', 'Match Type', 'Status'
+            'Ordered Qty', 'Trade Price (BDT)', 'Total Amount (BDT)', 'Match Type', 'Status'
           ]]
         }
       });
@@ -962,7 +1140,7 @@ async function ensureSpreadsheetStructure() {
             'Order Line ID', 'WhatsApp Msg ID', 'Order Date', 'Order Time', 'Primary DA ID',
             'Old / Alt ID', 'DA Name', 'Sender Phone', 'PSO Code', 'Pharmacy / Party Name',
             'Raw WhatsApp Text', 'CRP Code', 'Official Product Name', 'Pack Unit',
-            'Ordered Qty', 'Unit Price (BDT)', 'Total Amount (BDT)', 'Match Type',
+            'Ordered Qty', 'Trade Price (BDT)', 'Total Amount (BDT)', 'Match Type',
             'Action Reason', 'Deleted / Replaced At'
           ]]
         }
@@ -993,7 +1171,7 @@ async function ensureSpreadsheetStructure() {
           `=COUNTIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum})`,
           `=SUMIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum}, ${SHEET_TABS.LIVE_ORDERS}!O:O)`,
           `=SUMIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum}, ${SHEET_TABS.LIVE_ORDERS}!Q:Q)`,
-          `=IFERROR(INDEX(FILTER(${SHEET_TABS.LIVE_ORDERS}!C:C & " " & ${SHEET_TABS.LIVE_ORDERS}!D:D, ${SHEET_TABS.LIVE_ORDERS}!E:E=B${rowNum}), COUNTIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum})), "-")`
+          `=IFERROR(INDEX(FILTER(${SHEET_TABS.LIVE_ORDERS}!C:C & " " & TEXT(${SHEET_TABS.LIVE_ORDERS}!D:D, "hh:mm:ss AM/PM"), ${SHEET_TABS.LIVE_ORDERS}!E:E=B${rowNum}), COUNTIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum})), "-")`
         ]);
       });
       const totalRowNum = DA_MASTER.length + 2;
@@ -1012,16 +1190,12 @@ async function ensureSpreadsheetStructure() {
       });
     }
 
-    // 4. Product_Wise_Summary Tab
-    const prodRes = await sheetsClient.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.PRODUCT_SUMMARY}!A1:G100`
-    });
-    if (!prodRes.data.values || prodRes.data.values.length <= 1) {
+    // 4. Product_Wise_Summary Tab — Write Official TRADE PRICE from Current Pricie List (30-10-26).xlsx
+    if (forceUpdateTradePrices) {
       const prodRows = [
         [
           'CRP Code', 'Official Product Name (CRP.xlsx)', 'Pack Unit',
-          'Editable Unit Price (BDT)', 'Total Order Lines',
+          'Official Trade Price (BDT)', 'Total Order Lines',
           'Total Quantity Ordered', 'Total Order Amount (BDT)'
         ]
       ];
@@ -1051,8 +1225,9 @@ async function ensureSpreadsheetStructure() {
         valueInputOption: 'USER_ENTERED',
         requestBody: { values: prodRows }
       });
-    } else {
-      syncProductsFromSheetRows(prodRes.data.values);
+
+      // Also migrate any existing rows in Live_Orders to the new TRADE PRICE!
+      await migrateExistingLiveOrdersToTradePrice();
     }
 
     return true;
@@ -1062,44 +1237,56 @@ async function ensureSpreadsheetStructure() {
   }
 }
 
-function syncProductsFromSheetRows(rows) {
-  if (!rows || rows.length <= 1) return;
-  let updatedCount = 0;
-  for (let i = 1; i < rows.length; i++) {
-    const [code, name, unit, priceStr] = rows[i];
-    if (!code || code === 'TOTAL') continue;
-    const cleanCode = String(code).trim();
-    const cleanPrice = parseFloat(String(priceStr || '').replace(/[^\d.]/g, ''));
-    if (isNaN(cleanPrice) || cleanPrice <= 0) continue;
+/**
+ * Updates any existing rows in Live_Orders so their Unit Price & Total Amount reflect the new TRADE PRICE
+ */
+async function migrateExistingLiveOrdersToTradePrice() {
+  if (!sheetsClient || !GOOGLE_SHEET_ID) return;
+  try {
+    const res = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${SHEET_TABS.LIVE_ORDERS}!A1:S`
+    });
+    const rows = res.data.values || [];
+    if (rows.length <= 1) return;
 
-    const existing = activeProducts.find((p) => p.code === cleanCode);
-    if (existing) {
-      if (existing.price !== cleanPrice) {
-        existing.price = cleanPrice;
-        updatedCount++;
+    const updates = [];
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const crpCode = String(row[11] || '').trim();
+      const qty = parseFloat(String(row[14] || '0').replace(/,/g, ''));
+      const currentUnitPrice = parseFloat(String(row[15] || '0').replace(/[^\d.]/g, ''));
+
+      if (crpCode && TRADE_PRICE_MAP.has(crpCode) && qty > 0) {
+        const officialTp = TRADE_PRICE_MAP.get(crpCode);
+        if (Math.abs(currentUnitPrice - officialTp) > 0.001) {
+          const newTotal = Number((qty * officialTp).toFixed(2));
+          const rowNum = r + 1;
+          updates.push({
+            range: `${SHEET_TABS.LIVE_ORDERS}!P${rowNum}:Q${rowNum}`,
+            values: [[officialTp, newTotal]]
+          });
+        }
       }
-      if (name) existing.name = String(name).trim();
-      if (unit) existing.unit = String(unit).trim();
-    } else if (name) {
-      const cleanName = String(name).trim();
-      activeProducts.push({
-        code: cleanCode,
-        name: cleanName,
-        unit: unit ? String(unit).trim() : 'Pack',
-        price: cleanPrice,
-        family: cleanName.split(/\s+/)[0].toUpperCase(),
-        aliases: [cleanName.toLowerCase(), cleanName.split(/\s+/)[0].toLowerCase()]
-      });
-      updatedCount++;
     }
-  }
-  if (updatedCount > 0) {
-    addLog(`🔄 Synced ${updatedCount} updated product prices/items from Google Sheet.`);
+
+    if (updates.length > 0) {
+      await sheetsClient.spreadsheets.values.batchUpdate({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        requestBody: {
+          valueInputOption: 'USER_ENTERED',
+          data: updates
+        }
+      });
+      addLog(`💲 Updated ${updates.length} existing order row(s) in Live_Orders to new TRADE PRICE.`);
+    }
+  } catch (err) {
+    addLog(`⚠️ Trade price migration note: ${err.message}`);
   }
 }
 
 // ============================================================================
-// 8. PERMANENT CLOUD SESSION & CONFIG BACKUP IN GOOGLE SHEETS (_Bot_State)
+// 9. PERMANENT CLOUD SESSION & CONFIG BACKUP IN GOOGLE SHEETS (_Bot_State)
 // ============================================================================
 let stateBackupTimer = null;
 
@@ -1180,7 +1367,7 @@ async function restoreAuthAndConfigFromSheet() {
           const parsedConfig = JSON.parse(val);
           botConfig = { ...botConfig, ...parsedConfig };
           saveLocalConfig();
-          addLog(`☁️ Restored saved group config from Google Sheet: "${botConfig.targetGroupName}" (${botConfig.targetGroupId || 'Not set'})`);
+          addLog(`☁️ Restored saved group config from Google Sheet: "${botConfig.targetGroupName}"`);
         } catch (e) {}
       } else if (key && key.startsWith('WA_AUTH_GZIP') && val) {
         compressedChunks.push(val);
@@ -1213,7 +1400,7 @@ async function restoreAuthAndConfigFromSheet() {
 }
 
 // ============================================================================
-// 9. GOOGLE SHEETS ORDER CRUD: SAVE, EDIT/REPLACE, UNSEND/DELETE, & PATCH
+// 10. GOOGLE SHEETS ORDER CRUD: SAVE, EDIT/REPLACE, UNSEND/DELETE, & /CNL
 // ============================================================================
 let sheetQueue = Promise.resolve();
 function enqueueSheetTask(taskFn) {
@@ -1229,9 +1416,12 @@ async function appendOrdersToSheet(orders) {
     for (const o of orders) {
       recentOrders.unshift(o);
     }
-    if (recentOrders.length > 200) recentOrders.length = 200;
+    // Keep memory footprint small on Render Free Tier (max 50 items in RAM)
+    if (recentOrders.length > 50) recentOrders.length = 50;
     stats.totalOrdersSaved += orders.length;
-    stats.totalAmountSaved += orders.reduce((acc, x) => acc + x.totalAmount, 0);
+    stats.totalAmountSaved = Number(
+      (stats.totalAmountSaved + orders.reduce((acc, x) => acc + x.totalAmount, 0)).toFixed(2)
+    );
 
     if (!sheetsClient || !googleAuthReady) {
       addLog(`⚠️ Order parsed locally (${orders.length} items) — waiting for Google Sheets credentials.`);
@@ -1241,8 +1431,8 @@ async function appendOrdersToSheet(orders) {
     const values = orders.map((o) => [
       o.orderLineId,
       o.whatsappMsgId,
-      o.date,
-      o.time,
+      `'${o.date}`, // Leading apostrophe prevents Google Sheets serial number conversion
+      `'${o.time}`,
       o.daId,
       o.altId,
       o.daName,
@@ -1282,16 +1472,16 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
         removedLocal.push(rem);
       }
     }
-    if (removedLocal.length > 0 && reason === 'UNSENT_BY_USER') {
+    if (removedLocal.length > 0 && (reason === 'UNSENT_BY_USER' || reason === 'CANCELLED_BY_CNL')) {
       stats.totalOrdersDeleted += removedLocal.length;
       stats.totalOrdersSaved = Math.max(0, stats.totalOrdersSaved - removedLocal.length);
       const subtracted = removedLocal.reduce((acc, x) => acc + (x.totalAmount || 0), 0);
-      stats.totalAmountSaved = Math.max(0, stats.totalAmountSaved - subtracted);
+      stats.totalAmountSaved = Number(Math.max(0, stats.totalAmountSaved - subtracted).toFixed(2));
     }
 
     if (!sheetsClient || !googleAuthReady) {
       if (removedLocal.length > 0) {
-        addLog(`🗑️ Removed ${removedLocal.length} unsent order(s) from memory (Msg ID: ${whatsappMsgId}).`);
+        addLog(`🗑️ Removed ${removedLocal.length} order(s) from memory (${reason}, Msg ID: ${whatsappMsgId}).`);
       }
       return removedLocal.length;
     }
@@ -1326,7 +1516,7 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
       }
     }
 
-    if (matchingZeroBasedIndices.length === 0) return 0;
+    if (matchingZeroBasedIndices.length === 0) return removedLocal.length;
 
     const deleteRequests = matchingZeroBasedIndices
       .sort((a, b) => b - a)
@@ -1366,7 +1556,7 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
 async function applyFollowUpPatchToSheet(patch) {
   if (!patch) return;
   return enqueueSheetTask(async () => {
-    const cleanPhone = patch.senderPhone ? `+${patch.senderPhone.replace(/\D/g, '')}` : '';
+    const cleanPhone = patch.senderPhone ? `+${normalizeBdPhone(patch.senderPhone)}` : '';
     for (const o of recentOrders) {
       if (cleanPhone && o.senderPhone === cleanPhone) {
         if (patch.daInfo && (o.daId.startsWith('WA-') || o.daId === 'UNKNOWN')) {
@@ -1423,7 +1613,7 @@ async function applyFollowUpPatchToSheet(patch) {
 }
 
 // ============================================================================
-// 10. WHATSAPP BAILEYS ENGINE (QR LOGIN, GROUP LIST, ORDER & UNSEND LISTENER)
+// 11. WHATSAPP BAILEYS ENGINE (QR, GROUP, IMAGE OCR, /CNL CANCEL & UNSEND)
 // ============================================================================
 let sock = null;
 let waStatus = 'DISCONNECTED';
@@ -1448,14 +1638,19 @@ function addLog(msg) {
   const entry = `[${time}] ${msg}`;
   console.log(entry);
   activityLogs.unshift(entry);
-  if (activityLogs.length > 120) activityLogs.length = 120;
+  // Keep max 60 logs in memory so Render Free Tier RAM stays minimal
+  if (activityLogs.length > 60) activityLogs.length = 60;
 }
 
+/**
+ * Inspects a Baileys WAMessage for REVOKE (unsend), EDIT, IMAGE, or TEXT (including quoted /cnl replies)
+ */
 function inspectBaileysMessage(msg) {
   if (!msg || !msg.message) return { type: 'IGNORE' };
 
   const m = msg.message;
 
+  // 1. Unsend / Delete for Everyone (REVOKE)
   const proto =
     m.protocolMessage ||
     m.ephemeralMessage?.message?.protocolMessage ||
@@ -1469,6 +1664,7 @@ function inspectBaileysMessage(msg) {
     };
   }
 
+  // 2. Edited Message
   const editedObj =
     m.editedMessage?.message?.protocolMessage ||
     m.protocolMessage?.editedMessage ||
@@ -1493,20 +1689,42 @@ function inspectBaileysMessage(msg) {
     }
   }
 
+  // 3. Image Message (Handwritten / Paper Order Photo)
+  const imgMsg =
+    m.imageMessage ||
+    m.ephemeralMessage?.message?.imageMessage ||
+    m.viewOnceMessage?.message?.imageMessage ||
+    (m.documentMessage && String(m.documentMessage.mimetype || '').startsWith('image/')
+      ? m.documentMessage
+      : null);
+
+  if (imgMsg) {
+    return {
+      type: 'IMAGE',
+      msgId: msg.key.id,
+      caption: (imgMsg.caption || '').trim(),
+      mimeType: imgMsg.mimetype || 'image/jpeg',
+      remoteJid: msg.key.remoteJid,
+      rawMsg: msg
+    };
+  }
+
+  // 4. Standard Text or Quoted Reply Message
+  const extMsg = m.extendedTextMessage || m.ephemeralMessage?.message?.extendedTextMessage;
   const text =
     m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.documentMessage?.caption ||
+    extMsg?.text ||
     m.ephemeralMessage?.message?.conversation ||
-    m.ephemeralMessage?.message?.extendedTextMessage?.text ||
     '';
+
+  const quotedMsgId = extMsg?.contextInfo?.stanzaId || null;
 
   if (text.trim()) {
     return {
       type: 'TEXT',
       msgId: msg.key.id,
       text: text.trim(),
+      quotedMsgId,
       remoteJid: msg.key.remoteJid
     };
   }
@@ -1514,11 +1732,39 @@ function inspectBaileysMessage(msg) {
   return { type: 'IGNORE' };
 }
 
+/**
+ * Harvests participant @lid -> Phone Number mappings from group metadata
+ */
+function harvestLidMappingsFromGroups(groupsList) {
+  for (const g of groupsList || []) {
+    for (const p of g.participants || []) {
+      const ids = [p.id, p.jid, p.lid, p.phoneNumber].filter(Boolean);
+      let lidPart = null;
+      let phonePart = null;
+      for (const item of ids) {
+        const s = String(item);
+        if (s.endsWith('@lid')) {
+          lidPart = s.split('@')[0].split(':')[0];
+        } else if (s.endsWith('@s.whatsapp.net')) {
+          const norm = normalizeBdPhone(s.split('@')[0].split(':')[0]);
+          if (norm.startsWith('8801')) phonePart = norm;
+        }
+      }
+      if (lidPart && phonePart) {
+        lidToPhoneMap.set(lidPart, phonePart);
+      }
+    }
+  }
+}
+
 async function refreshJoinedGroups() {
   if (!sock || waStatus !== 'CONNECTED') return [];
   try {
     const groupsObj = await sock.groupFetchAllParticipating();
-    joinedGroups = Object.values(groupsObj)
+    const rawGroups = Object.values(groupsObj);
+    harvestLidMappingsFromGroups(rawGroups);
+
+    joinedGroups = rawGroups
       .map((g) => ({
         id: g.id,
         subject: g.subject || 'Unnamed Group',
@@ -1576,6 +1822,16 @@ async function startWhatsApp() {
       scheduleCloudStateBackup(6000);
     });
 
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts || []) {
+        if (c.lid && c.id && c.id.endsWith('@s.whatsapp.net')) {
+          const lid = c.lid.split('@')[0].split(':')[0];
+          const ph = normalizeBdPhone(c.id.split('@')[0].split(':')[0]);
+          if (ph.startsWith('8801')) lidToPhoneMap.set(lid, ph);
+        }
+      }
+    });
+
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -1590,8 +1846,14 @@ async function startWhatsApp() {
         currentQrDataUrl = null;
         connectedUser = {
           id: sock.user?.id || '',
-          name: sock.user?.name || 'WhatsApp User'
+          name: sock.user?.name || 'WhatsApp User',
+          lid: sock.user?.lid || ''
         };
+        if (connectedUser.lid && connectedUser.id) {
+          const botLid = connectedUser.lid.split('@')[0].split(':')[0];
+          const botPh = normalizeBdPhone(connectedUser.id.split('@')[0].split(':')[0]);
+          if (botPh.startsWith('8801')) lidToPhoneMap.set(botLid, botPh);
+        }
         addLog(`🟢 WhatsApp Connected as ${connectedUser.name} (${connectedUser.id})`);
         await refreshJoinedGroups();
         scheduleCloudStateBackup(3000);
@@ -1617,15 +1879,18 @@ async function startWhatsApp() {
       }
     });
 
+    // Listen for New Messages, Image Orders, "/cnl" Replies, Edited Messages, and Unsend Events
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return;
 
       for (const msg of messages) {
         try {
           const remoteJid = msg.key?.remoteJid || '';
-          if (!remoteJid.endsWith('@g.us')) continue;
+          if (!remoteJid || remoteJid === 'status@broadcast') continue;
 
-          if (botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) {
+          const isGroup = remoteJid.endsWith('@g.us');
+          // For group messages, only listen to the configured target group
+          if (isGroup && botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) {
             continue;
           }
 
@@ -1633,18 +1898,21 @@ async function startWhatsApp() {
           if (inspected.type === 'IGNORE') continue;
 
           const senderJid = msg.key.participant || msg.participant || remoteJid;
-          const senderPhone = senderJid.split('@')[0].split(':')[0];
+          const rawSenderId = senderJid.split('@')[0].split(':')[0];
+          let senderPhone = resolveRealSenderPhone(msg);
           const senderPushName = msg.pushName || '';
           const msgTimestamp = msg.messageTimestamp
             ? Number(msg.messageTimestamp) * 1000
             : Date.now();
 
+          // CASE 1: Message Unsent / Deleted for Everyone
           if (inspected.type === 'REVOKE') {
-            addLog(`🚨 Unsend/Delete detected in group for Msg ID: ${inspected.targetMsgId}`);
+            addLog(`🚨 Unsend/Delete detected for Msg ID: ${inspected.targetMsgId}`);
             await removeOrdersByMessageId(inspected.targetMsgId, 'UNSENT_BY_USER');
             continue;
           }
 
+          // CASE 2: Message Edited
           if (inspected.type === 'EDIT') {
             addLog(`✏️ Message Edit detected for Msg ID: ${inspected.targetMsgId}`);
             await removeOrdersByMessageId(inspected.targetMsgId, 'REPLACED_BY_EDIT');
@@ -1662,7 +1930,199 @@ async function startWhatsApp() {
             continue;
           }
 
+          // CASE 3: Handwritten / Paper Image Order (Strictly restricted to +8801732273944 & +8801793362829)
+          if (inspected.type === 'IMAGE') {
+            // If senderPhone is still an unmapped @lid in a group, fetch groupMetadata on the spot
+            if (!senderPhone.startsWith('8801') && isGroup && sock) {
+              try {
+                const gMeta = await sock.groupMetadata(remoteJid);
+                harvestLidMappingsFromGroups([gMeta]);
+                senderPhone = resolveRealSenderPhone(msg);
+              } catch (e) {}
+            }
+
+            if (!isAuthorizedForImageOrder(msg, senderPhone)) {
+              addLog(
+                `⛔ Ignored image from unauthorized sender (${senderPhone || rawSenderId} / ${senderPushName}). Only +8801732273944 & +8801793362829 are allowed.`
+              );
+              continue;
+            }
+
+            addLog(`📸 Authorized image received from +${senderPhone || rawSenderId}. Running OCR...`);
+            if (sock) {
+              try {
+                await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+              } catch (e) {}
+            }
+
+            let imageBuffer = null;
+            try {
+              imageBuffer = await downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+                { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+              );
+            } catch (dlErr) {
+              addLog(`❌ Failed to download image media: ${dlErr.message}`);
+              continue;
+            }
+
+            const ocrResult = await extractTextFromOrderImage(imageBuffer, inspected.mimeType);
+            imageBuffer = null; // Free buffer immediately for Render memory safety
+
+            const combinedText = [inspected.caption, ocrResult.text].filter(Boolean).join('\n').trim();
+            if (!combinedText) {
+              addLog('⚠️ Image OCR returned empty text.');
+              if (sock) {
+                try {
+                  await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ ছবির লেখাটি পড়া যায়নি। অনুগ্রহ করে পরিষ্কার আলোতে ছবি তুলে আবার পাঠান।' },
+                    { quoted: msg }
+                  );
+                } catch (e) {}
+              }
+              continue;
+            }
+
+            const parsedImgOrder = parseWhatsAppOrderMessage({
+              messageText: combinedText,
+              messageId: inspected.msgId,
+              timestamp: msgTimestamp,
+              senderPhone,
+              senderPushName,
+              senderJid
+            });
+
+            if (parsedImgOrder.isOrder && parsedImgOrder.orders.length > 0) {
+              // 1. Save immediately to Google Sheets
+              await appendOrdersToSheet(parsedImgOrder.orders);
+
+              // 2. Register message ID for "/cnl" cancellation
+              cancellableOrderMap.set(inspected.msgId, inspected.msgId);
+              lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
+              if (senderPhone) lastOrderBySenderMap.set(senderPhone, inspected.msgId);
+
+              // 3. Send detailed confirmation reply with "/cnl" instruction
+              const replyText = buildImageOrderReplyMessage(parsedImgOrder.orders, ocrResult.engine);
+              if (sock) {
+                try {
+                  const sentReply = await sock.sendMessage(
+                    remoteJid,
+                    { text: replyText },
+                    { quoted: msg }
+                  );
+                  if (sentReply?.key?.id) {
+                    cancellableOrderMap.set(sentReply.key.id, inspected.msgId);
+                  }
+                  await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                } catch (sendErr) {
+                  addLog(`⚠️ Could not send confirmation reply: ${sendErr.message}`);
+                }
+              }
+            } else {
+              addLog(`⚠️ No valid CRP products found in OCR text: "${combinedText.replace(/\n/g, ' | ')}"`);
+              if (sock) {
+                try {
+                  await sock.sendMessage(
+                    remoteJid,
+                    {
+                      text: `⚠️ ছবি থেকে কোনো CRP প্রোডাক্টের অর্ডার শনাক্ত করা যায়নি।\n\n*শনাক্তকৃত লেখা:*\n${combinedText.slice(0, 300)}`
+                    },
+                    { quoted: msg }
+                  );
+                } catch (e) {}
+              }
+            }
+            continue;
+          }
+
+          // CASE 4: Text Messages (Check for "/cnl" Cancel Reply OR "/bind" OR Standard Text Order)
           if (inspected.type === 'TEXT') {
+            // Skip bot's own confirmation replies so it doesn't re-parse its own confirmation text!
+            if (
+              inspected.text.includes('ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!') ||
+              inspected.text.includes('অর্ডারটি বাতিল (/cnl) করা হয়েছে!')
+            ) {
+              continue;
+            }
+
+            // A. Check if user is binding their LID to one of the two authorized image phone numbers: "/bind 01732273944"
+            const bindMatch = inspected.text.match(/^\/bind\s+(\+?\d{11,13})$/i);
+            if (bindMatch) {
+              const targetPh = normalizeBdPhone(bindMatch[1]);
+              if (AUTHORIZED_IMAGE_PHONES.includes(targetPh)) {
+                lidToPhoneMap.set(rawSenderId, targetPh);
+                if (!botConfig.authorizedImageLids) botConfig.authorizedImageLids = [];
+                if (!botConfig.authorizedImageLids.includes(rawSenderId)) {
+                  botConfig.authorizedImageLids.push(rawSenderId);
+                }
+                saveLocalConfig();
+                scheduleCloudStateBackup(2000);
+                addLog(`🔗 Bound sender ID ${rawSenderId} to authorized image phone +${targetPh}`);
+                if (sock) {
+                  try {
+                    await sock.sendMessage(
+                      remoteJid,
+                      { text: `✅ আপনার অ্যাকাউন্টটি (+${targetPh}) ছবির অর্ডারের জন্য সফলভাবে যুক্ত হয়েছে!` },
+                      { quoted: msg }
+                    );
+                  } catch (e) {}
+                }
+              }
+              continue;
+            }
+
+            // B. Check if message is "/cnl" (Cancel Command)
+            if (/^\/?cnl\b/i.test(inspected.text.trim())) {
+              let targetOrderMsgId = null;
+              if (inspected.quotedMsgId) {
+                targetOrderMsgId =
+                  cancellableOrderMap.get(inspected.quotedMsgId) || inspected.quotedMsgId;
+              } else {
+                targetOrderMsgId =
+                  lastOrderBySenderMap.get(rawSenderId) ||
+                  lastOrderBySenderMap.get(senderPhone) ||
+                  null;
+              }
+
+              if (targetOrderMsgId) {
+                const removedCount = await removeOrdersByMessageId(
+                  targetOrderMsgId,
+                  'CANCELLED_BY_CNL'
+                );
+                if (removedCount > 0) {
+                  addLog(`❌ Order (${targetOrderMsgId}) cancelled via /cnl command (${removedCount} lines removed).`);
+                  if (sock) {
+                    try {
+                      await sock.sendMessage(
+                        remoteJid,
+                        {
+                          text: `❌ *অর্ডারটি বাতিল (/cnl) করা হয়েছে!*\nGoogle Sheet থেকে ওই অর্ডারের *${removedCount}টি লাইন* মুছে ফেলা হয়েছে।`
+                        },
+                        { quoted: msg }
+                      );
+                    } catch (e) {}
+                  }
+                } else {
+                  if (sock) {
+                    try {
+                      await sock.sendMessage(
+                        remoteJid,
+                        { text: '⚠️ বাতিল করার মতো কোনো সক্রিয় অর্ডার খুঁজে পাওয়া যায়নি (হয়তো আগেই মুছে ফেলা হয়েছে)।' },
+                        { quoted: msg }
+                      );
+                    } catch (e) {}
+                  }
+                }
+              }
+              continue;
+            }
+
+            // C. Standard Text Order (only from target group)
+            if (!isGroup) continue;
+
             stats.totalMessagesChecked++;
             const parsed = parseWhatsAppOrderMessage({
               messageText: inspected.text,
@@ -1675,6 +2135,8 @@ async function startWhatsApp() {
 
             if (parsed.isOrder && parsed.orders.length > 0) {
               await appendOrdersToSheet(parsed.orders);
+              cancellableOrderMap.set(inspected.msgId, inspected.msgId);
+              lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
               if (botConfig.autoReactOnOrder && sock) {
                 try {
                   await sock.sendMessage(remoteJid, {
@@ -1696,8 +2158,10 @@ async function startWhatsApp() {
       for (const u of updates) {
         try {
           const remoteJid = u.key?.remoteJid || '';
-          if (!remoteJid.endsWith('@g.us')) continue;
-          if (botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) continue;
+          if (!remoteJid) continue;
+          if (remoteJid.endsWith('@g.us') && botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) {
+            continue;
+          }
 
           if (
             u.update?.message === null ||
@@ -1718,7 +2182,7 @@ async function startWhatsApp() {
             if (inspected.type === 'EDIT') {
               await removeOrdersByMessageId(inspected.targetMsgId, 'REPLACED_BY_EDIT');
               const senderJid = u.key.participant || remoteJid;
-              const senderPhone = senderJid.split('@')[0].split(':')[0];
+              const senderPhone = resolveRealSenderPhone({ key: u.key });
               const parsedEdit = parseWhatsAppOrderMessage({
                 messageText: inspected.text,
                 messageId: inspected.targetMsgId,
@@ -1744,10 +2208,10 @@ async function startWhatsApp() {
 }
 
 // ============================================================================
-// 11. EXPRESS WEB SERVER, API ENDPOINTS & INTERACTIVE DASHBOARD UI
+// 12. EXPRESS WEB SERVER, CLEAR LOGS/ORDERS API & DASHBOARD UI
 // ============================================================================
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -1769,14 +2233,41 @@ app.get('/api/status', (req, res) => {
     googleAuthError,
     googleSheetId: GOOGLE_SHEET_ID,
     googleSheetUrl: `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/edit`,
-    botConfig,
+    botConfig: {
+      ...botConfig,
+      hasGeminiKey: Boolean(botConfig.geminiApiKey || process.env.GEMINI_API_KEY)
+    },
+    authorizedImagePhones: AUTHORIZED_IMAGE_PHONES.map((p) => '+' + p),
     joinedGroups,
     stats,
+    memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     recentOrders: recentOrders.slice(0, 40),
     logs: activityLogs.slice(0, 50),
     productCount: activeProducts.length,
     daCount: DA_MASTER.length
   });
+});
+
+// Clear Live Parsed Orders from Render Memory (saves RAM without deleting Google Sheet data)
+app.post('/api/orders/clear', (req, res) => {
+  const count = recentOrders.length;
+  recentOrders.length = 0;
+  cancellableOrderMap.clear();
+  if (global.gc) {
+    try { global.gc(); } catch (e) {}
+  }
+  addLog(`🧹 Cleared ${count} order(s) from Live Parsed Orders memory buffer.`);
+  res.json({ ok: true, cleared: count, memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
+});
+
+// Clear Live Server Logs from Render Memory
+app.post('/api/logs/clear', (req, res) => {
+  activityLogs.length = 0;
+  if (global.gc) {
+    try { global.gc(); } catch (e) {}
+  }
+  addLog('🧹 Server logs cleared manually to free memory.');
+  res.json({ ok: true, memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
 });
 
 app.post('/api/groups/refresh', async (req, res) => {
@@ -1785,15 +2276,18 @@ app.post('/api/groups/refresh', async (req, res) => {
 });
 
 app.post('/api/config/group', async (req, res) => {
-  const { groupId, groupName, autoReactOnOrder } = req.body || {};
+  const { groupId, groupName, autoReactOnOrder, geminiApiKey } = req.body || {};
   if (typeof groupId === 'string') botConfig.targetGroupId = groupId.trim();
   if (typeof groupName === 'string') botConfig.targetGroupName = groupName.trim();
   if (typeof autoReactOnOrder === 'boolean') botConfig.autoReactOnOrder = autoReactOnOrder;
+  if (typeof geminiApiKey === 'string' && geminiApiKey.trim()) {
+    botConfig.geminiApiKey = geminiApiKey.trim();
+  }
   botConfig.updatedAt = new Date().toISOString();
 
   saveLocalConfig();
   await backupAuthAndConfigToSheet();
-  addLog(`🔒 Target Group locked & saved to cloud: "${botConfig.targetGroupName}" (${botConfig.targetGroupId || 'All/Auto'})`);
+  addLog(`🔒 Settings saved to cloud: Group="${botConfig.targetGroupName}"`);
   res.json({ ok: true, botConfig });
 });
 
@@ -1801,7 +2295,7 @@ app.post('/api/test-parse', async (req, res) => {
   const { messageText, senderPhone, senderName, saveToSheet, simulateUnsendMsgId } = req.body || {};
 
   if (simulateUnsendMsgId) {
-    const removedCount = await removeOrdersByMessageId(simulateUnsendMsgId, 'UNSENT_BY_USER');
+    const removedCount = await removeOrdersByMessageId(simulateUnsendMsgId, 'CANCELLED_BY_CNL');
     return res.json({ ok: true, action: 'UNSEND_SIMULATED', removedCount });
   }
 
@@ -1810,9 +2304,9 @@ app.post('/api/test-parse', async (req, res) => {
     messageText: messageText || '',
     messageId: msgId,
     timestamp: new Date(),
-    senderPhone: senderPhone || '8801602791043',
-    senderPushName: senderName || 'Md Rakib Hossain',
-    senderJid: `${senderPhone || '8801602791043'}@s.whatsapp.net`
+    senderPhone: senderPhone || '8801732273944',
+    senderPushName: senderName || 'Moajjem',
+    senderJid: `${senderPhone || '8801732273944'}@s.whatsapp.net`
   });
 
   if (saveToSheet && result.isOrder && result.orders.length > 0) {
@@ -1826,16 +2320,14 @@ app.post('/api/sheets/sync', async (req, res) => {
   if (!googleAuthReady) {
     await initGoogleSheetsClient();
   }
-  const ok = await ensureSpreadsheetStructure();
+  const ok = await ensureSpreadsheetStructure(true);
   await backupAuthAndConfigToSheet();
   res.json({ ok, googleAuthReady, googleAuthError, productCount: activeProducts.length });
 });
 
 app.post('/api/whatsapp/logout', async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout();
-    }
+    if (sock) await sock.logout();
   } catch (e) {}
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -1855,7 +2347,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Renata CRP WhatsApp Order Tracker & Auto Google Sheets Sync</title>
+  <title>Renata CRP WhatsApp Order Tracker v3.0 (Trade Price + Image OCR)</title>
   <style>
     :root {
       --bg: #0f172a;
@@ -1877,7 +2369,7 @@ app.get('/', (req, res) => {
       line-height: 1.5;
       padding: 20px;
     }
-    .container { max-width: 1240px; margin: 0 auto; }
+    .container { max-width: 1260px; margin: 0 auto; }
     header {
       display: flex;
       flex-wrap: wrap;
@@ -1890,15 +2382,15 @@ app.get('/', (req, res) => {
       border-radius: 14px;
       margin-bottom: 20px;
     }
-    header h1 { font-size: 1.35rem; font-weight: 700; color: #fff; }
-    header p { color: var(--muted); font-size: 0.9rem; margin-top: 4px; }
+    header h1 { font-size: 1.3rem; font-weight: 700; color: #fff; }
+    header p { color: var(--muted); font-size: 0.88rem; margin-top: 4px; }
     .badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 6px 14px;
+      padding: 6px 13px;
       border-radius: 999px;
-      font-size: 0.82rem;
+      font-size: 0.8rem;
       font-weight: 600;
     }
     .badge.ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
@@ -1917,13 +2409,15 @@ app.get('/', (req, res) => {
       padding: 20px;
     }
     .card h2 {
-      font-size: 1.05rem;
+      font-size: 1.02rem;
       margin-bottom: 12px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       border-bottom: 1px solid var(--border);
       padding-bottom: 10px;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .qr-box {
       display: flex;
@@ -1933,34 +2427,34 @@ app.get('/', (req, res) => {
       padding: 16px;
       background: #0b1120;
       border-radius: 12px;
-      min-height: 250px;
+      min-height: 240px;
       text-align: center;
     }
     .qr-box img {
-      max-width: 240px;
+      max-width: 230px;
       border-radius: 10px;
       border: 4px solid #fff;
       margin-bottom: 10px;
     }
-    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; margin-top: 12px; }
+    label { display: block; font-size: 0.83rem; color: var(--muted); margin-bottom: 5px; margin-top: 10px; }
     select, input, textarea {
       width: 100%;
       background: #0b1120;
       border: 1px solid var(--border);
       color: var(--text);
-      padding: 10px 12px;
+      padding: 9px 12px;
       border-radius: 8px;
-      font-size: 0.92rem;
+      font-size: 0.9rem;
     }
-    textarea { min-height: 110px; font-family: monospace; resize: vertical; }
+    textarea { min-height: 105px; font-family: monospace; resize: vertical; }
     .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
     button, .btn-link {
       cursor: pointer;
       border: none;
-      padding: 10px 16px;
+      padding: 9px 14px;
       border-radius: 8px;
       font-weight: 600;
-      font-size: 0.88rem;
+      font-size: 0.85rem;
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -1973,6 +2467,7 @@ app.get('/', (req, res) => {
     .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
     .btn-outline:hover { background: #334155; }
     .btn-danger { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.35); color: #fff; }
     .stats-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -1985,9 +2480,9 @@ app.get('/', (req, res) => {
       padding: 14px 16px;
       border-radius: 12px;
     }
-    .stat-card .lbl { font-size: 0.78rem; color: var(--muted); }
-    .stat-card .val { font-size: 1.4rem; font-weight: 700; color: #fff; margin-top: 4px; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
+    .stat-card .lbl { font-size: 0.76rem; color: var(--muted); }
+    .stat-card .val { font-size: 1.35rem; font-weight: 700; color: #fff; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
     th, td {
       padding: 9px 10px;
       border-bottom: 1px solid var(--border);
@@ -2013,12 +2508,13 @@ app.get('/', (req, res) => {
   <div class="container">
     <header>
       <div>
-        <h1>📦 Renata PLC (NK Depot) — WhatsApp CRP Order Auto-Tracker</h1>
-        <p>অটোমেটিক ওয়াটসঅ্যাপ গ্রুপ অর্ডার ট্র্যাকার, বানান সংশোধন (78 CRP Products & 46 DAs) এবং আনসেন্ড (Unsend) অটো-রিমুভ সিস্টেম</p>
+        <h1>📦 Renata PLC (NK Depot) — WhatsApp CRP Order Tracker v3.0</h1>
+        <p>অফিশিয়াল Trade Price (30-10-26), হাতে লেখা ছবির অর্ডার (OCR) + <b>/cnl</b> ক্যান্সেল সিস্টেম এবং মেমোরি ক্লিয়ার কন্ট্রোল প্যানেল</p>
       </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
         <span id="waBadge" class="badge warn">⏳ Checking WhatsApp...</span>
-        <span id="sheetBadge" class="badge warn">⏳ Checking Google Sheet...</span>
+        <span id="sheetBadge" class="badge warn">⏳ Checking Sheet...</span>
+        <span id="ramBadge" class="badge ok">⚡ RAM: -- MB</span>
         <a id="openSheetBtn" href="#" target="_blank" class="btn-link btn-blue">📊 Open Google Sheet</a>
       </div>
     </header>
@@ -2026,87 +2522,97 @@ app.get('/', (req, res) => {
     <div class="stats-row">
       <div class="stat-card">
         <div class="lbl">সক্রিয় টার্গেট গ্রুপ (Target Group)</div>
-        <div class="val" id="statGroup" style="font-size:1rem; color:#34d399;">Loading...</div>
+        <div class="val" id="statGroup" style="font-size:0.95rem; color:#34d399;">Loading...</div>
       </div>
       <div class="stat-card">
-        <div class="lbl">মোট সেভ হওয়া অর্ডার লাইন (Saved Lines)</div>
+        <div class="lbl">মোট সেভ হওয়া অর্ডার লাইন (Saved)</div>
         <div class="val" id="statSaved">0</div>
       </div>
       <div class="stat-card">
-        <div class="lbl">মোট অর্ডারের পরিমাণ (Total BDT)</div>
+        <div class="lbl">মোট অর্ডার (Trade Price BDT)</div>
         <div class="val" id="statAmount">৳0</div>
       </div>
       <div class="stat-card">
-        <div class="lbl">আনসেন্ড/ডিলিট রিমুভড (Unsent Removed)</div>
+        <div class="lbl">আনসেন্ড / /cnl রিমুভড</div>
         <div class="val" id="statDeleted" style="color:#f87171;">0</div>
       </div>
       <div class="stat-card">
-        <div class="lbl">প্রোডাক্ট ও DA ডাটাবেজ</div>
-        <div class="val" id="statMaster" style="font-size:1.05rem;">78 CRP / 46 DAs</div>
+        <div class="lbl">ছবির অর্ডার অনুমোদিত নম্বর</div>
+        <div class="val" style="font-size:0.82rem; color:#fbbf24;">+8801732273944<br/>+8801793362829</div>
       </div>
     </div>
 
     <div class="grid">
+      <!-- STEP 1: WHATSAPP LOGIN -->
       <div class="card">
         <h2>
-          <span>১. WhatsApp কানেকশন (One-Time QR Scan)</span>
-          <button class="btn-outline" style="padding:5px 10px; font-size:0.78rem;" onclick="logoutWhatsApp()">Change Account</button>
+          <span>১. WhatsApp কানেকশন (Auto-Saved)</span>
+          <button class="btn-outline" style="padding:5px 10px; font-size:0.76rem;" onclick="logoutWhatsApp()">Change Account</button>
         </h2>
         <div id="qrContainer" class="qr-box">
           <p style="color:var(--muted);">Loading WhatsApp status...</p>
         </div>
-        <p style="font-size:0.8rem; color:var(--muted); margin-top:10px;">
-          💡 <b>টিপস:</b> একবার QR কোড স্ক্যান করে লগইন করলে সেশনটি অটোমেটিক আপনার Google Sheet-এর ক্লাউড ব্যাকআপে সেভ হয়ে যায়। ফলে Render রিস্টার্ট নিলেও আর কখনো লগইন করতে হবে না!
+        <p style="font-size:0.78rem; color:var(--muted); margin-top:10px;">
+          💡 <b>নোট:</b> খাতায় লিখে ছবি তুলে অর্ডার দেওয়ার জন্য <b>+8801732273944</b> এবং <b>+8801793362829</b> নম্বর দুটি লক করা আছে। অর্ডার সেভ হওয়ার পর বটের মেসেজে <b>/cnl</b> রিপ্লাই দিলে সেটি বাতিল হয়ে যাবে।
         </p>
       </div>
 
+      <!-- STEP 2: GROUP & IMAGE OCR SETTINGS -->
       <div class="card">
         <h2>
-          <span>২. WhatsApp গ্রুপ সিলেক্ট করুন (One-Time Setup)</span>
-          <button class="btn-outline" style="padding:5px 10px; font-size:0.78rem;" onclick="refreshGroups()">🔄 গ্রুপ লিস্ট রিফ্রেশ</button>
+          <span>২. গ্রুপ ও ছবির OCR সেটিংস</span>
+          <button class="btn-outline" style="padding:5px 10px; font-size:0.76rem;" onclick="refreshGroups()">🔄 গ্রুপ রিফ্রেশ</button>
         </h2>
 
-        <label>আপনার জয়েন থাকা WhatsApp গ্রুপগুলো থেকে সিলেক্ট করুন:</label>
+        <label>আপনার জয়েন থাকা WhatsApp গ্রুপ সিলেক্ট করুন:</label>
         <select id="groupSelect" onchange="onGroupDropdownChange()">
-          <option value="">-- সব গ্রুপ / নিচের বক্সে গ্রুপের নাম বা ID দিন --</option>
+          <option value="">-- গ্রুপ সিলেক্ট করুন --</option>
         </select>
 
-        <label>অথবা গ্রুপের নাম / Group JID (অটো সেভ থাকবে):</label>
+        <label>টার্গেট গ্রুপের নাম:</label>
         <input type="text" id="targetGroupNameInput" placeholder="e.g. CRP sales NK Depot" />
         <input type="hidden" id="targetGroupIdInput" />
 
-        <label style="display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer; color:#e2e8f0;">
-          <input type="checkbox" id="autoReactCheckbox" style="width:18px; height:18px;" checked />
+        <label>হাতে লেখা ছবি (Handwriting OCR) আরও নিখুঁত করতে ফ্রি Gemini API Key (ঐচ্ছিক):</label>
+        <input type="password" id="geminiKeyInput" placeholder="AIzaSy... (না দিলেও বিল্ট-ইন ফ্রি ক্লাউড OCR কাজ করবে)" />
+
+        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer; color:#e2e8f0;">
+          <input type="checkbox" id="autoReactCheckbox" style="width:17px; height:17px;" checked />
           অর্ডার সেভ হলে মেসেজে অটোমেটিক ✅ রিয়েকশন দিবে
         </label>
 
         <div class="btn-row">
-          <button class="btn-primary" onclick="saveGroupConfig()">💾 Save & Lock Group Permanently</button>
-          <button class="btn-outline" onclick="syncSheetStructure()">📊 Verify / Sync Sheet Tabs</button>
+          <button class="btn-primary" onclick="saveGroupConfig()">💾 Save Settings</button>
+          <button class="btn-blue" onclick="syncSheetStructure()">💲 Update Sheet to Trade Price</button>
         </div>
-        <p id="saveStatusMsg" style="font-size:0.83rem; color:#34d399; margin-top:10px;"></p>
+        <p id="saveStatusMsg" style="font-size:0.82rem; color:#34d399; margin-top:8px;"></p>
       </div>
 
+      <!-- STEP 3: LIVE ORDER & /CNL SIMULATOR -->
       <div class="card">
-        <h2>🧪 ৩. লাইভ অর্ডার ও ভুল বানান টেস্টার (Simulator)</h2>
-        <label>যেকোনো ভুল বানানের অর্ডার মেসেজ লিখে টেস্ট করুন:</label>
+        <h2>🧪 ৩. লাইভ অর্ডার (Trade Price) ও /cnl টেস্টার</h2>
+        <label>যেকোনো অর্ডার মেসেজ লিখে Trade Price হিসাব টেস্ট করুন:</label>
         <textarea id="testInput">Cf 4526 Seraj
-Nipun pharmacy pso code E 71
+Cus name: Nipun pharmacy pso E71
 TotiFen 50
 Doxicup 10 pes
 Deltason 50ml 20 ta
 Locan r 150mg = 10</textarea>
         <div class="btn-row">
-          <button class="btn-blue" onclick="runTestParse(false)">🔍 Test Spell-Checker Only</button>
-          <button class="btn-primary" onclick="runTestParse(true)">🚀 Test & Save to Google Sheet</button>
-          <button id="simUnsendBtn" class="btn-danger" style="display:none;" onclick="simulateUnsend()">🗑️ Simulate Unsend (Remove Last Test)</button>
+          <button class="btn-blue" onclick="runTestParse(false)">🔍 Test Trade Price</button>
+          <button class="btn-primary" onclick="runTestParse(true)">🚀 Test & Save to Sheet</button>
+          <button id="simUnsendBtn" class="btn-danger" style="display:none;" onclick="simulateUnsend()">🗑️ Test /cnl (Cancel Last Order)</button>
         </div>
-        <div id="testResultBox" style="margin-top:12px; font-size:0.82rem; color:#cbd5e1;"></div>
+        <div id="testResultBox" style="margin-top:12px; font-size:0.81rem; color:#cbd5e1;"></div>
       </div>
     </div>
 
+    <!-- RECENT PARSED ORDERS TABLE WITH CLEAR BUTTON -->
     <div class="card" style="margin-bottom:20px;">
-      <h2>📋 সর্বশেষ ট্র্যাক হওয়া অর্ডারসমূহ (Live Parsed Orders)</h2>
+      <h2>
+        <span>📋 সর্বশেষ ট্র্যাক হওয়া অর্ডারসমূহ (Live Parsed Orders)</span>
+        <button class="btn-danger" style="padding:6px 12px; font-size:0.8rem;" onclick="clearLiveOrders()">🧹 Clear Orders List (মেমোরি খালি করুন)</button>
+      </h2>
       <div class="table-wrap">
         <table>
           <thead>
@@ -2118,20 +2624,24 @@ Locan r 150mg = 10</textarea>
               <th>Raw WhatsApp Text</th>
               <th>Official CRP Product</th>
               <th>Qty</th>
-              <th>Unit Price</th>
+              <th>Trade Price</th>
               <th>Total (BDT)</th>
               <th>Match</th>
             </tr>
           </thead>
           <tbody id="ordersTableBody">
-            <tr><td colspan="10" style="text-align:center; color:var(--muted);">No orders recorded in this session yet.</td></tr>
+            <tr><td colspan="10" style="text-align:center; color:var(--muted);">No orders in temporary memory buffer. (All saved orders are safe in Google Sheets!)</td></tr>
           </tbody>
         </table>
       </div>
     </div>
 
+    <!-- SYSTEM ACTIVITY LOGS WITH CLEAR BUTTON -->
     <div class="card">
-      <h2>🖥️ সিস্টেম লগ (Live Server Logs)</h2>
+      <h2>
+        <span>🖥️ সিস্টেম লগ (Live Server Logs)</span>
+        <button class="btn-danger" style="padding:6px 12px; font-size:0.8rem;" onclick="clearServerLogs()">🧹 Clear Server Logs (লগ ক্লিয়ার করুন)</button>
+      </h2>
       <div id="logBox" class="log-box"></div>
     </div>
   </div>
@@ -2170,34 +2680,33 @@ Locan r 150mg = 10</textarea>
           sheetBadge.textContent = '⚠️ Sheet Auth Needed';
         }
 
+        document.getElementById('ramBadge').textContent = '⚡ RAM: ' + (data.memoryMB || 0) + ' MB';
         document.getElementById('openSheetBtn').href = data.googleSheetUrl;
 
         document.getElementById('statGroup').textContent =
           data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Groups';
         document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;
         document.getElementById('statAmount').textContent =
-          '৳' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD');
+          '৳' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         document.getElementById('statDeleted').textContent = data.stats.totalOrdersDeleted;
-        document.getElementById('statMaster').textContent =
-          data.productCount + ' CRP / ' + data.daCount + ' DAs';
 
         const qrBox = document.getElementById('qrContainer');
         if (data.waStatus === 'CONNECTED' && data.connectedUser) {
           qrBox.innerHTML =
-            '<div style="font-size:2.6rem; margin-bottom:8px;">✅</div>' +
+            '<div style="font-size:2.4rem; margin-bottom:6px;">✅</div>' +
             '<h3 style="color:#34d399;">WhatsApp সচল এবং লগইন সেভ করা আছে!</h3>' +
-            '<p style="color:#94a3b8; font-size:0.88rem; margin-top:6px;">Account: <b>' +
+            '<p style="color:#94a3b8; font-size:0.86rem; margin-top:4px;">Account: <b>' +
             data.connectedUser.name +
             '</b> (' +
             data.connectedUser.id.split(':')[0] +
             ')</p>' +
-            '<span class="badge ok" style="margin-top:12px;">☁️ Auto-Saved in Cloud Backup</span>';
+            '<span class="badge ok" style="margin-top:10px;">☁️ Auto-Saved in Cloud Backup</span>';
         } else if (data.qrDataUrl) {
           qrBox.innerHTML =
             '<img src="' +
             data.qrDataUrl +
             '" alt="WhatsApp QR Code" />' +
-            '<p style="color:#fbbf24; font-weight:600; font-size:0.9rem;">আপনার ফোনের WhatsApp ➔ Linked Devices থেকে এই QR কোডটি স্ক্যান করুন</p>';
+            '<p style="color:#fbbf24; font-weight:600; font-size:0.88rem;">আপনার ফোনের WhatsApp ➔ Linked Devices থেকে এই QR কোডটি স্ক্যান করুন</p>';
         } else {
           qrBox.innerHTML =
             '<p style="color:#94a3b8;">🔄 WhatsApp কানেক্ট হচ্ছে / QR তৈরি হচ্ছে... অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।</p>';
@@ -2235,12 +2744,14 @@ Locan r 150mg = 10</textarea>
                 '<td style="color:#fbbf24;">' + o.rawText + '</td>' +
                 '<td><b>[' + o.crpCode + ']</b> ' + o.productName + '</td>' +
                 '<td><b>' + o.orderedQty + '</b></td>' +
-                '<td>৳' + o.unitPrice + '</td>' +
-                '<td style="color:#34d399; font-weight:700;">৳' + Number(o.totalAmount).toLocaleString('en-BD') + '</td>' +
+                '<td>৳' + Number(o.unitPrice).toFixed(2) + '</td>' +
+                '<td style="color:#34d399; font-weight:700;">৳' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +
                 '<td>' + o.matchType + '</td>' +
                 '</tr>'
             )
             .join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color:var(--muted);">No orders in temporary memory buffer. (All saved orders are safe in Google Sheets!)</td></tr>';
         }
 
         const logBox = document.getElementById('logBox');
@@ -2277,16 +2788,18 @@ Locan r 150mg = 10</textarea>
       const groupId = document.getElementById('targetGroupIdInput').value;
       const groupName = document.getElementById('targetGroupNameInput').value;
       const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;
+      const geminiApiKey = document.getElementById('geminiKeyInput').value;
 
       const res = await fetch('/api/config/group', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })
+        body: JSON.stringify({ groupId, groupName, autoReactOnOrder, geminiApiKey })
       });
       const data = await res.json();
       if (data.ok) {
         document.getElementById('saveStatusMsg').textContent =
-          '✅ গ্রুপ সেটিংস স্থায়ীভাবে সেভ হয়েছে: ' + (data.botConfig.targetGroupName || 'All');
+          '✅ সেটিংস স্থায়ীভাবে সেভ হয়েছে!';
+        document.getElementById('geminiKeyInput').value = '';
         groupInputTouched = false;
         fetchStatus();
       }
@@ -2295,8 +2808,24 @@ Locan r 150mg = 10</textarea>
     async function syncSheetStructure() {
       const res = await fetch('/api/sheets/sync', { method: 'POST' });
       const data = await res.json();
-      alert(data.ok ? '✅ Google Sheet-এর সব ট্যাব এবং ফর্মুলা সফলভাবে সিঙ্ক হয়েছে!' : '⚠️ Error: ' + data.googleAuthError);
+      alert(data.ok ? '✅ Google Sheet-এর সব প্রোডাক্টের দাম অফিশিয়াল TRADE PRICE অনুযায়ী আপডেট হয়েছে!' : '⚠️ Error: ' + data.googleAuthError);
       fetchStatus();
+    }
+
+    async function clearLiveOrders() {
+      const res = await fetch('/api/orders/clear', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        fetchStatus();
+      }
+    }
+
+    async function clearServerLogs() {
+      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        fetchStatus();
+      }
     }
 
     async function runTestParse(saveToSheet) {
@@ -2316,10 +2845,12 @@ Locan r 150mg = 10</textarea>
         box.innerHTML =
           '<div style="color:#34d399; font-weight:600; margin-bottom:6px;">✅ শনাক্ত হয়েছে ' +
           data.orders.length +
-          'টি প্রোডাক্ট অর্ডার (DA: ' +
+          'টি অর্ডার লাইন (DA: ' +
           data.orders[0].daId +
           ' - ' +
           data.orders[0].daName +
+          ', Party: ' +
+          data.orders[0].pharmacyName +
           '):</div>' +
           data.orders
             .map(
@@ -2332,11 +2863,11 @@ Locan r 150mg = 10</textarea>
                 o.productName +
                 '</b> | Qty: <b>' +
                 o.orderedQty +
-                '</b> | Total: <b>৳' +
-                o.totalAmount +
-                '</b> (' +
-                o.matchType +
-                ')'
+                '</b> × ৳' +
+                o.unitPrice.toFixed(2) +
+                ' = <b>৳' +
+                o.totalAmount.toFixed(2) +
+                '</b>'
             )
             .join('<br/>');
       } else {
@@ -2354,11 +2885,11 @@ Locan r 150mg = 10</textarea>
       });
       const data = await res.json();
       document.getElementById('testResultBox').innerHTML =
-        '<span style="color:#f87171; font-weight:600;">🗑️ আনসেন্ড সিমুলেশন সফল! মেসেজ (' +
+        '<span style="color:#f87171; font-weight:600;">❌ /cnl ক্যান্সেল সফল! মেসেজ (' +
         lastTestMsgId +
         ') এর ' +
         data.removedCount +
-        'টি অর্ডার ডাটাবেজ ও Google Sheet থেকে অটোমেটিক রিমুভ করা হয়েছে!</span>';
+        'টি অর্ডার Google Sheet থেকে অটোমেটিক মুছে ফেলা হয়েছে!</span>';
       lastTestMsgId = null;
       document.getElementById('simUnsendBtn').style.display = 'none';
       fetchStatus();
@@ -2378,7 +2909,7 @@ Locan r 150mg = 10</textarea>
 });
 
 // ============================================================================
-// 12. RENDER FREE-TIER SELF-PING KEEP-ALIVE & SERVER BOOTSTRAP
+// 13. RENDER FREE-TIER SELF-PING KEEP-ALIVE & SERVER BOOTSTRAP
 // ============================================================================
 function startKeepAliveLoop() {
   setInterval(async () => {
@@ -2393,10 +2924,10 @@ function startKeepAliveLoop() {
 
 async function bootstrap() {
   app.listen(PORT, '0.0.0.0', async () => {
-    addLog(`🚀 Server listening on port ${PORT}`);
+    addLog(`🚀 Server v3.0 listening on port ${PORT}`);
     await initGoogleSheetsClient();
     if (googleAuthReady) {
-      await ensureSpreadsheetStructure();
+      await ensureSpreadsheetStructure(true);
       await restoreAuthAndConfigFromSheet();
     }
     await startWhatsApp();
@@ -2411,8 +2942,11 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_CRP_PRODUCTS,
   DA_MASTER,
+  AUTHORIZED_IMAGE_PHONES,
   matchCRPProduct,
   extractOrderQuantity,
   parseWhatsAppOrderMessage,
-  inspectBaileysMessage
+  inspectBaileysMessage,
+  isAuthorizedForImageOrder,
+  buildImageOrderReplyMessage
 };
