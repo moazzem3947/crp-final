@@ -1,19 +1,26 @@
 /**
  * ============================================================================
- * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER (v3.0 PRO)
+ * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER (v4.0 PRO)
+ * NEO-BRUTALISM EDITION + 3X AUTO-RETRY & KEYLESS AI VISION OCR
  * ============================================================================
- * What's New in v3.0:
- * 1. Exact TRADE PRICE for all 78+ CRP Products from "Current Pricie List (30-10-26).xlsx"
- *    + Auto-migration of existing Google Sheet Product_Wise_Summary & Live_Orders prices!
- * 2. Handwritten / Paper Photo Order OCR (Image-to-Order) strictly restricted to:
- *    -> +8801732273944 and +8801793362829 ONLY (ignores images from all other numbers)
- * 3. Instant WhatsApp Order Confirmation Reply on Image Orders + "/cnl" Cancel System:
- *    -> Saves order to Google Sheet & replies with full itemized breakdown.
- *    -> If user replies "/cnl" to that message, it immediately cancels & deletes the order
- *       from Google Sheets! If anything else (or nothing) is replied, it stays saved.
- * 4. Manual "Clear Live Orders" & "Clear Server Logs" buttons on Dashboard to keep
- *    Render Free-Tier RAM/storage ultra-lightweight.
- * 5. Enhanced Baileys @lid -> Phone Number resolver & clean "Cus name:" party parser.
+ * What's New & Fixed in v4.0:
+ * 1. 3-Stage Server-Side Image OCR Auto-Retry + Keyless Vision AI Fallback:
+ *    - Pass 1: OCR.space Engine 2 (Neural Handwriting/Camera Mode) or Gemini Vision
+ *    - Pass 2: Auto-Recheck with OCR.space Engine 1 (Contrast/Orientation Mode) + Raw Line Mode
+ *    - Pass 3: Keyless Free Vision AI (Pollinations OpenAI Vision API — requires ZERO API key!)
+ *    - Smart OCR Pre-Normalizer: Fixes handwritten digit lookalikes (5O->50, l0->10, I5->15),
+ *      merges split product+quantity lines, and parses tab-separated columns & bottom party names.
+ *    - Sends error message ONLY if all 3+ server-side attempts fail to find any order!
+ * 2. Fixed +8801732273944 & +8801793362829 Image Authorization:
+ *    - Pre-binds known WhatsApp @lid IDs (259794032148540 & 51243288424651 & 188738965659721)
+ *    - Auto-resolves @lid for both numbers on startup via sock.onWhatsApp() & groupMetadata
+ *    - Supports flexible /bind command in ANY group, DM, or image caption!
+ * 3. Fixed Group Message Capture & Signal Decryption after Group Setup / Restart:
+ *    - Backs up pre-key-*.json files in _Bot_State + calls uploadPreKeysToServerIfRequired()
+ *      so group member messages never fail Signal decryption after Render restarts!
+ *    - Flexible group matching (matches by targetGroupId OR targetGroupName, or "ALL" groups)
+ *    - Smart First-Empty-Row insertion in Live_Orders (prevents blank row gaps when rows are cleared)
+ * 4. Complete Neo-Brutalism UI Redesign + Clear Orders & Clear Logs Memory Buttons
  * ============================================================================
  */
 
@@ -47,6 +54,14 @@ const LOCAL_CONFIG_PATH = path.join(__dirname, 'bot_config.json');
 // Strictly Authorized Phone Numbers for Image-to-Order OCR (Normalized to 8801XXXXXXXXX)
 const AUTHORIZED_IMAGE_PHONES = ['8801732273944', '8801793362829'];
 
+// Pre-bound known WhatsApp Multi-Device @lid identifiers for +8801732273944 and +8801793362829
+// discovered directly from the user's WhatsApp session state
+const DEFAULT_AUTHORIZED_LIDS = [
+  '259794032148540', // +8801732273944
+  '51243288424651',  // +8801793362829
+  '188738965659721'  // Connected Bot Account (Moajjem)
+];
+
 const SHEET_TABS = {
   LIVE_ORDERS: 'Live_Orders',
   DA_SUMMARY: 'DA_Wise_Summary',
@@ -67,7 +82,7 @@ const DEFAULT_CRP_PRODUCTS = [
   { code: '636', name: "DELTASONE ORAL SOLUTION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 44.98, family: 'DELTASONE', aliases: ['deltasone 50ml', 'deltason 50ml', 'daltasone 50ml', 'daltason 50ml', 'delta sone 50ml', 'delta som', 'dellthesun', 'deltasone syp', 'deltason syr', 'deltason sry', 'delterson 50ml', 'deltarson 50ml'] },
   { code: '637', name: "DELTASONE ORAL SOLUTION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 71.21, family: 'DELTASONE', aliases: ['deltasone 100ml', 'deltason 100ml', 'daltasone 100ml', 'delta sone 100ml', 'deltasone 100'] },
   { code: 'CS7', name: "DELTASONE 5MG TAB 17X30'S", unit: "Box (17x30's)", price: 657.90, family: 'DELTASONE', aliases: ['deltasone tab', 'deltason tab', 'daltasone tap', 'deltasone 5mg', 'deltason 5mg', 'deltasonne tab', 'deltasone 17x30'] },
-  { code: '922', name: "PRAZOLE 20MG CAP 6X10'S", unit: "Box (6x10's)", price: 225.00, family: 'PRAZOLE', aliases: ['prazole', 'prazol', 'parzol', 'prajol', 'frazol', 'prazole 20mg', 'prazol cap'] },
+  { code: '922', name: "PRAZOLE 20MG CAP 6X10'S", unit: "Box (6x10's)", price: 225.00, family: 'PRAZOLE', aliases: ['prazole', 'prazol', 'parzol', 'prajol', 'frazol', 'pazal', 'prazole 20mg', 'prazol cap'] },
   { code: '271', name: 'ZITHRIN DRY SYRUP 35ML', unit: 'Bottle (35ml)', price: 104.95, family: 'ZITHRIN', aliases: ['zithrin 35ml', 'zitrin 35ml', 'zithrin 35', 'zitrin 35', 'zitthrin', 'zithren', 'zithrin dry syrup', 'zithrin syp', 'zithrin syr'] },
   { code: '290', name: 'ZITHRIN DRY SYRUP 50ML', unit: 'Bottle (50ml)', price: 149.93, family: 'ZITHRIN', aliases: ['zithrin 50ml', 'zitrin 50ml', 'zithrin 50', 'zitrin 50', 'zrithrin 50ml'] },
   { code: '270', name: 'ZITHRIN DRY SYRUP 20ML', unit: 'Bottle (20ml)', price: 74.96, family: 'ZITHRIN', aliases: ['zithrin 20ml', 'zitrin 20ml', 'zithirin 20ml', 'zithrin 20'] },
@@ -76,7 +91,7 @@ const DEFAULT_CRP_PRODUCTS = [
   { code: '278', name: "XAMIC 500MG CAP (2X10'S)", unit: "Box (2x10's)", price: 329.80, family: 'XAMIC', aliases: ['xamic', 'xamic cap', 'xamic 500mg', 'xamic capsule', 'xmaic', 'examic'] },
   { code: '635', name: "RECOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 29.99, family: 'RECOF', aliases: ['recof', 'recop', 'recof syp', 'recof syr', 'recof sry', 'recof 100ml', 'recof syraf'] },
   { code: '299', name: "TRULAX SYRUP 1MG/5ML 100ML 1'S", unit: 'Bottle (100ml)', price: 33.73, family: 'TRULAX', aliases: ['trulax', 'tulax', 'trulex', 'trulax syr', 'trulax syp', 'trulax sry', 'trulax 100ml'] },
-  { code: '112', name: 'LUCAN-R SUSP. 35ML', unit: 'Bottle (35ml)', price: 58.70, family: 'LUCAN-R', aliases: ['lucan r 35ml', 'lucan-r 35ml', 'locan r sry', 'lucan r syp', 'lucan r syr', 'lukan r syp', 'luknar syraf', 'lokanar', 'lucon r syp', 'lucanar syp', 'lucar sry'] },
+  { code: '112', name: 'LUCAN-R SUSP. 35ML', unit: 'Bottle (35ml)', price: 58.70, family: 'LUCAN-R', aliases: ['lucan r 35ml', 'lucan-r 35ml', 'locan r sry', 'lucan r syp', 'lucan r syr', 'lukan r syp', 'luknar syraf', 'lokanar', 'lucon r syp', 'lucanar syp', 'lucar sry', 'luna r'] },
   { code: '876', name: "LUCAN-R 50MG CAP 4x10'S", unit: "Box (4x10's)", price: 240.80, family: 'LUCAN-R', aliases: ['lucan r 50mg', 'locan r 50mg', 'lucan-r 50mg', 'lukan r 50', 'lacan r 50mg', 'lucan r 50'] },
   { code: '605', name: 'LUCAN-R 150MG CAPS 2X6', unit: "Box (2x6's)", price: 198.60, family: 'LUCAN-R', aliases: ['lucan r 150mg', 'locan r 150mg', 'lucan-r 150mg', 'lucan r 150', 'locan r 150', 'luknar 150', 'lucon r 150', 'lunch 150'] },
   { code: '621', name: 'LUCAN-R 200MG CAPS 2X6', unit: "Box (2x6's)", price: 224.88, family: 'LUCAN-R', aliases: ['lucan r 200mg', 'locan r 200mg', 'lucan-r 200mg', 'lucan r 200', 'locan r 200', 'lucanar 200'] },
@@ -192,7 +207,7 @@ const DA_MASTER = [
   { daId: 'C210024', altId: '', name: 'Ilias Hossain', phones: ['8801621668496'], aliases: ['ilias hossain'] },
   { daId: 'C210028', altId: '', name: 'Abdur Rahman', phones: [], aliases: ['abdur rahman nk depot ren', 'abdur rahman'] },
   { daId: 'C122230', altId: '', name: 'DA ID C122230', phones: ['8801777824386'], aliases: ['c122230'] },
-  { daId: 'CF10145', altId: '', name: 'Moajjem', phones: ['8801732273944', '8801793362829'], aliases: ['moajjem', 'moazzem'] }
+  { daId: 'CF10145', altId: 'RF9084', name: 'Moajjem', phones: ['8801732273944', '8801793362829'], aliases: ['moajjem', 'moazzem', 'rf9084'] }
 ];
 
 // ============================================================================
@@ -334,12 +349,12 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'DOXICAP', regex: /\b(dox[iy]?\s*c[auo]p|doxicap|doxicup)\b/i },
   { family: 'DOMIREN', regex: /\b(dom[iey]?r[ea]n|domniren|domira)\b/i },
   { family: 'DELTASONE', regex: /\b(d[ea]ll?t[aeh]?r?\s*s[oa]n[ne]?|delta\s*som|dellthesun)\b/i },
-  { family: 'PRAZOLE', regex: /\b(pr?a[zj]o?l[ea]?|parzol|frazol)\b/i },
+  { family: 'PRAZOLE', regex: /\b(pr?a[zj]o?l[ea]?|parzol|frazol|pazal)\b/i },
   { family: 'ZITHRIN', regex: /\b(z[ri]?th?[i]?r[ie]n|zitrin|zitthrin|ziyhrin)\b/i },
   { family: 'XAMIC', regex: /\b(xamic|xmaic|examic)\b/i },
   { family: 'RECOF', regex: /\b(recof|recop)\b/i },
   { family: 'TRULAX', regex: /\b(tr?ul[ae]x)\b/i },
-  { family: 'LUCAN-R', regex: /\b(l[ou]l?u?[ck][aeo]?n[a]?\s*[\-]?r?|lukn?ar|lokanar|lacan\s*r|luncar|lunar|lunch\s*(?:150|200|50))\b/i },
+  { family: 'LUCAN-R', regex: /\b(l[ou]l?u?[ck][aeo]?n[a]?\s*[\-_]?r?|lukn?ar|lokanar|lacan\s*r|luncar|lunar|luna\s*[\-_]?r|lunch\s*(?:150|200|50))\b/i },
   { family: 'FLONTIN', regex: /\b(fl?o[nl]?t[ie]n[e]?|foltin|falntin)\b/i },
   { family: 'NORMANAL', regex: /\b(n[oa]rm[ao]n[ao]l|nomanal|normal)\b/i },
   { family: 'FUROCLAV', regex: /\b(f[eu]?roclav)\b/i },
@@ -418,7 +433,7 @@ function matchCRPProduct(rawLine) {
     'medecal', 'hall', 'hal', 'mh', 'bazar', 'bazer', 'bz', 'market', 'road', 'hat', 'new', 'al', 'ma',
     'maa', 'jannat', 'janani', 'popular', 'model', 'unique', 'laxmipur', 'ramgonj', 'raipur', 'hatiya',
     'chowmuhani', 'noakhali', 'mandari', 'hasnabad', 'chatkhil', 'sonapur', 'kabirhat', 'company', 'dr',
-    'cus', 'name', 'customer', 'party'
+    'cus', 'name', 'customer', 'party', 'pharmey'
   ]);
 
   const tokens = normalized
@@ -461,11 +476,30 @@ function matchCRPProduct(rawLine) {
 }
 
 // ============================================================================
-// 5. QUANTITY EXTRACTOR & MULTI-ITEM LINE SPLITTER
+// 5. QUANTITY EXTRACTOR, OCR PRE-NORMALIZER & MULTI-ITEM LINE SPLITTER
 // ============================================================================
 
+/**
+ * Fixes common OCR handwriting digit misreads at the end of lines or before units:
+ * e.g. "5O" -> "50", "l0" -> "10", "I0" -> "10", "l5" -> "15", "2O" -> "20", "S0" -> "50"
+ */
+function fixOcrDigitLookalikes(str) {
+  if (!str) return '';
+  return str
+    // Fix lookalikes inside or adjacent to digits: e.g. "5O" -> "50", "1OO" -> "100"
+    .replace(/(\d)[Oo](\b|\s|ta|pes|pcs|pc|box|bx)/gi, '$10$2')
+    .replace(/(\d)[Oo][Oo](\b|\s|ta|pes|pcs|pc|box|bx)/gi, '$100$2')
+    // Fix "l0", "I0", "l5", "I5", "S0" when preceded by space/=/dash and followed by end/unit
+    .replace(/([\s\-:=])[lI|](\d\b)/g, '$11$2')
+    .replace(/([\s\-:=])[lI|][Oo](\b|\s|ta|pes|pcs|pc|box|bx)/g, '$110$2')
+    .replace(/([\s\-:=])S[0Oo](\b|\s|ta|pes|pcs|pc|box|bx)/g, '$150$2');
+}
+
 function extractOrderQuantity(rawLine, matchedProduct) {
-  let s = rawLine;
+  let s = fixOcrDigitLookalikes(rawLine);
+  // Separate glued letters and digits like "Domiren100ml" -> "Domiren 100 ml"
+  s = s.replace(/([a-zA-Z])(\d)/g, '$1 $2').replace(/(\d)([a-zA-Z])/g, '$1 $2');
+
   s = s.replace(/^\s*\d+\s*[\/)\.]\s*/, ' ');
   s = s.replace(/\b(cf|rf|c)\s*[\-_]?\s*\d{4,6}\b/gi, ' ');
   s = s.replace(/\bpso\s*[\-:=]?\s*[a-z]?\s*\d{2,3}\b/gi, ' ');
@@ -489,6 +523,64 @@ function extractOrderQuantity(rawLine, matchedProduct) {
   }
 
   return null;
+}
+
+/**
+ * Pre-normalizes OCR text from handwritten/printed images:
+ * 1. Splits tab-separated cells gracefully (while keeping "Product \t Qty" together)
+ * 2. Merges a Product line that has no quantity with the next line if the next line is purely a quantity!
+ */
+function normalizeOcrOrderText(rawText) {
+  if (!rawText) return '';
+  let text = fixOcrDigitLookalikes(rawText.replace(/\r\n/g, '\n'));
+
+  // Handle tab-separated table output from OCR.space (e.g. "CF10145\tTOTifen SYP 10 Ta\tMA Pharmey" or "Totifen\t50")
+  const rawLines = text.split('\n');
+  const expandedLines = [];
+
+  for (const line of rawLines) {
+    if (!line.includes('\t')) {
+      expandedLines.push(line.trim());
+      continue;
+    }
+    const cells = line.split('\t').map((c) => c.trim()).filter(Boolean);
+    let buffer = '';
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells[i];
+      // If buffer has a product without quantity and current cell is a quantity (e.g. "10", "50 ta"), join them!
+      if (buffer && matchCRPProduct(buffer) && extractOrderQuantity(buffer) === null && /^[\-=:]*\s*\d+\s*(ta|pes|pcs|pc|box|bx)?$/i.test(cell)) {
+        expandedLines.push(`${buffer} ${cell}`);
+        buffer = '';
+      } else {
+        if (buffer) expandedLines.push(buffer);
+        buffer = cell;
+      }
+    }
+    if (buffer) expandedLines.push(buffer);
+  }
+
+  // Pass 2: Merge consecutive lines where Line i is a Product without quantity and Line i+1 is just a quantity
+  const mergedLines = [];
+  for (let i = 0; i < expandedLines.length; i++) {
+    const cur = expandedLines[i];
+    if (!cur) continue;
+    const next = i + 1 < expandedLines.length ? expandedLines[i + 1] : '';
+
+    if (
+      next &&
+      matchCRPProduct(cur) !== null &&
+      extractOrderQuantity(cur) === null &&
+      matchCRPProduct(next) === null &&
+      /^[\-=:*#]*\s*\d+(?:\+\d+)?\s*(ta|tah|pes|pcs|pc|pic|box|bx|bot|pack)?\.?$/i.test(next)
+    ) {
+      mergedLines.push(`${cur} ${next}`);
+      i++; // Skip next line since it was merged
+    } else {
+      mergedLines.push(cur);
+    }
+  }
+
+  return mergedLines.join('\n');
 }
 
 function expandLineSegments(line) {
@@ -528,11 +620,12 @@ function expandLineSegments(line) {
 // ============================================================================
 
 const senderContextCache = new Map();
-const lidToPhoneMap = new Map(); // Maps WhatsApp @lid IDs -> normalized 8801XXXXXXXXX phone numbers
+const lidToPhoneMap = new Map([
+  ['259794032148540', '8801732273944'],
+  ['51243288424651', '8801793362829'],
+  ['188738965659721', '8801795058467']
+]);
 
-/**
- * Normalizes any phone number string to 8801XXXXXXXXX format if it's a valid BD number
- */
 function normalizeBdPhone(raw) {
   if (!raw) return '';
   const digits = String(raw).replace(/\D/g, '');
@@ -548,9 +641,6 @@ function normalizeBdPhone(raw) {
   return digits;
 }
 
-/**
- * Resolves the real phone number of a WhatsApp message sender (even when group uses @lid)
- */
 function resolveRealSenderPhone(msg) {
   if (!msg) return '';
   const candidatos = [
@@ -562,7 +652,6 @@ function resolveRealSenderPhone(msg) {
     !msg.key?.remoteJid?.endsWith('@g.us') ? msg.key?.remoteJid : ''
   ];
 
-  // If message was sent from the connected bot phone itself
   if (msg.key?.fromMe && connectedUser?.id) {
     candidatos.unshift(connectedUser.id);
   }
@@ -570,12 +659,11 @@ function resolveRealSenderPhone(msg) {
   for (const c of candidatos) {
     if (!c) continue;
     const rawId = String(c).split('@')[0].split(':')[0];
-    if (String(c).endsWith('@lid') && lidToPhoneMap.has(rawId)) {
+    if (lidToPhoneMap.has(rawId)) {
       return lidToPhoneMap.get(rawId);
     }
     const norm = normalizeBdPhone(rawId);
     if (norm.length === 13 && norm.startsWith('8801')) {
-      // Also record in lidToPhoneMap if msg.key.participant was an @lid
       const pJid = msg.key?.participant || '';
       if (pJid.endsWith('@lid')) {
         lidToPhoneMap.set(pJid.split('@')[0].split(':')[0], norm);
@@ -592,21 +680,39 @@ function resolveRealSenderPhone(msg) {
 }
 
 /**
- * Checks if a message was sent by one of the two strictly authorized Image Order numbers:
- * +8801732273944 or +8801793362829
+ * Checks if a message was sent by +8801732273944 or +8801793362829 (across all JID/LID/fromMe formats)
  */
 function isAuthorizedForImageOrder(msg, resolvedPhone) {
   const norm = normalizeBdPhone(resolvedPhone);
   for (const authPhone of AUTHORIZED_IMAGE_PHONES) {
-    if (norm === authPhone || norm.endsWith(authPhone.slice(-10))) {
+    if (norm === authPhone || (norm.length >= 10 && norm.endsWith(authPhone.slice(-10)))) {
       return true;
     }
   }
-  // Also check if the raw participant LID was explicitly bound to one of the 2 authorized numbers
-  const rawParticipant = (msg?.key?.participant || msg?.key?.remoteJid || '').split('@')[0].split(':')[0];
-  if (rawParticipant && botConfig.authorizedImageLids && botConfig.authorizedImageLids.includes(rawParticipant)) {
-    return true;
+
+  const rawCandidates = [
+    msg?.key?.participant,
+    msg?.participant,
+    msg?.key?.participantPn,
+    msg?.participantPn,
+    !msg?.key?.remoteJid?.endsWith('@g.us') ? msg?.key?.remoteJid : ''
+  ]
+    .filter(Boolean)
+    .map((x) => String(x).split('@')[0].split(':')[0]);
+
+  const allAllowedLids = new Set([
+    ...DEFAULT_AUTHORIZED_LIDS,
+    ...(botConfig.authorizedImageLids || [])
+  ]);
+
+  for (const rawId of rawCandidates) {
+    if (allAllowedLids.has(rawId)) return true;
+    const mapped = lidToPhoneMap.get(rawId);
+    if (mapped && AUTHORIZED_IMAGE_PHONES.includes(mapped)) return true;
+    const normCand = normalizeBdPhone(rawId);
+    if (AUTHORIZED_IMAGE_PHONES.includes(normCand)) return true;
   }
+
   return false;
 }
 
@@ -615,7 +721,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
   const cleanPhone = normalizeBdPhone(senderPhone);
   const cleanPush = (senderPushName || '').toLowerCase().trim();
 
-  // 1. Explicit DA ID inside message text
   const explicitMatch = cleanText.match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b/);
   if (explicitMatch) {
     const candidateId = `${explicitMatch[1]}${explicitMatch[2]}`;
@@ -646,7 +751,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // 2. Match by Sender Phone Number
   if (cleanPhone.length >= 10) {
     const last10 = cleanPhone.slice(-10);
     const foundByPhone = DA_MASTER.find((d) =>
@@ -658,7 +762,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // 3. Match by Sender PushName or Name inside Message Text
   for (const da of DA_MASTER) {
     for (const alias of da.aliases || []) {
       if (alias.length >= 4 && (cleanPush.includes(alias) || fullText.toLowerCase().includes(alias))) {
@@ -668,7 +771,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // 4. Fallback to cached context
   if (senderJid && senderContextCache.has(senderJid)) {
     return senderContextCache.get(senderJid);
   }
@@ -705,12 +807,11 @@ function isPharmacyCandidateLine(line) {
   const clean = line.trim();
   if (!clean || clean.length < 3) return false;
   if (/^(pso|cf|rf|c[\-_]?\d|assalamu|salam|hi|hello|crp\b)/i.test(clean)) return false;
-  // Support "Cus:", "Cus name:", "Customer:", "Party:" prefixes used in live orders
   if (/^(cus|customer|party)\s*(?:name)?\s*[\-:=]/i.test(clean)) return true;
-  if (/^(md\s+|ikbal\s+hossain|robiul\s+hossain|dawdul\s+islam|jahid\s+mondol|rezaul\s+haque|rejaul\s+hoque|mizan\b|sharif\b|rakib\b)/i.test(clean) && !/\b(pharmacy|pharma|phy|p\/h|medical|med|hall|mh|m\.h|drug|clinic|hospital|store|corner|center|centre)\b/i.test(clean)) {
+  if (/^(md\s+|ikbal\s+hossain|robiul\s+hossain|dawdul\s+islam|jahid\s+mondol|rezaul\s+haque|rejaul\s+hoque|mizan\b|sharif\b|rakib\b)/i.test(clean) && !/\b(pharmacy|pharmey|pharma|phy|p\/h|medical|med|hall|mh|m\.h|drug|clinic|hospital|store|corner|center|centre)\b/i.test(clean)) {
     return false;
   }
-  if (/\b(pharmacy|pharmechy|pharmecy|pharmicy|pharma|phy|p\/h|medical|medecal|med\s+hall|hall|hal|m\.?h\b|drug|clinic|hospital|medicine|medicen|corner|cornar|center|centre|store|point|paint|nikaton|ph\b)/i.test(clean)) {
+  if (/\b(pharmacy|pharmechy|pharmecy|pharmicy|pharmey|pharma|phy|p\/h|medical|medecal|med\s+hall|hall|hal|m\.?h\b|drug|clinic|hospital|medicine|medicen|corner|cornar|center|centre|store|point|paint|nikaton|ph\b)/i.test(clean)) {
     return true;
   }
   return false;
@@ -736,8 +837,8 @@ function parseWhatsAppOrderMessage({
     return { isOrder: false, orders: [], followUpPatch: null };
   }
 
-  const rawLines = messageText
-    .replace(/\r\n/g, '\n')
+  const normalizedBlock = normalizeOcrOrderText(messageText);
+  const rawLines = normalizedBlock
     .split('\n')
     .map((l) => l.replace(/<This message was edited>/gi, '').trim())
     .filter(Boolean);
@@ -746,14 +847,17 @@ function parseWhatsAppOrderMessage({
     return { isOrder: false, orders: [], followUpPatch: null };
   }
 
-  const daInfo = resolveDAFromMessageAndSender(messageText, senderPhone, senderPushName, senderJid);
+  const daInfo = resolveDAFromMessageAndSender(normalizedBlock, senderPhone, senderPushName, senderJid);
 
   let globalPso = null;
+  let defaultPharmacy = '';
   for (const l of rawLines) {
-    const p = extractPSOCode(l);
-    if (p) {
-      globalPso = p;
-      break;
+    if (!globalPso) {
+      const p = extractPSOCode(l);
+      if (p) globalPso = p;
+    }
+    if (!defaultPharmacy && isPharmacyCandidateLine(l) && matchCRPProduct(l) === null) {
+      defaultPharmacy = cleanPharmacyName(l);
     }
   }
 
@@ -780,7 +884,7 @@ function parseWhatsAppOrderMessage({
           const totalAmount = Number((qty * prod.price).toFixed(2));
           parsedItems.push({
             rawLine: seg.trim(),
-            pharmacyName: currentPharmacy || potentialPartyHeader || 'General Party',
+            pharmacyName: currentPharmacy || defaultPharmacy || potentialPartyHeader || 'General Party',
             psoCode: currentPso || globalPso || '-',
             crpCode: prod.code,
             productName: prod.name,
@@ -807,9 +911,9 @@ function parseWhatsAppOrderMessage({
     }
   }
 
-  if (parsedItems.length === 0 && rawLines.length <= 2 && messageText.length <= 35) {
-    const onlyDaMatch = messageText.toUpperCase().match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b|\b(2100\d{2}|122\d{3})\b/);
-    const onlyPsoMatch = extractPSOCode(messageText);
+  if (parsedItems.length === 0 && rawLines.length <= 2 && normalizedBlock.length <= 35) {
+    const onlyDaMatch = normalizedBlock.toUpperCase().match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b|\b(2100\d{2}|122\d{3})\b/);
+    const onlyPsoMatch = extractPSOCode(normalizedBlock);
     if (onlyDaMatch || onlyPsoMatch) {
       return {
         isOrder: false,
@@ -839,7 +943,6 @@ function parseWhatsAppOrderMessage({
     hour12: true
   });
 
-  // Prefer real BD phone number (from senderPhone or DA_MASTER) over raw @lid digits
   let displayPhone = normalizeBdPhone(senderPhone);
   if (!displayPhone.startsWith('8801') && daInfo.phones && daInfo.phones.length > 0) {
     displayPhone = daInfo.phones[0];
@@ -876,97 +979,257 @@ function parseWhatsAppOrderMessage({
 }
 
 // ============================================================================
-// 7. HANDWRITTEN / PAPER PHOTO OCR ENGINE (GEMINI VISION + OCR.SPACE FALLBACK)
+// 7. 3-STAGE AUTO-RETRY IMAGE OCR + KEYLESS VISION AI FALLBACK ENGINE
 // ============================================================================
 
-/**
- * Extracts text from a handwritten or printed order photo buffer.
- * Supports:
- * 1. Google Gemini Flash Vision API (if GEMINI_API_KEY is set in Env or Web Dashboard - 100% Free Tier, highest handwriting accuracy)
- * 2. Built-in OCR.space Engine 2 API (works out-of-the-box with zero config for camera/handwritten/printed text)
- */
-async function extractTextFromOrderImage(imageBuffer, mimeType = 'image/jpeg') {
-  const base64Image = imageBuffer.toString('base64');
-  const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  // Engine 1: Google Gemini Vision API (Best for Handwritten Paper Orders)
-  if (geminiKey) {
-    const models = ['gemini-2.5-flash', 'gemini-1.5-flash'];
-    const productNamesHint = activeProducts.map((p) => `${p.name} (${p.code})`).join(', ');
-    const promptText =
-      'You are an expert OCR system for Renata PLC Bangladesh pharmaceutical order sheets. ' +
-      'Read this handwritten or printed order photo and output ONLY the plain text lines exactly as structured for order parsing: ' +
-      'Include any DA Code (like CF9054, RF20363, C122210), DA Name, Pharmacy/Customer Name, PSO Code (like PSO E71, G24, 450), ' +
-      'and every Product Name with its ordered Quantity (one product per line, e.g. "Totifen 100ml 50", "Doxicap 10"). ' +
-      `Known official products include: ${productNamesHint}. ` +
-      'Do NOT add markdown formatting or commentary—output only the raw extracted order lines.';
-
-    for (const modelName of models) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(geminiKey)}`;
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{
-              parts: [
-                { text: promptText },
-                { inline_data: { mime_type: mimeType, data: base64Image } }
-              ]
-            }],
-            generationConfig: { temperature: 0.1 }
-          })
-        });
-        const data = await response.json();
-        const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
-        if (extracted) {
-          addLog(`📸 Image OCR (Gemini Vision ${modelName}) extracted ${extracted.split('\n').length} line(s).`);
-          return { text: extracted, engine: `Gemini Vision (${modelName})` };
-        }
-      } catch (err) {
-        addLog(`⚠️ Gemini Vision (${modelName}) warning: ${err.message}`);
-      }
-    }
-  }
-
-  // Engine 2: Built-in Zero-Config OCR.space Engine 2 (supports handwriting & camera photos)
+async function fetchWithTimeout(url, options = {}, timeoutMs = 16000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const ocrKey = (process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
-    const formBody = new URLSearchParams();
-    formBody.append('apikey', ocrKey);
-    formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
-    formBody.append('language', 'eng');
-    formBody.append('isOverlayRequired', 'false');
-    formBody.append('OCREngine', '2'); // Engine 2 is specialized for handwritten & weird fonts/camera photos
-    formBody.append('scale', 'true');
-    formBody.append('isTable', 'true');
-
-    const res = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formBody.toString()
-    });
-    const json = await res.json();
-    const parsedText = (json?.ParsedResults || [])
-      .map((r) => r.ParsedText || '')
-      .join('\n')
-      .trim();
-
-    if (parsedText) {
-      addLog(`📸 Image OCR (Cloud Engine 2) extracted ${parsedText.split('\n').length} line(s).`);
-      return { text: parsedText, engine: 'Cloud OCR Engine 2' };
-    }
-  } catch (err) {
-    addLog(`⚠️ Cloud OCR Engine 2 error: ${err.message}`);
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
-
-  return { text: '', engine: 'None' };
 }
 
 /**
- * Formats the WhatsApp confirmation reply message sent after saving an image order
+ * Call OCR.space with configurable engine (Engine 2 = Handwriting/Camera, Engine 1 = Fast Printed/Contrast)
  */
-function buildImageOrderReplyMessage(orders, ocrEngine) {
+async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true') {
+  const ocrKey = (process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
+  const formBody = new URLSearchParams();
+  formBody.append('apikey', ocrKey);
+  formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
+  formBody.append('language', 'eng');
+  formBody.append('isOverlayRequired', 'false');
+  formBody.append('OCREngine', String(engineNumber));
+  formBody.append('scale', 'true');
+  formBody.append('detectOrientation', 'true');
+  formBody.append('isTable', String(isTable));
+
+  const res = await fetchWithTimeout('https://api.ocr.space/parse/image', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody.toString()
+  }, 15000);
+  const json = await res.json();
+  return (json?.ParsedResults || [])
+    .map((r) => r.ParsedText || '')
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Keyless Free Vision AI Fallback (Pollinations OpenAI-Compatible Multimodal Vision Endpoint)
+ * Works with ZERO API Key or account setup!
+ */
+async function runKeylessVisionAiFallback(base64Image, mimeType) {
+  const productHint = activeProducts.slice(0, 45).map((p) => p.name.split(' ')[0]).join(', ');
+  const promptText =
+    'Read this handwritten or printed pharmaceutical order sheet photo from Bangladesh (Renata PLC). ' +
+    'Extract and output ONLY the raw order lines: include DA Code (e.g. CF9054, RF20363, C122210), ' +
+    'Customer/Pharmacy Name, PSO Code, and each Medicine Name with its ordered Quantity on the same line (e.g. "Totifen 50", "Doxicap 10", "Domiren 100ml 20"). ' +
+    `Common medicine names include: ${productHint}. Output plain text lines only, no commentary.`;
+
+  const res = await fetchWithTimeout('https://text.pollinations.ai/openai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'openai',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: promptText },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+          ]
+        }
+      ],
+      temperature: 0.1
+    })
+  }, 20000);
+
+  if (!res.ok) return '';
+  const data = await res.json();
+  return (data?.choices?.[0]?.message?.content || '').trim();
+}
+
+/**
+ * Optional Google Gemini Vision API (if user configured GEMINI_API_KEY)
+ */
+async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
+  const models = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+  const productNamesHint = activeProducts.map((p) => `${p.name} (${p.code})`).join(', ');
+  const promptText =
+    'Read this handwritten or printed order photo for Renata PLC Bangladesh and output ONLY the plain text lines: ' +
+    'DA Code, Pharmacy/Customer Name, PSO Code, and each Product Name with its Quantity (one product per line, e.g. "Totifen 100ml 50"). ' +
+    `Official products: ${productNamesHint}.`;
+
+  for (const modelName of models) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: promptText },
+              { inline_data: { mime_type: mimeType, data: base64Image } }
+            ]
+          }],
+          generationConfig: { temperature: 0.1 }
+        })
+      }, 15000);
+      const data = await response.json();
+      const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
+      if (extracted) return { text: extracted, engine: `Gemini Vision (${modelName})` };
+    } catch (e) {}
+  }
+  return null;
+}
+
+/**
+ * 3-Stage Server-Side Auto-Retry + Keyless Vision AI Pipeline:
+ * Automatically checks and parses the image up to 3+ times across different OCR & AI Vision engines
+ * BEFORE returning failure, so the user NEVER has to resend an image multiple times!
+ */
+async function processImageOrderWithThreeRetries({
+  imageBuffer,
+  mimeType = 'image/jpeg',
+  caption = '',
+  messageId,
+  timestamp,
+  senderPhone,
+  senderPushName,
+  senderJid
+}) {
+  const base64Image = imageBuffer.toString('base64');
+  const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+  const collectedTexts = [];
+
+  // Define the 3 automatic retry stages + final keyless AI Vision stage
+  const stages = [
+    {
+      name: 'Attempt 1/3 (Neural Handwriting & Table OCR Engine 2)',
+      run: async () => {
+        if (geminiKey) {
+          const g = await runGeminiVisionPass(base64Image, mimeType, geminiKey);
+          if (g && g.text) return g;
+        }
+        const t = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
+        return { text: t, engine: 'Cloud OCR Engine 2 (Table Mode)' };
+      }
+    },
+    {
+      name: 'Attempt 2/3 (Auto-Recheck: Raw Line Handwriting OCR + Orientation Engine 1)',
+      run: async () => {
+        const t2Raw = await runOcrSpacePass(base64Image, mimeType, '2', 'false');
+        const t1 = await runOcrSpacePass(base64Image, mimeType, '1', 'true');
+        return {
+          text: [t2Raw, t1].filter(Boolean).join('\n'),
+          engine: 'Cloud OCR Engine 1+2 (Multi-Pass)'
+        };
+      }
+    },
+    {
+      name: 'Attempt 3/3 (Auto-Recheck: Keyless AI Vision Fallback — Zero API Key)',
+      run: async () => {
+        const aiText = await runKeylessVisionAiFallback(base64Image, mimeType);
+        if (aiText) {
+          return { text: aiText, engine: 'Keyless Vision AI (GPT-4o Vision Fallback)' };
+        }
+        // Final retry on OCR Engine 2 if Vision endpoint was unreachable
+        const tRetry = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
+        return { text: tRetry, engine: 'Cloud OCR Engine 2 (Retry 3)' };
+      }
+    }
+  ];
+
+  for (let i = 0; i < stages.length; i++) {
+    const stage = stages[i];
+    try {
+      if (i > 0) {
+        addLog(`🔄 Image Recheck [${stage.name}] running automatically...`);
+        await sleep(1200);
+      }
+      const res = await stage.run();
+      const rawExtracted = (res?.text || '').trim();
+      if (rawExtracted) {
+        collectedTexts.push(rawExtracted);
+      }
+
+      const combinedText = [caption, rawExtracted].filter(Boolean).join('\n').trim();
+      if (combinedText) {
+        const parsed = parseWhatsAppOrderMessage({
+          messageText: combinedText,
+          messageId,
+          timestamp,
+          senderPhone,
+          senderPushName,
+          senderJid
+        });
+        if (parsed.isOrder && parsed.orders.length > 0) {
+          addLog(`✅ Image Order succeeded on ${stage.name} (${parsed.orders.length} items matched via ${res.engine}).`);
+          return {
+            ok: true,
+            attemptUsed: i + 1,
+            engine: res.engine,
+            extractedText: combinedText,
+            parsed
+          };
+        }
+      }
+    } catch (err) {
+      addLog(`⚠️ ${stage.name} warning: ${err.message}`);
+    }
+  }
+
+  // Final Combined Pass: If individual passes had partial text (e.g. DA ID in Pass 1 and Product in Pass 2), try combined text!
+  if (collectedTexts.length > 1) {
+    const mergedAll = [caption, ...collectedTexts].filter(Boolean).join('\n');
+    const parsedMerged = parseWhatsAppOrderMessage({
+      messageText: mergedAll,
+      messageId,
+      timestamp,
+      senderPhone,
+      senderPushName,
+      senderJid
+    });
+    if (parsedMerged.isOrder && parsedMerged.orders.length > 0) {
+      // Deduplicate by crpCode + orderedQty in case multiple passes extracted the same line
+      const seen = new Set();
+      parsedMerged.orders = parsedMerged.orders.filter((o) => {
+        const k = `${o.crpCode}_${o.orderedQty}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      addLog(`✅ Image Order succeeded via Combined Multi-Pass Text (${parsedMerged.orders.length} items).`);
+      return {
+        ok: true,
+        attemptUsed: 3,
+        engine: 'Combined Multi-Pass OCR',
+        extractedText: mergedAll,
+        parsed: parsedMerged
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    attemptUsed: 3,
+    engine: 'All 3 Retries Exhausted',
+    extractedText: collectedTexts.join('\n').trim(),
+    parsed: null
+  };
+}
+
+function buildImageOrderReplyMessage(orders, ocrEngine = '', attemptUsed = 1) {
   const first = orders[0];
   const totalAmount = orders.reduce((sum, o) => sum + o.totalAmount, 0);
 
@@ -986,6 +1249,9 @@ function buildImageOrderReplyMessage(orders, ocrEngine) {
 
   lines.push('');
   lines.push(`💰 *সর্বমোট (Grand Total): ৳${totalAmount.toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*`);
+  if (attemptUsed > 1) {
+    lines.push(`🔄 _Auto-Recheck Pass: ${attemptUsed}/3 (${ocrEngine})_`);
+  }
   lines.push('');
   lines.push('⚠️ _এই অর্ডারটি বাতিল করতে চাইলে এই মেসেজের Reply-তে লিখুন:_ */cnl*');
   lines.push('_(অন্য কিছু লিখলে বা কিছু না লিখলে অর্ডারটি সেভ থাকবে)_');
@@ -1005,19 +1271,24 @@ let botConfig = {
   targetGroupName: process.env.TARGET_GROUP_NAME || 'CRP sales NK Depot',
   autoReactOnOrder: true,
   geminiApiKey: process.env.GEMINI_API_KEY || '',
-  authorizedImageLids: [],
+  authorizedImageLids: [...DEFAULT_AUTHORIZED_LIDS],
   priceVersion: 'TRADE_PRICE_2026_10_30',
   updatedAt: null
 };
 
-// Map of Bot Reply Message ID (and Original Image Msg ID) -> Order WhatsApp Msg ID for "/cnl" cancellation
 const cancellableOrderMap = new Map();
 const lastOrderBySenderMap = new Map();
 
 if (fs.existsSync(LOCAL_CONFIG_PATH)) {
   try {
     const saved = JSON.parse(fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8'));
-    botConfig = { ...botConfig, ...saved };
+    botConfig = {
+      ...botConfig,
+      ...saved,
+      authorizedImageLids: Array.from(
+        new Set([...DEFAULT_AUTHORIZED_LIDS, ...(saved.authorizedImageLids || [])])
+      )
+    };
   } catch (e) {}
 }
 
@@ -1071,9 +1342,6 @@ async function initGoogleSheetsClient() {
   }
 }
 
-/**
- * Ensures all 5 tabs exist and upgrades Product_Wise_Summary & Live_Orders to official TRADE PRICE
- */
 async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
   if (!sheetsClient || !GOOGLE_SHEET_ID) return false;
   try {
@@ -1190,7 +1458,7 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
       });
     }
 
-    // 4. Product_Wise_Summary Tab — Write Official TRADE PRICE from Current Pricie List (30-10-26).xlsx
+    // 4. Product_Wise_Summary Tab
     if (forceUpdateTradePrices) {
       const prodRows = [
         [
@@ -1226,7 +1494,6 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
         requestBody: { values: prodRows }
       });
 
-      // Also migrate any existing rows in Live_Orders to the new TRADE PRICE!
       await migrateExistingLiveOrdersToTradePrice();
     }
 
@@ -1237,9 +1504,6 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
   }
 }
 
-/**
- * Updates any existing rows in Live_Orders so their Unit Price & Total Amount reflect the new TRADE PRICE
- */
 async function migrateExistingLiveOrdersToTradePrice() {
   if (!sheetsClient || !GOOGLE_SHEET_ID) return;
   try {
@@ -1253,6 +1517,7 @@ async function migrateExistingLiveOrdersToTradePrice() {
     const updates = [];
     for (let r = 1; r < rows.length; r++) {
       const row = rows[r];
+      if (!row || !row[0]) continue;
       const crpCode = String(row[11] || '').trim();
       const qty = parseFloat(String(row[14] || '0').replace(/,/g, ''));
       const currentUnitPrice = parseFloat(String(row[15] || '0').replace(/[^\d.]/g, ''));
@@ -1297,12 +1562,8 @@ async function backupAuthAndConfigToSheet() {
     if (fs.existsSync(AUTH_DIR)) {
       const files = fs.readdirSync(AUTH_DIR);
       for (const file of files) {
-        if (
-          file === 'creds.json' ||
-          file.startsWith('app-state-sync-key-') ||
-          file.startsWith('session-') ||
-          file.startsWith('sender-key-')
-        ) {
+        // Back up ALL .json files including pre-key-*.json so Signal group decryption never fails after restart!
+        if (file.endsWith('.json')) {
           const fullPath = path.join(AUTH_DIR, file);
           if (fs.statSync(fullPath).isFile()) {
             authFiles[file] = fs.readFileSync(fullPath, 'utf8');
@@ -1330,7 +1591,7 @@ async function backupAuthAndConfigToSheet() {
 
     await sheetsClient.spreadsheets.values.clear({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.BOT_STATE}!A1:Z30`
+      range: `${SHEET_TABS.BOT_STATE}!A1:Z40`
     });
     await sheetsClient.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SHEET_ID,
@@ -1355,7 +1616,7 @@ async function restoreAuthAndConfigFromSheet() {
   try {
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.BOT_STATE}!A1:C30`
+      range: `${SHEET_TABS.BOT_STATE}!A1:C40`
     });
     const rows = res.data.values || [];
     let compressedChunks = [];
@@ -1365,9 +1626,19 @@ async function restoreAuthAndConfigFromSheet() {
       if (key === 'BOT_CONFIG' && val) {
         try {
           const parsedConfig = JSON.parse(val);
-          botConfig = { ...botConfig, ...parsedConfig };
+          botConfig = {
+            ...botConfig,
+            ...parsedConfig,
+            authorizedImageLids: Array.from(
+              new Set([
+                ...DEFAULT_AUTHORIZED_LIDS,
+                ...(botConfig.authorizedImageLids || []),
+                ...(parsedConfig.authorizedImageLids || [])
+              ])
+            )
+          };
           saveLocalConfig();
-          addLog(`☁️ Restored saved group config from Google Sheet: "${botConfig.targetGroupName}"`);
+          addLog(`☁️ Restored saved group config: "${botConfig.targetGroupName}" (${botConfig.targetGroupId || 'All Groups'})`);
         } catch (e) {}
       } else if (key && key.startsWith('WA_AUTH_GZIP') && val) {
         compressedChunks.push(val);
@@ -1400,7 +1671,7 @@ async function restoreAuthAndConfigFromSheet() {
 }
 
 // ============================================================================
-// 10. GOOGLE SHEETS ORDER CRUD: SAVE, EDIT/REPLACE, UNSEND/DELETE, & /CNL
+// 10. GOOGLE SHEETS ORDER CRUD: SMART FIRST-EMPTY-ROW WRITE, UNSEND & /CNL
 // ============================================================================
 let sheetQueue = Promise.resolve();
 function enqueueSheetTask(taskFn) {
@@ -1410,13 +1681,16 @@ function enqueueSheetTask(taskFn) {
   return sheetQueue;
 }
 
+/**
+ * Writes new order rows into the exact first empty row of Live_Orders
+ * (Prevents blank row gaps when rows were manually cleared in Google Sheets!)
+ */
 async function appendOrdersToSheet(orders) {
   if (!orders || orders.length === 0) return;
   return enqueueSheetTask(async () => {
     for (const o of orders) {
       recentOrders.unshift(o);
     }
-    // Keep memory footprint small on Render Free Tier (max 50 items in RAM)
     if (recentOrders.length > 50) recentOrders.length = 50;
     stats.totalOrdersSaved += orders.length;
     stats.totalAmountSaved = Number(
@@ -1431,7 +1705,7 @@ async function appendOrdersToSheet(orders) {
     const values = orders.map((o) => [
       o.orderLineId,
       o.whatsappMsgId,
-      `'${o.date}`, // Leading apostrophe prevents Google Sheets serial number conversion
+      `'${o.date}`,
       `'${o.time}`,
       o.daId,
       o.altId,
@@ -1450,15 +1724,31 @@ async function appendOrdersToSheet(orders) {
       o.status
     ]);
 
-    await sheetsClient.spreadsheets.values.append({
+    // Find the exact first empty row in Column A of Live_Orders so there are NEVER blank gaps
+    const colARes = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.LIVE_ORDERS}!A:S`,
+      range: `${SHEET_TABS.LIVE_ORDERS}!A1:A1000`
+    });
+    const colARows = colARes.data.values || [['Order Line ID']];
+    let targetStartRow = colARows.length + 1;
+    for (let i = 1; i < colARows.length; i++) {
+      if (!colARows[i] || !String(colARows[i][0] || '').trim()) {
+        targetStartRow = i + 1;
+        break;
+      }
+    }
+
+    const targetEndRow = targetStartRow + values.length - 1;
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${SHEET_TABS.LIVE_ORDERS}!A${targetStartRow}:S${targetEndRow}`,
       valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
       requestBody: { values }
     });
 
-    addLog(`✅ Saved ${orders.length} order line(s) from ${orders[0].daName} (${orders[0].daId}) to Google Sheets.`);
+    addLog(
+      `✅ Saved ${orders.length} order line(s) at Row ${targetStartRow} from ${orders[0].daName} (${orders[0].daId}) to Google Sheets.`
+    );
   });
 }
 
@@ -1480,9 +1770,6 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
     }
 
     if (!sheetsClient || !googleAuthReady) {
-      if (removedLocal.length > 0) {
-        addLog(`🗑️ Removed ${removedLocal.length} order(s) from memory (${reason}, Msg ID: ${whatsappMsgId}).`);
-      }
       return removedLocal.length;
     }
 
@@ -1505,7 +1792,7 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
     const deletedAt = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka' });
 
     for (let r = 1; r < rows.length; r++) {
-      const rowMsgId = String(rows[r][1] || '').trim();
+      const rowMsgId = String(rows[r]?.[1] || '').trim();
       if (rowMsgId === String(whatsappMsgId).trim()) {
         matchingZeroBasedIndices.push(r);
         const fullRow = [...rows[r]];
@@ -1581,6 +1868,7 @@ async function applyFollowUpPatchToSheet(patch) {
 
     const dataUpdates = [];
     for (let r = rows.length - 1; r >= Math.max(1, rows.length - 25); r--) {
+      if (!rows[r]) continue;
       const rowPhone = String(rows[r][7] || '').trim();
       if (rowPhone === cleanPhone) {
         const rowNum = r + 1;
@@ -1613,7 +1901,7 @@ async function applyFollowUpPatchToSheet(patch) {
 }
 
 // ============================================================================
-// 11. WHATSAPP BAILEYS ENGINE (QR, GROUP, IMAGE OCR, /CNL CANCEL & UNSEND)
+// 11. WHATSAPP BAILEYS ENGINE (QR, GROUP MATCHER, 3X OCR, /CNL & UNSEND)
 // ============================================================================
 let sock = null;
 let waStatus = 'DISCONNECTED';
@@ -1638,19 +1926,41 @@ function addLog(msg) {
   const entry = `[${time}] ${msg}`;
   console.log(entry);
   activityLogs.unshift(entry);
-  // Keep max 60 logs in memory so Render Free Tier RAM stays minimal
   if (activityLogs.length > 60) activityLogs.length = 60;
 }
 
 /**
- * Inspects a Baileys WAMessage for REVOKE (unsend), EDIT, IMAGE, or TEXT (including quoted /cnl replies)
+ * Checks whether a group JID matches the user's configured target group (by ID, by Name, or All Groups)
  */
+function isAllowedTargetGroup(remoteJid) {
+  if (!remoteJid || !remoteJid.endsWith('@g.us')) return false;
+  const cfgId = (botConfig.targetGroupId || '').trim();
+  const cfgName = (botConfig.targetGroupName || '').trim().toLowerCase();
+
+  // If set to ALL groups or both empty, allow any group the bot is in
+  if (cfgId === 'ALL' || (!cfgId && !cfgName) || cfgName === 'all' || cfgName === 'all groups') {
+    return true;
+  }
+  if (cfgId && remoteJid === cfgId) {
+    return true;
+  }
+  if (cfgName) {
+    const foundGroup = joinedGroups.find((g) => g.id === remoteJid);
+    if (foundGroup) {
+      const subj = (foundGroup.subject || '').trim().toLowerCase();
+      if (subj === cfgName || subj.includes(cfgName) || cfgName.includes(subj)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function inspectBaileysMessage(msg) {
   if (!msg || !msg.message) return { type: 'IGNORE' };
 
   const m = msg.message;
 
-  // 1. Unsend / Delete for Everyone (REVOKE)
   const proto =
     m.protocolMessage ||
     m.ephemeralMessage?.message?.protocolMessage ||
@@ -1664,7 +1974,6 @@ function inspectBaileysMessage(msg) {
     };
   }
 
-  // 2. Edited Message
   const editedObj =
     m.editedMessage?.message?.protocolMessage ||
     m.protocolMessage?.editedMessage ||
@@ -1689,7 +1998,6 @@ function inspectBaileysMessage(msg) {
     }
   }
 
-  // 3. Image Message (Handwritten / Paper Order Photo)
   const imgMsg =
     m.imageMessage ||
     m.ephemeralMessage?.message?.imageMessage ||
@@ -1709,7 +2017,6 @@ function inspectBaileysMessage(msg) {
     };
   }
 
-  // 4. Standard Text or Quoted Reply Message
   const extMsg = m.extendedTextMessage || m.ephemeralMessage?.message?.extendedTextMessage;
   const text =
     m.conversation ||
@@ -1732,9 +2039,6 @@ function inspectBaileysMessage(msg) {
   return { type: 'IGNORE' };
 }
 
-/**
- * Harvests participant @lid -> Phone Number mappings from group metadata
- */
 function harvestLidMappingsFromGroups(groupsList) {
   for (const g of groupsList || []) {
     for (const p of g.participants || []) {
@@ -1752,6 +2056,12 @@ function harvestLidMappingsFromGroups(groupsList) {
       }
       if (lidPart && phonePart) {
         lidToPhoneMap.set(lidPart, phonePart);
+        if (AUTHORIZED_IMAGE_PHONES.includes(phonePart)) {
+          if (!botConfig.authorizedImageLids) botConfig.authorizedImageLids = [];
+          if (!botConfig.authorizedImageLids.includes(lidPart)) {
+            botConfig.authorizedImageLids.push(lidPart);
+          }
+        }
       }
     }
   }
@@ -1772,18 +2082,19 @@ async function refreshJoinedGroups() {
       }))
       .sort((a, b) => a.subject.localeCompare(b.subject));
 
-    if (!botConfig.targetGroupId && botConfig.targetGroupName) {
+    // Sync targetGroupId if targetGroupName matches one of the joined groups
+    if (botConfig.targetGroupName && botConfig.targetGroupId !== 'ALL') {
       const autoFound = joinedGroups.find(
         (g) =>
           g.subject.toLowerCase().trim() === botConfig.targetGroupName.toLowerCase().trim() ||
-          g.subject.toLowerCase().includes('crp sales')
+          g.subject.toLowerCase().includes(botConfig.targetGroupName.toLowerCase().trim())
       );
-      if (autoFound) {
+      if (autoFound && botConfig.targetGroupId !== autoFound.id) {
         botConfig.targetGroupId = autoFound.id;
         botConfig.targetGroupName = autoFound.subject;
         saveLocalConfig();
         scheduleCloudStateBackup(2000);
-        addLog(`🎯 Auto-detected target WhatsApp group: "${autoFound.subject}" (${autoFound.id})`);
+        addLog(`🎯 Synced target WhatsApp group: "${autoFound.subject}" (${autoFound.id})`);
       }
     }
     return joinedGroups;
@@ -1791,6 +2102,30 @@ async function refreshJoinedGroups() {
     addLog(`⚠️ Could not fetch group list: ${err.message}`);
     return joinedGroups;
   }
+}
+
+/**
+ * Queries WhatsApp server for the exact @lid of +8801732273944 & +8801793362829 on connection open
+ */
+async function autoBindAuthorizedImagePhones() {
+  if (!sock || waStatus !== 'CONNECTED') return;
+  try {
+    if (typeof sock.onWhatsApp === 'function') {
+      const results = await sock.onWhatsApp(...AUTHORIZED_IMAGE_PHONES);
+      for (const r of results || []) {
+        const phoneNorm = normalizeBdPhone((r.jid || '').split('@')[0].split(':')[0]);
+        const lidClean = (r.lid || '').split('@')[0].split(':')[0];
+        if (lidClean && phoneNorm) {
+          lidToPhoneMap.set(lidClean, phoneNorm);
+          if (!botConfig.authorizedImageLids) botConfig.authorizedImageLids = [];
+          if (!botConfig.authorizedImageLids.includes(lidClean)) {
+            botConfig.authorizedImageLids.push(lidClean);
+            addLog(`🔐 Auto-bound authorized image phone +${phoneNorm} -> LID ${lidClean}`);
+          }
+        }
+      }
+    }
+  } catch (e) {}
 }
 
 async function startWhatsApp() {
@@ -1855,6 +2190,15 @@ async function startWhatsApp() {
           if (botPh.startsWith('8801')) lidToPhoneMap.set(botLid, botPh);
         }
         addLog(`🟢 WhatsApp Connected as ${connectedUser.name} (${connectedUser.id})`);
+
+        // Critical: Ensure pre-keys are uploaded so group member messages never fail decryption!
+        if (typeof sock.uploadPreKeysToServerIfRequired === 'function') {
+          try {
+            await sock.uploadPreKeysToServerIfRequired();
+          } catch (e) {}
+        }
+
+        await autoBindAuthorizedImagePhones();
         await refreshJoinedGroups();
         scheduleCloudStateBackup(3000);
       }
@@ -1879,7 +2223,6 @@ async function startWhatsApp() {
       }
     });
 
-    // Listen for New Messages, Image Orders, "/cnl" Replies, Edited Messages, and Unsend Events
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return;
 
@@ -1889,11 +2232,6 @@ async function startWhatsApp() {
           if (!remoteJid || remoteJid === 'status@broadcast') continue;
 
           const isGroup = remoteJid.endsWith('@g.us');
-          // For group messages, only listen to the configured target group
-          if (isGroup && botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) {
-            continue;
-          }
-
           const inspected = inspectBaileysMessage(msg);
           if (inspected.type === 'IGNORE') continue;
 
@@ -1904,6 +2242,42 @@ async function startWhatsApp() {
           const msgTimestamp = msg.messageTimestamp
             ? Number(msg.messageTimestamp) * 1000
             : Date.now();
+
+          // Check "/bind" command FIRST across ALL groups and DMs (even before group filter!)
+          const textOrCaption = (inspected.text || inspected.caption || '').trim();
+          const bindMatch = textOrCaption.match(/^\/?bind(?:\s+([\+\d\-\s]{10,18}))?$/i);
+          if (bindMatch) {
+            const targetPh = bindMatch[1]
+              ? normalizeBdPhone(bindMatch[1])
+              : AUTHORIZED_IMAGE_PHONES[0];
+            if (AUTHORIZED_IMAGE_PHONES.includes(targetPh)) {
+              lidToPhoneMap.set(rawSenderId, targetPh);
+              if (!botConfig.authorizedImageLids) botConfig.authorizedImageLids = [];
+              if (!botConfig.authorizedImageLids.includes(rawSenderId)) {
+                botConfig.authorizedImageLids.push(rawSenderId);
+              }
+              saveLocalConfig();
+              scheduleCloudStateBackup(2000);
+              addLog(`🔗 Bound sender ID ${rawSenderId} to authorized image phone +${targetPh}`);
+              if (sock) {
+                try {
+                  await sock.sendMessage(
+                    remoteJid,
+                    { text: `✅ আপনার অ্যাকাউন্টটি (+${targetPh}, ID: ${rawSenderId}) ছবির অর্ডারের জন্য স্থায়ীভাবে যুক্ত হয়েছে!` },
+                    { quoted: msg }
+                  );
+                } catch (e) {}
+              }
+              continue;
+            }
+          }
+
+          // For group messages, check if group is allowed (unless it's an authorized image sender!)
+          if (isGroup && !isAllowedTargetGroup(remoteJid)) {
+            if (!(inspected.type === 'IMAGE' && isAuthorizedForImageOrder(msg, senderPhone))) {
+              continue;
+            }
+          }
 
           // CASE 1: Message Unsent / Deleted for Everyone
           if (inspected.type === 'REVOKE') {
@@ -1930,9 +2304,8 @@ async function startWhatsApp() {
             continue;
           }
 
-          // CASE 3: Handwritten / Paper Image Order (Strictly restricted to +8801732273944 & +8801793362829)
+          // CASE 3: Handwritten / Paper Image Order (3-Retry + Keyless Vision AI Pipeline)
           if (inspected.type === 'IMAGE') {
-            // If senderPhone is still an unmapped @lid in a group, fetch groupMetadata on the spot
             if (!senderPhone.startsWith('8801') && isGroup && sock) {
               try {
                 const gMeta = await sock.groupMetadata(remoteJid);
@@ -1943,12 +2316,12 @@ async function startWhatsApp() {
 
             if (!isAuthorizedForImageOrder(msg, senderPhone)) {
               addLog(
-                `⛔ Ignored image from unauthorized sender (${senderPhone || rawSenderId} / ${senderPushName}). Only +8801732273944 & +8801793362829 are allowed.`
+                `⛔ Ignored image from unauthorized sender (ID: ${rawSenderId}, Phone: ${senderPhone || 'Unknown'}, Name: ${senderPushName}).`
               );
               continue;
             }
 
-            addLog(`📸 Authorized image received from +${senderPhone || rawSenderId}. Running OCR...`);
+            addLog(`📸 Authorized image received from +${senderPhone || rawSenderId}. Starting 3-Stage OCR Pipeline...`);
             if (sock) {
               try {
                 await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
@@ -1968,44 +2341,31 @@ async function startWhatsApp() {
               continue;
             }
 
-            const ocrResult = await extractTextFromOrderImage(imageBuffer, inspected.mimeType);
-            imageBuffer = null; // Free buffer immediately for Render memory safety
-
-            const combinedText = [inspected.caption, ocrResult.text].filter(Boolean).join('\n').trim();
-            if (!combinedText) {
-              addLog('⚠️ Image OCR returned empty text.');
-              if (sock) {
-                try {
-                  await sock.sendMessage(
-                    remoteJid,
-                    { text: '⚠️ ছবির লেখাটি পড়া যায়নি। অনুগ্রহ করে পরিষ্কার আলোতে ছবি তুলে আবার পাঠান।' },
-                    { quoted: msg }
-                  );
-                } catch (e) {}
-              }
-              continue;
-            }
-
-            const parsedImgOrder = parseWhatsAppOrderMessage({
-              messageText: combinedText,
+            const ocrPipelineResult = await processImageOrderWithThreeRetries({
+              imageBuffer,
+              mimeType: inspected.mimeType,
+              caption: inspected.caption,
               messageId: inspected.msgId,
               timestamp: msgTimestamp,
               senderPhone,
               senderPushName,
               senderJid
             });
+            imageBuffer = null; // Free memory immediately
 
-            if (parsedImgOrder.isOrder && parsedImgOrder.orders.length > 0) {
-              // 1. Save immediately to Google Sheets
-              await appendOrdersToSheet(parsedImgOrder.orders);
+            if (ocrPipelineResult.ok && ocrPipelineResult.parsed?.orders?.length > 0) {
+              const orders = ocrPipelineResult.parsed.orders;
+              await appendOrdersToSheet(orders);
 
-              // 2. Register message ID for "/cnl" cancellation
               cancellableOrderMap.set(inspected.msgId, inspected.msgId);
               lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
               if (senderPhone) lastOrderBySenderMap.set(senderPhone, inspected.msgId);
 
-              // 3. Send detailed confirmation reply with "/cnl" instruction
-              const replyText = buildImageOrderReplyMessage(parsedImgOrder.orders, ocrResult.engine);
+              const replyText = buildImageOrderReplyMessage(
+                orders,
+                ocrPipelineResult.engine,
+                ocrPipelineResult.attemptUsed
+              );
               if (sock) {
                 try {
                   const sentReply = await sock.sendMessage(
@@ -2022,13 +2382,22 @@ async function startWhatsApp() {
                 }
               }
             } else {
-              addLog(`⚠️ No valid CRP products found in OCR text: "${combinedText.replace(/\n/g, ' | ')}"`);
+              // All 3 server-side retries + Keyless Vision AI fallback exhausted without finding any CRP product
+              addLog(
+                `❌ All 3 OCR retries & Vision AI fallback found no valid CRP order. Extracted: "${(ocrPipelineResult.extractedText || '').replace(/\n/g, ' | ').slice(0, 180)}"`
+              );
               if (sock) {
                 try {
+                  await sock.sendMessage(remoteJid, { react: { text: '⚠️', key: msg.key } });
                   await sock.sendMessage(
                     remoteJid,
                     {
-                      text: `⚠️ ছবি থেকে কোনো CRP প্রোডাক্টের অর্ডার শনাক্ত করা যায়নি।\n\n*শনাক্তকৃত লেখা:*\n${combinedText.slice(0, 300)}`
+                      text:
+                        '⚠️ *ছবিটি ৩ বার অটো-রিচেক ও AI Vision দিয়ে চেক করার পরও কোনো CRP প্রোডাক্টের অর্ডার পাওয়া যায়নি।*\n' +
+                        'অনুগ্রহ করে খাতার লেখাটি আরেকটু পরিষ্কার করে ছবি তুলে পাঠান।' +
+                        (ocrPipelineResult.extractedText
+                          ? `\n\n_শনাক্তকৃত লেখা:_\n${ocrPipelineResult.extractedText.slice(0, 220)}`
+                          : '')
                     },
                     { quoted: msg }
                   );
@@ -2038,43 +2407,16 @@ async function startWhatsApp() {
             continue;
           }
 
-          // CASE 4: Text Messages (Check for "/cnl" Cancel Reply OR "/bind" OR Standard Text Order)
+          // CASE 4: Text Messages ("/cnl" Cancel Reply OR Standard Group Text Order)
           if (inspected.type === 'TEXT') {
-            // Skip bot's own confirmation replies so it doesn't re-parse its own confirmation text!
             if (
               inspected.text.includes('ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!') ||
-              inspected.text.includes('অর্ডারটি বাতিল (/cnl) করা হয়েছে!')
+              inspected.text.includes('অর্ডারটি বাতিল (/cnl) করা হয়েছে!') ||
+              inspected.text.includes('ছবিটি ৩ বার অটো-রিচেক')
             ) {
               continue;
             }
 
-            // A. Check if user is binding their LID to one of the two authorized image phone numbers: "/bind 01732273944"
-            const bindMatch = inspected.text.match(/^\/bind\s+(\+?\d{11,13})$/i);
-            if (bindMatch) {
-              const targetPh = normalizeBdPhone(bindMatch[1]);
-              if (AUTHORIZED_IMAGE_PHONES.includes(targetPh)) {
-                lidToPhoneMap.set(rawSenderId, targetPh);
-                if (!botConfig.authorizedImageLids) botConfig.authorizedImageLids = [];
-                if (!botConfig.authorizedImageLids.includes(rawSenderId)) {
-                  botConfig.authorizedImageLids.push(rawSenderId);
-                }
-                saveLocalConfig();
-                scheduleCloudStateBackup(2000);
-                addLog(`🔗 Bound sender ID ${rawSenderId} to authorized image phone +${targetPh}`);
-                if (sock) {
-                  try {
-                    await sock.sendMessage(
-                      remoteJid,
-                      { text: `✅ আপনার অ্যাকাউন্টটি (+${targetPh}) ছবির অর্ডারের জন্য সফলভাবে যুক্ত হয়েছে!` },
-                      { quoted: msg }
-                    );
-                  } catch (e) {}
-                }
-              }
-              continue;
-            }
-
-            // B. Check if message is "/cnl" (Cancel Command)
             if (/^\/?cnl\b/i.test(inspected.text.trim())) {
               let targetOrderMsgId = null;
               if (inspected.quotedMsgId) {
@@ -2120,7 +2462,6 @@ async function startWhatsApp() {
               continue;
             }
 
-            // C. Standard Text Order (only from target group)
             if (!isGroup) continue;
 
             stats.totalMessagesChecked++;
@@ -2159,7 +2500,7 @@ async function startWhatsApp() {
         try {
           const remoteJid = u.key?.remoteJid || '';
           if (!remoteJid) continue;
-          if (remoteJid.endsWith('@g.us') && botConfig.targetGroupId && remoteJid !== botConfig.targetGroupId) {
+          if (remoteJid.endsWith('@g.us') && !isAllowedTargetGroup(remoteJid)) {
             continue;
           }
 
@@ -2208,14 +2549,15 @@ async function startWhatsApp() {
 }
 
 // ============================================================================
-// 12. EXPRESS WEB SERVER, CLEAR LOGS/ORDERS API & DASHBOARD UI
+// 12. EXPRESS WEB SERVER & NEO-BRUTALISM DASHBOARD UI
 // ============================================================================
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '8mb' }));
 
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
+    version: '4.0-neo-brutalism',
     waStatus,
     googleAuthReady,
     targetGroup: botConfig.targetGroupName,
@@ -2248,7 +2590,6 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// Clear Live Parsed Orders from Render Memory (saves RAM without deleting Google Sheet data)
 app.post('/api/orders/clear', (req, res) => {
   const count = recentOrders.length;
   recentOrders.length = 0;
@@ -2260,13 +2601,12 @@ app.post('/api/orders/clear', (req, res) => {
   res.json({ ok: true, cleared: count, memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
 });
 
-// Clear Live Server Logs from Render Memory
 app.post('/api/logs/clear', (req, res) => {
   activityLogs.length = 0;
   if (global.gc) {
     try { global.gc(); } catch (e) {}
   }
-  addLog('🧹 Server logs cleared manually to free memory.');
+  addLog('🧹 Server logs cleared manually to free Render memory.');
   res.json({ ok: true, memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
 });
 
@@ -2276,9 +2616,33 @@ app.post('/api/groups/refresh', async (req, res) => {
 });
 
 app.post('/api/config/group', async (req, res) => {
-  const { groupId, groupName, autoReactOnOrder, geminiApiKey } = req.body || {};
-  if (typeof groupId === 'string') botConfig.targetGroupId = groupId.trim();
-  if (typeof groupName === 'string') botConfig.targetGroupName = groupName.trim();
+  let { groupId, groupName, autoReactOnOrder, geminiApiKey } = req.body || {};
+  groupId = typeof groupId === 'string' ? groupId.trim() : '';
+  groupName = typeof groupName === 'string' ? groupName.trim() : '';
+
+  if (groupId === 'ALL') {
+    botConfig.targetGroupId = 'ALL';
+    botConfig.targetGroupName = 'All Joined Groups (সব গ্রুপ)';
+  } else {
+    // If user typed a groupName or picked from dropdown, sync ID & Name accurately from joinedGroups
+    if (groupId) {
+      const foundById = joinedGroups.find((g) => g.id === groupId);
+      if (foundById) groupName = foundById.subject;
+    } else if (groupName) {
+      const foundByName = joinedGroups.find(
+        (g) =>
+          g.subject.toLowerCase().trim() === groupName.toLowerCase() ||
+          g.subject.toLowerCase().includes(groupName.toLowerCase())
+      );
+      if (foundByName) {
+        groupId = foundByName.id;
+        groupName = foundByName.subject;
+      }
+    }
+    botConfig.targetGroupId = groupId;
+    botConfig.targetGroupName = groupName || 'All Joined Groups';
+  }
+
   if (typeof autoReactOnOrder === 'boolean') botConfig.autoReactOnOrder = autoReactOnOrder;
   if (typeof geminiApiKey === 'string' && geminiApiKey.trim()) {
     botConfig.geminiApiKey = geminiApiKey.trim();
@@ -2287,7 +2651,7 @@ app.post('/api/config/group', async (req, res) => {
 
   saveLocalConfig();
   await backupAuthAndConfigToSheet();
-  addLog(`🔒 Settings saved to cloud: Group="${botConfig.targetGroupName}"`);
+  addLog(`🔒 Group Config Saved: "${botConfig.targetGroupName}" [ID: ${botConfig.targetGroupId || 'ALL'}]`);
   res.json({ ok: true, botConfig });
 });
 
@@ -2340,6 +2704,7 @@ app.post('/api/whatsapp/logout', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Serve Neo-Brutalism Dashboard UI at "/"
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -2347,312 +2712,452 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Renata CRP WhatsApp Order Tracker v3.0 (Trade Price + Image OCR)</title>
+  <title>Renata CRP Order Tracker v4.0 — Neo-Brutalism Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --accent: #10b981;
-      --accent-hover: #059669;
-      --blue: #3b82f6;
-      --danger: #ef4444;
-      --warn: #f59e0b;
+      --bg: #FFFDF7;
+      --ink: #000000;
+      --yellow: #FFE600;
+      --mint: #6EE7B7;
+      --sky: #7DD3FC;
+      --pink: #FF90E8;
+      --coral: #FDA4AF;
+      --lavender: #C4B5FD;
+      --orange: #FDBA74;
+      --white: #FFFFFF;
+      --border: 3px solid #000000;
+      --shadow: 6px 6px 0px #000000;
+      --shadow-sm: 4px 4px 0px #000000;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
+      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;
+      background-color: var(--bg);
+      background-image: radial-gradient(#000000 1.15px, transparent 1.15px);
+      background-size: 24px 24px;
+      color: var(--ink);
       line-height: 1.5;
-      padding: 20px;
+      padding: 22px;
     }
-    .container { max-width: 1260px; margin: 0 auto; }
+    .container { max-width: 1280px; margin: 0 auto; }
+
+    /* Neo-Brutalist Hero Header */
     header {
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
-      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-      border: 1px solid var(--border);
-      padding: 20px 24px;
-      border-radius: 14px;
-      margin-bottom: 20px;
+      background: var(--yellow);
+      border: 3.5px solid var(--ink);
+      box-shadow: 8px 8px 0px var(--ink);
+      padding: 22px 26px;
+      border-radius: 12px;
+      margin-bottom: 24px;
     }
-    header h1 { font-size: 1.3rem; font-weight: 700; color: #fff; }
-    header p { color: var(--muted); font-size: 0.88rem; margin-top: 4px; }
+    header h1 {
+      font-size: 1.55rem;
+      font-weight: 800;
+      color: var(--ink);
+      letter-spacing: -0.5px;
+      text-transform: uppercase;
+    }
+    header p {
+      color: #1e293b;
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+
+    /* Neo-Brutalist Badges */
     .badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 6px 13px;
-      border-radius: 999px;
-      font-size: 0.8rem;
-      font-weight: 600;
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-size: 0.84rem;
+      font-weight: 800;
+      border: 2.5px solid var(--ink);
+      box-shadow: 3px 3px 0px var(--ink);
+      background: var(--white);
+      color: var(--ink);
     }
-    .badge.ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
-    .badge.warn { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
-    .badge.err { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }
+    .badge.ok { background: var(--mint); }
+    .badge.warn { background: var(--orange); }
+    .badge.err { background: var(--coral); }
+    .badge.info { background: var(--lavender); }
+
+    /* Stats Row */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      border: var(--border);
+      box-shadow: var(--shadow);
+      padding: 16px 18px;
+      border-radius: 12px;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .stat-card:hover {
+      transform: translate(-2px, -2px);
+      box-shadow: 8px 8px 0px var(--ink);
+    }
+    .stat-card.c1 { background: #A7F3D0; }
+    .stat-card.c2 { background: #BAE6FD; }
+    .stat-card.c3 { background: #FEF08A; }
+    .stat-card.c4 { background: #FECDD3; }
+    .stat-card.c5 { background: #DDD6FE; }
+    .stat-card .lbl {
+      font-size: 0.8rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--ink);
+      opacity: 0.85;
+    }
+    .stat-card .val {
+      font-size: 1.5rem;
+      font-weight: 800;
+      color: var(--ink);
+      margin-top: 6px;
+    }
+
+    /* Main Grid & Cards */
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-      gap: 20px;
-      margin-bottom: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 22px;
+      margin-bottom: 24px;
     }
     .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px;
+      background: var(--white);
+      border: var(--border);
+      box-shadow: var(--shadow);
+      border-radius: 12px;
+      overflow: hidden;
     }
-    .card h2 {
-      font-size: 1.02rem;
-      margin-bottom: 12px;
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 10px;
-      gap: 8px;
+      gap: 10px;
       flex-wrap: wrap;
+      font-weight: 800;
+      font-size: 1.05rem;
     }
+    .card-header.h-pink { background: var(--pink); }
+    .card-header.h-mint { background: var(--mint); }
+    .card-header.h-sky { background: var(--sky); }
+    .card-header.h-yellow { background: var(--yellow); }
+    .card-header.h-lavender { background: var(--lavender); }
+    .card-body { padding: 20px; }
+
+    /* QR Box */
     .qr-box {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 16px;
-      background: #0b1120;
-      border-radius: 12px;
-      min-height: 240px;
+      padding: 18px;
+      background: #FFFDF7;
+      border: 2.5px dashed var(--ink);
+      border-radius: 10px;
+      min-height: 245px;
       text-align: center;
     }
     .qr-box img {
-      max-width: 230px;
-      border-radius: 10px;
-      border: 4px solid #fff;
-      margin-bottom: 10px;
-    }
-    label { display: block; font-size: 0.83rem; color: var(--muted); margin-bottom: 5px; margin-top: 10px; }
-    select, input, textarea {
-      width: 100%;
-      background: #0b1120;
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 9px 12px;
+      max-width: 225px;
       border-radius: 8px;
-      font-size: 0.9rem;
+      border: 3px solid var(--ink);
+      box-shadow: var(--shadow-sm);
+      margin-bottom: 12px;
+      background: #fff;
     }
-    textarea { min-height: 105px; font-family: monospace; resize: vertical; }
-    .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+
+    /* Inputs & Controls */
+    label {
+      display: block;
+      font-size: 0.86rem;
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 6px;
+      margin-top: 12px;
+    }
+    select, input[type="text"], input[type="password"], textarea {
+      width: 100%;
+      background: #FFFDF7;
+      border: 2.5px solid var(--ink);
+      box-shadow: 3px 3px 0px var(--ink);
+      color: var(--ink);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      font-family: inherit;
+      outline: none;
+    }
+    select:focus, input:focus, textarea:focus {
+      background: #FEF9C3;
+    }
+    textarea { min-height: 112px; font-family: monospace; resize: vertical; }
+
+    /* Neo-Brutalist Tactile Buttons */
+    .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
     button, .btn-link {
       cursor: pointer;
-      border: none;
-      padding: 9px 14px;
+      border: 2.5px solid var(--ink);
+      box-shadow: 4px 4px 0px var(--ink);
+      padding: 10px 16px;
       border-radius: 8px;
-      font-weight: 600;
-      font-size: 0.85rem;
+      font-weight: 800;
+      font-size: 0.88rem;
+      font-family: inherit;
       display: inline-flex;
       align-items: center;
       gap: 6px;
       text-decoration: none;
-      transition: 0.15s;
+      color: var(--ink);
+      background: var(--white);
+      transition: transform 0.08s ease, box-shadow 0.08s ease;
     }
-    .btn-primary { background: var(--accent); color: #052e16; }
-    .btn-primary:hover { background: var(--accent-hover); color: #fff; }
-    .btn-blue { background: var(--blue); color: #fff; }
-    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
-    .btn-outline:hover { background: #334155; }
-    .btn-danger { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
-    .btn-danger:hover { background: rgba(239, 68, 68, 0.35); color: #fff; }
-    .stats-row {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 12px;
-      margin-bottom: 20px;
+    button:hover, .btn-link:hover {
+      transform: translate(2px, 2px);
+      box-shadow: 2px 2px 0px var(--ink);
     }
-    .stat-card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      padding: 14px 16px;
-      border-radius: 12px;
+    button:active, .btn-link:active {
+      transform: translate(4px, 4px);
+      box-shadow: 0px 0px 0px var(--ink);
     }
-    .stat-card .lbl { font-size: 0.76rem; color: var(--muted); }
-    .stat-card .val { font-size: 1.35rem; font-weight: 700; color: #fff; margin-top: 4px; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .btn-primary { background: var(--mint); }
+    .btn-blue { background: var(--sky); }
+    .btn-yellow { background: var(--yellow); }
+    .btn-danger { background: var(--coral); }
+    .btn-sm { padding: 6px 12px; font-size: 0.8rem; box-shadow: 3px 3px 0px var(--ink); }
+
+    /* Table */
+    .table-wrap {
+      overflow-x: auto;
+      max-height: 390px;
+      overflow-y: auto;
+      border: 2.5px solid var(--ink);
+      border-radius: 8px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: var(--white); }
     th, td {
-      padding: 9px 10px;
-      border-bottom: 1px solid var(--border);
+      padding: 10px 12px;
+      border-bottom: 2px solid var(--ink);
+      border-right: 1.5px solid var(--ink);
       text-align: left;
     }
-    th { background: #0b1120; color: var(--muted); font-weight: 600; }
-    .table-wrap { overflow-x: auto; max-height: 360px; overflow-y: auto; }
+    th {
+      background: var(--ink);
+      color: var(--yellow);
+      font-weight: 800;
+      text-transform: uppercase;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    tr:nth-child(even) td { background: #FFFDF5; }
+    tr:hover td { background: #FEF08A; }
+
+    /* Log Terminal */
     .log-box {
-      background: #0b1120;
-      border: 1px solid var(--border);
+      background: #111827;
+      border: 3px solid var(--ink);
+      box-shadow: inset 0 0 0 2px #000;
       border-radius: 8px;
-      padding: 12px;
-      height: 220px;
+      padding: 14px;
+      height: 230px;
       overflow-y: auto;
       font-family: monospace;
-      font-size: 0.8rem;
-      color: #cbd5e1;
+      font-size: 0.82rem;
+      color: #A7F3D0;
     }
-    .log-box div { padding: 2px 0; border-bottom: 1px dashed rgba(255,255,255,0.05); }
+    .log-box div { padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }
+
+    .note-box {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: #FEF08A;
+      border: 2px solid var(--ink);
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
       <div>
-        <h1>📦 Renata PLC (NK Depot) — WhatsApp CRP Order Tracker v3.0</h1>
-        <p>অফিশিয়াল Trade Price (30-10-26), হাতে লেখা ছবির অর্ডার (OCR) + <b>/cnl</b> ক্যান্সেল সিস্টেম এবং মেমোরি ক্লিয়ার কন্ট্রোল প্যানেল</p>
+        <h1>⚡ Renata PLC (NK Depot) — CRP Order Tracker v4.0</h1>
+        <p>Neo-Brutalism Edition • 3x Auto-Retry + Keyless Vision AI OCR • Trade Price • /cnl Cancel</p>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <span id="waBadge" class="badge warn">⏳ Checking WhatsApp...</span>
-        <span id="sheetBadge" class="badge warn">⏳ Checking Sheet...</span>
-        <span id="ramBadge" class="badge ok">⚡ RAM: -- MB</span>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <span id="waBadge" class="badge warn">⏳ WhatsApp...</span>
+        <span id="sheetBadge" class="badge warn">⏳ Sheet...</span>
+        <span id="ramBadge" class="badge info">⚡ RAM: -- MB</span>
         <a id="openSheetBtn" href="#" target="_blank" class="btn-link btn-blue">📊 Open Google Sheet</a>
       </div>
     </header>
 
     <div class="stats-row">
-      <div class="stat-card">
-        <div class="lbl">সক্রিয় টার্গেট গ্রুপ (Target Group)</div>
-        <div class="val" id="statGroup" style="font-size:0.95rem; color:#34d399;">Loading...</div>
+      <div class="stat-card c1">
+        <div class="lbl">🎯 সক্রিয় গ্রুপ (Target Group)</div>
+        <div class="val" id="statGroup" style="font-size:1.05rem;">Loading...</div>
       </div>
-      <div class="stat-card">
-        <div class="lbl">মোট সেভ হওয়া অর্ডার লাইন (Saved)</div>
+      <div class="stat-card c2">
+        <div class="lbl">📦 মোট সেভ অর্ডার (Saved Lines)</div>
         <div class="val" id="statSaved">0</div>
       </div>
-      <div class="stat-card">
-        <div class="lbl">মোট অর্ডার (Trade Price BDT)</div>
-        <div class="val" id="statAmount">৳0</div>
+      <div class="stat-card c3">
+        <div class="lbl">💰 মোট অর্ডার (Trade Price)</div>
+        <div class="val" id="statAmount">৳0.00</div>
       </div>
-      <div class="stat-card">
-        <div class="lbl">আনসেন্ড / /cnl রিমুভড</div>
-        <div class="val" id="statDeleted" style="color:#f87171;">0</div>
+      <div class="stat-card c4">
+        <div class="lbl">🗑️ আনসেন্ড / /cnl রিমুভড</div>
+        <div class="val" id="statDeleted">0</div>
       </div>
-      <div class="stat-card">
-        <div class="lbl">ছবির অর্ডার অনুমোদিত নম্বর</div>
-        <div class="val" style="font-size:0.82rem; color:#fbbf24;">+8801732273944<br/>+8801793362829</div>
+      <div class="stat-card c5">
+        <div class="lbl">📸 ছবির অর্ডার অনুমোদিত নম্বর</div>
+        <div class="val" style="font-size:0.88rem; line-height:1.35;">+8801732273944 ✅<br/>+8801793362829 ✅</div>
       </div>
     </div>
 
     <div class="grid">
       <!-- STEP 1: WHATSAPP LOGIN -->
       <div class="card">
-        <h2>
-          <span>১. WhatsApp কানেকশন (Auto-Saved)</span>
-          <button class="btn-outline" style="padding:5px 10px; font-size:0.76rem;" onclick="logoutWhatsApp()">Change Account</button>
-        </h2>
-        <div id="qrContainer" class="qr-box">
-          <p style="color:var(--muted);">Loading WhatsApp status...</p>
+        <div class="card-header h-pink">
+          <span>১. WhatsApp কানেকশন (Cloud Auto-Save)</span>
+          <button class="btn-danger btn-sm" onclick="logoutWhatsApp()">Change Account</button>
         </div>
-        <p style="font-size:0.78rem; color:var(--muted); margin-top:10px;">
-          💡 <b>নোট:</b> খাতায় লিখে ছবি তুলে অর্ডার দেওয়ার জন্য <b>+8801732273944</b> এবং <b>+8801793362829</b> নম্বর দুটি লক করা আছে। অর্ডার সেভ হওয়ার পর বটের মেসেজে <b>/cnl</b> রিপ্লাই দিলে সেটি বাতিল হয়ে যাবে।
-        </p>
+        <div class="card-body">
+          <div id="qrContainer" class="qr-box">
+            <p style="font-weight:700;">Loading WhatsApp status...</p>
+          </div>
+          <div class="note-box">
+            📸 <b>৩ বার অটো-রিচেক OCR:</b> <b>+8801732273944</b> এবং <b>+8801793362829</b> থেকে অর্ডারের ছবি পাঠালে সার্ভার নিজে থেকেই ৩ বার ভিন্ন ভিন্ন মেথডে (Handwriting OCR + Keyless AI Vision) রিচেক করবে—তাই একই ছবি বারবার পাঠাতে হবে না!
+          </div>
+        </div>
       </div>
 
-      <!-- STEP 2: GROUP & IMAGE OCR SETTINGS -->
+      <!-- STEP 2: GROUP SELECTOR & SETTINGS -->
       <div class="card">
-        <h2>
-          <span>২. গ্রুপ ও ছবির OCR সেটিংস</span>
-          <button class="btn-outline" style="padding:5px 10px; font-size:0.76rem;" onclick="refreshGroups()">🔄 গ্রুপ রিফ্রেশ</button>
-        </h2>
-
-        <label>আপনার জয়েন থাকা WhatsApp গ্রুপ সিলেক্ট করুন:</label>
-        <select id="groupSelect" onchange="onGroupDropdownChange()">
-          <option value="">-- গ্রুপ সিলেক্ট করুন --</option>
-        </select>
-
-        <label>টার্গেট গ্রুপের নাম:</label>
-        <input type="text" id="targetGroupNameInput" placeholder="e.g. CRP sales NK Depot" />
-        <input type="hidden" id="targetGroupIdInput" />
-
-        <label>হাতে লেখা ছবি (Handwriting OCR) আরও নিখুঁত করতে ফ্রি Gemini API Key (ঐচ্ছিক):</label>
-        <input type="password" id="geminiKeyInput" placeholder="AIzaSy... (না দিলেও বিল্ট-ইন ফ্রি ক্লাউড OCR কাজ করবে)" />
-
-        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer; color:#e2e8f0;">
-          <input type="checkbox" id="autoReactCheckbox" style="width:17px; height:17px;" checked />
-          অর্ডার সেভ হলে মেসেজে অটোমেটিক ✅ রিয়েকশন দিবে
-        </label>
-
-        <div class="btn-row">
-          <button class="btn-primary" onclick="saveGroupConfig()">💾 Save Settings</button>
-          <button class="btn-blue" onclick="syncSheetStructure()">💲 Update Sheet to Trade Price</button>
+        <div class="card-header h-mint">
+          <span>২. WhatsApp গ্রুপ ও সেটিংস</span>
+          <button class="btn-yellow btn-sm" onclick="refreshGroups()">🔄 গ্রুপ রিফ্রেশ</button>
         </div>
-        <p id="saveStatusMsg" style="font-size:0.82rem; color:#34d399; margin-top:8px;"></p>
+        <div class="card-body">
+          <label>আপনার WhatsApp গ্রুপ সিলেক্ট করুন:</label>
+          <select id="groupSelect" onchange="onGroupDropdownChange()">
+            <option value="ALL">🌐 All Joined Groups (সব গ্রুপ থেকে অর্ডার নিবে)</option>
+          </select>
+
+          <label>অথবা নির্দিষ্ট গ্রুপের নাম:</label>
+          <input type="text" id="targetGroupNameInput" placeholder="e.g. CRP sales NK Depot" oninput="onGroupNameManualInput()" />
+          <input type="hidden" id="targetGroupIdInput" />
+
+          <label>অতিরিক্ত Gemini API Key (ঐচ্ছিক — না দিলেও ফ্রি AI Vision কাজ করবে):</label>
+          <input type="password" id="geminiKeyInput" placeholder="কোনো API Key ছাড়াই 3-Stage AI OCR সচল আছে" />
+
+          <label style="display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;">
+            <input type="checkbox" id="autoReactCheckbox" style="width:18px; height:18px; accent-color:#000;" checked />
+            অর্ডার সেভ হলে মেসেজে অটোমেটিক ✅ রিয়েকশন দিবে
+          </label>
+
+          <div class="btn-row">
+            <button class="btn-primary" onclick="saveGroupConfig()">💾 Save Group Settings</button>
+            <button class="btn-blue" onclick="syncSheetStructure()">💲 Sync Trade Price to Sheet</button>
+          </div>
+          <p id="saveStatusMsg" style="font-size:0.86rem; font-weight:800; color:#047857; margin-top:10px;"></p>
+        </div>
       </div>
 
       <!-- STEP 3: LIVE ORDER & /CNL SIMULATOR -->
       <div class="card">
-        <h2>🧪 ৩. লাইভ অর্ডার (Trade Price) ও /cnl টেস্টার</h2>
-        <label>যেকোনো অর্ডার মেসেজ লিখে Trade Price হিসাব টেস্ট করুন:</label>
-        <textarea id="testInput">Cf 4526 Seraj
+        <div class="card-header h-sky">
+          <span>🧪 ৩. লাইভ অর্ডার ও /cnl টেস্টার</span>
+        </div>
+        <div class="card-body">
+          <label>যেকোনো অর্ডার মেসেজ লিখে Trade Price হিসাব টেস্ট করুন:</label>
+          <textarea id="testInput">Cf 4526 Seraj
 Cus name: Nipun pharmacy pso E71
 TotiFen 50
 Doxicup 10 pes
 Deltason 50ml 20 ta
 Locan r 150mg = 10</textarea>
-        <div class="btn-row">
-          <button class="btn-blue" onclick="runTestParse(false)">🔍 Test Trade Price</button>
-          <button class="btn-primary" onclick="runTestParse(true)">🚀 Test & Save to Sheet</button>
-          <button id="simUnsendBtn" class="btn-danger" style="display:none;" onclick="simulateUnsend()">🗑️ Test /cnl (Cancel Last Order)</button>
+          <div class="btn-row">
+            <button class="btn-yellow" onclick="runTestParse(false)">🔍 Test Parser</button>
+            <button class="btn-primary" onclick="runTestParse(true)">🚀 Test & Save to Sheet</button>
+            <button id="simUnsendBtn" class="btn-danger" style="display:none;" onclick="simulateUnsend()">🗑️ Test /cnl Cancel</button>
+          </div>
+          <div id="testResultBox" style="margin-top:12px; font-size:0.84rem; font-weight:600;"></div>
         </div>
-        <div id="testResultBox" style="margin-top:12px; font-size:0.81rem; color:#cbd5e1;"></div>
       </div>
     </div>
 
     <!-- RECENT PARSED ORDERS TABLE WITH CLEAR BUTTON -->
-    <div class="card" style="margin-bottom:20px;">
-      <h2>
+    <div class="card" style="margin-bottom:24px;">
+      <div class="card-header h-yellow">
         <span>📋 সর্বশেষ ট্র্যাক হওয়া অর্ডারসমূহ (Live Parsed Orders)</span>
-        <button class="btn-danger" style="padding:6px 12px; font-size:0.8rem;" onclick="clearLiveOrders()">🧹 Clear Orders List (মেমোরি খালি করুন)</button>
-      </h2>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Date & Time</th>
-              <th>DA ID & Name</th>
-              <th>PSO</th>
-              <th>Pharmacy / Party</th>
-              <th>Raw WhatsApp Text</th>
-              <th>Official CRP Product</th>
-              <th>Qty</th>
-              <th>Trade Price</th>
-              <th>Total (BDT)</th>
-              <th>Match</th>
-            </tr>
-          </thead>
-          <tbody id="ordersTableBody">
-            <tr><td colspan="10" style="text-align:center; color:var(--muted);">No orders in temporary memory buffer. (All saved orders are safe in Google Sheets!)</td></tr>
-          </tbody>
-        </table>
+        <button class="btn-danger btn-sm" onclick="clearLiveOrders()">🧹 Clear Orders List (মেমোরি খালি করুন)</button>
+      </div>
+      <div class="card-body">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Date & Time</th>
+                <th>DA ID & Name</th>
+                <th>PSO</th>
+                <th>Pharmacy / Party</th>
+                <th>Raw WhatsApp Text</th>
+                <th>Official CRP Product</th>
+                <th>Qty</th>
+                <th>Trade Price</th>
+                <th>Total (BDT)</th>
+                <th>Match</th>
+              </tr>
+            </thead>
+            <tbody id="ordersTableBody">
+              <tr><td colspan="10" style="text-align:center; font-weight:700;">মেমোরি বাফারে কোনো অর্ডার নেই (Google Sheet-এ আপনার সব অর্ডার সুরক্ষিত আছে)।</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
 
     <!-- SYSTEM ACTIVITY LOGS WITH CLEAR BUTTON -->
     <div class="card">
-      <h2>
+      <div class="card-header h-lavender">
         <span>🖥️ সিস্টেম লগ (Live Server Logs)</span>
-        <button class="btn-danger" style="padding:6px 12px; font-size:0.8rem;" onclick="clearServerLogs()">🧹 Clear Server Logs (লগ ক্লিয়ার করুন)</button>
-      </h2>
-      <div id="logBox" class="log-box"></div>
+        <button class="btn-danger btn-sm" onclick="clearServerLogs()">🧹 Clear Server Logs (লগ ক্লিয়ার করুন)</button>
+      </div>
+      <div class="card-body">
+        <div id="logBox" class="log-box"></div>
+      </div>
     </div>
   </div>
 
   <script>
     let lastTestMsgId = null;
     let groupInputTouched = false;
+    let lastGroupsCount = -1;
 
-    document.getElementById('targetGroupNameInput').addEventListener('input', () => {
+    function onGroupNameManualInput() {
       groupInputTouched = true;
-    });
+      // Clear hidden ID so backend resolves the new group ID from the typed name!
+      document.getElementById('targetGroupIdInput').value = '';
+    }
 
     async function fetchStatus() {
       try {
@@ -2674,7 +3179,7 @@ Locan r 150mg = 10</textarea>
         const sheetBadge = document.getElementById('sheetBadge');
         if (data.googleAuthReady) {
           sheetBadge.className = 'badge ok';
-          sheetBadge.textContent = '🟢 Google Sheet Connected';
+          sheetBadge.textContent = '🟢 Sheet Connected';
         } else {
           sheetBadge.className = 'badge err';
           sheetBadge.textContent = '⚠️ Sheet Auth Needed';
@@ -2684,7 +3189,7 @@ Locan r 150mg = 10</textarea>
         document.getElementById('openSheetBtn').href = data.googleSheetUrl;
 
         document.getElementById('statGroup').textContent =
-          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Groups';
+          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';
         document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;
         document.getElementById('statAmount').textContent =
           '৳' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -2693,29 +3198,31 @@ Locan r 150mg = 10</textarea>
         const qrBox = document.getElementById('qrContainer');
         if (data.waStatus === 'CONNECTED' && data.connectedUser) {
           qrBox.innerHTML =
-            '<div style="font-size:2.4rem; margin-bottom:6px;">✅</div>' +
-            '<h3 style="color:#34d399;">WhatsApp সচল এবং লগইন সেভ করা আছে!</h3>' +
-            '<p style="color:#94a3b8; font-size:0.86rem; margin-top:4px;">Account: <b>' +
+            '<div style="font-size:2.6rem; margin-bottom:6px;">✅</div>' +
+            '<h3 style="font-weight:800;">WhatsApp সচল এবং লগইন সেভ করা আছে!</h3>' +
+            '<p style="font-size:0.9rem; font-weight:700; margin-top:4px;">Account: <b>' +
             data.connectedUser.name +
             '</b> (' +
             data.connectedUser.id.split(':')[0] +
             ')</p>' +
-            '<span class="badge ok" style="margin-top:10px;">☁️ Auto-Saved in Cloud Backup</span>';
+            '<span class="badge ok" style="margin-top:12px;">☁️ Permanent Cloud Backup Active</span>';
         } else if (data.qrDataUrl) {
           qrBox.innerHTML =
             '<img src="' +
             data.qrDataUrl +
             '" alt="WhatsApp QR Code" />' +
-            '<p style="color:#fbbf24; font-weight:600; font-size:0.88rem;">আপনার ফোনের WhatsApp ➔ Linked Devices থেকে এই QR কোডটি স্ক্যান করুন</p>';
+            '<p style="font-weight:800; font-size:0.9rem;">আপনার ফোনের WhatsApp ➔ Linked Devices থেকে এই QR কোডটি স্ক্যান করুন</p>';
         } else {
           qrBox.innerHTML =
-            '<p style="color:#94a3b8;">🔄 WhatsApp কানেক্ট হচ্ছে / QR তৈরি হচ্ছে... অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।</p>';
+            '<p style="font-weight:700;">🔄 WhatsApp কানেক্ট হচ্ছে / QR তৈরি হচ্ছে... অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।</p>';
         }
 
         const select = document.getElementById('groupSelect');
-        if (data.joinedGroups && data.joinedGroups.length > 0 && select.options.length <= 1) {
-          select.innerHTML = '<option value="">-- গ্রুপ সিলেক্ট করুন --</option>';
-          data.joinedGroups.forEach((g) => {
+        const groups = data.joinedGroups || [];
+        if (groups.length !== lastGroupsCount && !groupInputTouched) {
+          lastGroupsCount = groups.length;
+          select.innerHTML = '<option value="ALL">🌐 All Joined Groups (সব গ্রুপ থেকে অর্ডার নিবে)</option>';
+          groups.forEach((g) => {
             const opt = document.createElement('option');
             opt.value = g.id;
             opt.dataset.name = g.subject;
@@ -2737,21 +3244,21 @@ Locan r 150mg = 10</textarea>
             .map(
               (o) =>
                 '<tr>' +
-                '<td>' + o.date + ' ' + o.time + '</td>' +
-                '<td><b>' + o.daId + '</b><br/><span style="color:#94a3b8;">' + o.daName + '</span></td>' +
-                '<td>' + o.psoCode + '</td>' +
+                '<td><b>' + o.date + '</b><br/>' + o.time + '</td>' +
+                '<td><b>' + o.daId + '</b><br/><span>' + o.daName + '</span></td>' +
+                '<td><b>' + o.psoCode + '</b></td>' +
                 '<td>' + o.pharmacyName + '</td>' +
-                '<td style="color:#fbbf24;">' + o.rawText + '</td>' +
+                '<td><b>' + o.rawText + '</b></td>' +
                 '<td><b>[' + o.crpCode + ']</b> ' + o.productName + '</td>' +
                 '<td><b>' + o.orderedQty + '</b></td>' +
                 '<td>৳' + Number(o.unitPrice).toFixed(2) + '</td>' +
-                '<td style="color:#34d399; font-weight:700;">৳' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +
+                '<td style="font-weight:800;">৳' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +
                 '<td>' + o.matchType + '</td>' +
                 '</tr>'
             )
             .join('');
         } else {
-          tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color:var(--muted);">No orders in temporary memory buffer. (All saved orders are safe in Google Sheets!)</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; font-weight:700;">মেমোরি বাফারে কোনো অর্ডার নেই (Google Sheet-এ আপনার সব অর্ডার সুরক্ষিত আছে)।</td></tr>';
         }
 
         const logBox = document.getElementById('logBox');
@@ -2762,8 +3269,12 @@ Locan r 150mg = 10</textarea>
     function onGroupDropdownChange() {
       const sel = document.getElementById('groupSelect');
       const opt = sel.options[sel.selectedIndex];
-      if (opt && opt.value) {
-        groupInputTouched = true;
+      if (!opt) return;
+      groupInputTouched = true;
+      if (opt.value === 'ALL') {
+        document.getElementById('targetGroupIdInput').value = 'ALL';
+        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (সব গ্রুপ)';
+      } else {
         document.getElementById('targetGroupIdInput').value = opt.value;
         document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';
       }
@@ -2772,15 +3283,9 @@ Locan r 150mg = 10</textarea>
     async function refreshGroups() {
       const res = await fetch('/api/groups/refresh', { method: 'POST' });
       const data = await res.json();
-      const select = document.getElementById('groupSelect');
-      select.innerHTML = '<option value="">-- গ্রুপ সিলেক্ট করুন --</option>';
-      (data.groups || []).forEach((g) => {
-        const opt = document.createElement('option');
-        opt.value = g.id;
-        opt.dataset.name = g.subject;
-        opt.textContent = g.subject + ' (' + g.size + ' members)';
-        select.appendChild(opt);
-      });
+      lastGroupsCount = -1;
+      groupInputTouched = false;
+      await fetchStatus();
       alert('গ্রুপ লিস্ট আপডেট হয়েছে! মোট গ্রুপ: ' + (data.groups || []).length);
     }
 
@@ -2798,7 +3303,7 @@ Locan r 150mg = 10</textarea>
       const data = await res.json();
       if (data.ok) {
         document.getElementById('saveStatusMsg').textContent =
-          '✅ সেটিংস স্থায়ীভাবে সেভ হয়েছে!';
+          '✅ গ্রুপ সেটিংস স্থায়ীভাবে সেভ হয়েছে: ' + (data.botConfig.targetGroupName || 'All');
         document.getElementById('geminiKeyInput').value = '';
         groupInputTouched = false;
         fetchStatus();
@@ -2808,24 +3313,20 @@ Locan r 150mg = 10</textarea>
     async function syncSheetStructure() {
       const res = await fetch('/api/sheets/sync', { method: 'POST' });
       const data = await res.json();
-      alert(data.ok ? '✅ Google Sheet-এর সব প্রোডাক্টের দাম অফিশিয়াল TRADE PRICE অনুযায়ী আপডেট হয়েছে!' : '⚠️ Error: ' + data.googleAuthError);
+      alert(data.ok ? '✅ Google Sheet-এর সব প্রোডাক্টের দাম অফিশিয়াল TRADE PRICE অনুযায়ী সিঙ্ক হয়েছে!' : '⚠️ Error: ' + data.googleAuthError);
       fetchStatus();
     }
 
     async function clearLiveOrders() {
       const res = await fetch('/api/orders/clear', { method: 'POST' });
       const data = await res.json();
-      if (data.ok) {
-        fetchStatus();
-      }
+      if (data.ok) fetchStatus();
     }
 
     async function clearServerLogs() {
       const res = await fetch('/api/logs/clear', { method: 'POST' });
       const data = await res.json();
-      if (data.ok) {
-        fetchStatus();
-      }
+      if (data.ok) fetchStatus();
     }
 
     async function runTestParse(saveToSheet) {
@@ -2843,7 +3344,7 @@ Locan r 150mg = 10</textarea>
           document.getElementById('simUnsendBtn').style.display = 'inline-flex';
         }
         box.innerHTML =
-          '<div style="color:#34d399; font-weight:600; margin-bottom:6px;">✅ শনাক্ত হয়েছে ' +
+          '<div style="background:#A7F3D0; border:2px solid #000; padding:10px; border-radius:8px; margin-bottom:6px;">✅ শনাক্ত হয়েছে ' +
           data.orders.length +
           'টি অর্ডার লাইন (DA: ' +
           data.orders[0].daId +
@@ -2851,7 +3352,7 @@ Locan r 150mg = 10</textarea>
           data.orders[0].daName +
           ', Party: ' +
           data.orders[0].pharmacyName +
-          '):</div>' +
+          '):<br/>' +
           data.orders
             .map(
               (o) =>
@@ -2869,9 +3370,10 @@ Locan r 150mg = 10</textarea>
                 o.totalAmount.toFixed(2) +
                 '</b>'
             )
-            .join('<br/>');
+            .join('<br/>') +
+          '</div>';
       } else {
-        box.innerHTML = '<span style="color:#f87171;">⚠️ কোনো CRP প্রোডাক্ট অর্ডার পাওয়া যায়নি।</span>';
+        box.innerHTML = '<div style="background:#FECDD3; border:2px solid #000; padding:10px; border-radius:8px;">⚠️ কোনো CRP প্রোডাক্ট অর্ডার পাওয়া যায়নি।</div>';
       }
       fetchStatus();
     }
@@ -2885,11 +3387,11 @@ Locan r 150mg = 10</textarea>
       });
       const data = await res.json();
       document.getElementById('testResultBox').innerHTML =
-        '<span style="color:#f87171; font-weight:600;">❌ /cnl ক্যান্সেল সফল! মেসেজ (' +
+        '<div style="background:#FECDD3; border:2px solid #000; padding:10px; border-radius:8px;">❌ /cnl ক্যান্সেল সফল! মেসেজ (' +
         lastTestMsgId +
         ') এর ' +
         data.removedCount +
-        'টি অর্ডার Google Sheet থেকে অটোমেটিক মুছে ফেলা হয়েছে!</span>';
+        'টি অর্ডার Google Sheet থেকে অটোমেটিক মুছে ফেলা হয়েছে!</div>';
       lastTestMsgId = null;
       document.getElementById('simUnsendBtn').style.display = 'none';
       fetchStatus();
@@ -2924,11 +3426,12 @@ function startKeepAliveLoop() {
 
 async function bootstrap() {
   app.listen(PORT, '0.0.0.0', async () => {
-    addLog(`🚀 Server v3.0 listening on port ${PORT}`);
+    addLog(`🚀 Server v4.0 (Neo-Brutalism Edition) listening on port ${PORT}`);
     await initGoogleSheetsClient();
     if (googleAuthReady) {
-      await ensureSpreadsheetStructure(true);
+      // Restore cloud config & WhatsApp auth session FIRST before ensuring spreadsheet structure!
       await restoreAuthAndConfigFromSheet();
+      await ensureSpreadsheetStructure(true);
     }
     await startWhatsApp();
     startKeepAliveLoop();
@@ -2943,10 +3446,14 @@ module.exports = {
   DEFAULT_CRP_PRODUCTS,
   DA_MASTER,
   AUTHORIZED_IMAGE_PHONES,
+  DEFAULT_AUTHORIZED_LIDS,
   matchCRPProduct,
   extractOrderQuantity,
+  normalizeOcrOrderText,
   parseWhatsAppOrderMessage,
   inspectBaileysMessage,
   isAuthorizedForImageOrder,
+  isAllowedTargetGroup,
+  processImageOrderWithThreeRetries,
   buildImageOrderReplyMessage
 };
