@@ -203,7 +203,8 @@ const DEFAULT_DA_MASTER = [
   { daId: 'C210024', altId: '', name: 'Ilias Hossain', phones: ['8801621668496'], aliases: ['ilias hossain'] },
   { daId: 'C210028', altId: '', name: 'Abdur Rahman', phones: [], aliases: ['abdur rahman nk depot ren', 'abdur rahman'] },
   { daId: 'C122230', altId: '', name: 'DA ID C122230', phones: ['8801777824386'], aliases: ['c122230'] },
-  { daId: 'CF10145', altId: 'RF9084', name: 'Moajjem', phones: [], aliases: ['moajjem', 'moazzem', 'rf9084'] }
+  { daId: 'CF10145', altId: '', name: 'Moajjem', phones: [], aliases: ['moajjem', 'cf10145', 'moazzem'] },
+  { daId: 'RF9084', altId: '', name: 'Tofayel Ahmed', phones: [], aliases: ['tofayel ahmed', 'rf9084', 'tofayel'] }
 ];
 
 // ============================================================================
@@ -433,7 +434,7 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'XAMIC', regex: /\b(xamic|xmaic|examic|zamic)\b/i },
   { family: 'RECOF', regex: /\b(recof|recop|rekof)\b/i },
   { family: 'TRULAX', regex: /\b(trul[ae]x|tulax|trulux)\b/i },
-  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*150)\b/i },
+  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luen\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*150)\b/i },
   { family: 'FLONTIN', regex: /\b(fl?ont[ie]ne?|foltin|flotin|falntin)\b/i },
   { family: 'NORMANAL', regex: /\b(norm[ao]n[ao]l|narmonal|nomanal|normal\s*500|normal(?=\s*[\-:=]?\s*\d))\b/i },
   { family: 'FUROCEF', regex: /\b(fe?uroc[ce]fe?|furosef|reocef)\b/i },
@@ -639,8 +640,8 @@ function extractOrderQuantity(rawLine, matchedProduct) {
  */
 function detectUnrecognizedProductLine(seg) {
   if (!seg || typeof seg !== 'string') return null;
-  const trimmed = seg.trim();
-  if (trimmed.length < 4 || trimmed.length > 85) return null;
+  const trimmed = fixOcrDigitLookalikes(seg.trim());
+  if (trimmed.length < 4 || trimmed.length > 90) return null;
 
   // Ignore DA ID lines, PSO lines, Pharmacy lines, phone numbers, or casual chat
   if (/\b(cf|rf|c)\s*[\-_.]?\s*\d{4,6}\b/i.test(trimmed)) return null;
@@ -661,27 +662,31 @@ function detectUnrecognizedProductLine(seg) {
     }
   }
 
-  // Must have a clear order quantity pattern (e.g. "= 20", "- 50", "30 ta", "10 pcs", "20 box", or "MedicineName 20")
+  // Must have a clear order quantity pattern (supports 40P, 20T, 10B, 50 pes, = 30, - 10, etc.)
+  const UNIT_PAT = '(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)';
   const hasOrderShape =
-    /([a-zA-Z]{3,}.*?[\-:=]+\s*\d+\s*(?:ta|tah|pes|pcs|pc|pic|box|bx|bot|pack)?$)/i.test(trimmed) ||
-    /([a-zA-Z]{3,}.*?\s+\d+\s*(?:ta|tah|pes|pcs|pc|pic|box|bx|bot|pack)\.?$)/i.test(trimmed) ||
-    /^[*\d\/.)\s]*([a-zA-Z][a-zA-Z0-9\-\s]{2,35}?)\s+(\d{1,4})\s*$/i.test(trimmed);
+    new RegExp(`([a-zA-Z]{2,}.*?[\\-:=]+\\s*\\d+\\s*${UNIT_PAT}?\\.?$)`, 'i').test(trimmed) ||
+    new RegExp(`([a-zA-Z]{2,}.*?\\s+\\d+\\s*${UNIT_PAT}\\.?$)`, 'i').test(trimmed) ||
+    /^[*\d\/.)\s]*([a-zA-Z][a-zA-Z0-9\-\s.]{2,40}?)\s+(\d{1,4})\s*$/i.test(trimmed);
 
   if (!hasOrderShape) return null;
 
   const qty = extractOrderQuantity(trimmed, null);
   if (qty === null || qty <= 0 || qty > 5000) return null;
 
-  // Extract clean unknown product text by removing leading numbering and trailing quantity
-  let unknownName = trimmed
-    .replace(/^[*\d\/.)\-\s]+/, '')
-    .replace(/[\-:=]+\s*\d+(?:\+\d+)?\s*(?:ta|tah|pes|pcs|pc|pic|box|bx|bot|pack)?\.?\s*$/i, '')
-    .replace(/\s+\d+(?:\+\d+)?\s*(?:ta|tah|pes|pcs|pc|pic|box|bx|bot|pack)?\.?\s*$/i, '')
-    .replace(/[*_~]+/g, '')
-    .trim();
+  // Extract clean unknown product text by removing leading numbering and trailing quantity + unit (only once so strength like 200 / 100ml is preserved!)
+  let unknownName = trimmed.replace(/^[*\d\/.)\-\s]+/, '');
+  const sepQtyRegex = new RegExp(`[\\-:=]+\\s*\\d+(?:\\+\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
+  const spaceQtyRegex = new RegExp(`\\s+\\d+(?:\\+\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
+  if (sepQtyRegex.test(unknownName)) {
+    unknownName = unknownName.replace(sepQtyRegex, '');
+  } else {
+    unknownName = unknownName.replace(spaceQtyRegex, '');
+  }
+  unknownName = unknownName.replace(/[*_~]+/g, '').trim();
 
-  if (!unknownName || unknownName.length < 3 || /^\d+$/.test(unknownName)) return null;
-  if (!/[a-zA-Z]{3,}/.test(unknownName)) return null;
+  if (!unknownName || unknownName.length < 2 || /^\d+$/.test(unknownName)) return null;
+  if (!/[a-zA-Z]{2,}/.test(unknownName)) return null;
 
   return {
     rawLine: trimmed,
@@ -1217,7 +1222,9 @@ function parseWhatsAppOrderMessage({
         !potentialPartyHeader &&
         seg.length >= 3 &&
         seg.length <= 45 &&
-        !/^(cf|rf|c[\-_]?\d|pso\b|\d+$)/i.test(seg)
+        !/^(cf|rf|c[\-_]?\d|pso\b|\d+$)/i.test(seg) &&
+        !/[=:]\s*\d+/i.test(seg) &&
+        !/\b\d+\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|bot|pack)\b/i.test(seg)
       ) {
         potentialPartyHeader = cleanPharmacyName(seg);
       }
@@ -1486,10 +1493,11 @@ async function processImageOrderWithThreeRetries({
           timestamp,
           senderPhone,
           senderPushName,
-          senderJid
+          senderJid,
+          isImageOrder: true
         });
-        if (parsed.isOrder && parsed.orders.length > 0) {
-          addLog(`✅ Image Order succeeded on ${stage.name} (${parsed.orders.length} items matched via ${res.engine}).`);
+        if ((parsed.isOrder && parsed.orders.length > 0) || (parsed.unrecognizedItems && parsed.unrecognizedItems.length > 0)) {
+          addLog(`✅ Image Order parsed on ${stage.name} (${parsed.orders.length} matched, ${(parsed.unrecognizedItems || []).length} unknown via ${res.engine}).`);
           return {
             ok: true,
             attemptUsed: i + 1,
@@ -1515,7 +1523,7 @@ async function processImageOrderWithThreeRetries({
       senderPushName,
       senderJid
     });
-    if (parsedMerged.isOrder && parsedMerged.orders.length > 0) {
+    if ((parsedMerged.isOrder && parsedMerged.orders.length > 0) || (parsedMerged.unrecognizedItems && parsedMerged.unrecognizedItems.length > 0)) {
       // Deduplicate by crpCode + orderedQty in case multiple passes extracted the same line
       const seen = new Set();
       parsedMerged.orders = parsedMerged.orders.filter((o) => {
@@ -2228,7 +2236,7 @@ async function applyFollowUpPatchToSheet(patch) {
 
 
 // ============================================================================
-// 11. WHATSAPP BAILEYS ENGINE + INTERACTIVE SELF-LEARNING ADMIN BOT (01793362829)
+// 11. WHATSAPP BAILEYS ENGINE + UNIFIED SELF-LEARNING ADMIN BOT (01793362829)
 // ============================================================================
 let sock = null;
 let waStatus = 'DISCONNECTED';
@@ -2239,9 +2247,9 @@ const recentOrders = [];
 const activityLogs = [];
 
 // Pending interactive resolutions waiting for Admin (01793362829) reply
-// token -> { token, type: 'UNKNOWN_DA' | 'UNKNOWN_PRODUCT', createdAt, ... }
+// Holds the entire order until DA Name/ID and all Product Names are confirmed, then saves to Google Sheets!
 const pendingResolutions = new Map();
-// WhatsApp Message ID of bot's question -> token
+// Maps WhatsApp Message IDs (prompt msg ID in DM, prompt msg ID in Group, and original order msg ID) -> token
 const pendingQuestionMsgIdMap = new Map();
 let pendingCounter = 100;
 
@@ -2264,142 +2272,274 @@ function addLog(msg) {
 }
 
 /**
- * Sends a WhatsApp message to all configured Admin Alert Numbers (default: 01793362829)
- * and registers the sent message IDs so quoting/replying to the message resolves the pending item!
+ * Sends the interactive prompt to:
+ * 1) All configured Admin Alert Numbers (e.g. 01793362829) in DM
+ * 2) The origin chat/group (if different from the Admin DM) quoting the original message
+ * And registers ALL sent message IDs in pendingQuestionMsgIdMap so replying in EITHER chat works 100%!
  */
-async function sendAdminResolutionPrompt(token, promptText) {
+async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
+  if (item.originMsg?.key?.id) {
+    pendingQuestionMsgIdMap.set(item.originMsg.key.id, item.token);
+  }
   if (!sock || waStatus !== 'CONNECTED') {
-    addLog(`⚠️ Cannot send WhatsApp prompt for ${token} (WhatsApp not connected). Available in Web UI.`);
+    addLog(`⚠️ WhatsApp not connected for prompt [${item.token}]. Ready in Web Dashboard.`);
     return;
   }
+
+  const sentToJids = new Set();
+
+  // 1. Send in the chat where the order was posted (quoting the order message)
+  if (item.originRemoteJid) {
+    try {
+      const sentOrigin = await sock.sendMessage(
+        item.originRemoteJid,
+        { text: promptText },
+        item.originMsg ? { quoted: item.originMsg } : undefined
+      );
+      if (sentOrigin?.key?.id) {
+        pendingQuestionMsgIdMap.set(sentOrigin.key.id, item.token);
+      }
+      sentToJids.add(item.originRemoteJid);
+      addLog(`📲 Sent prompt [${item.token}] in origin chat (${item.originRemoteJid})`);
+    } catch (e) {}
+  }
+
+  // 2. Also send to all Admin Alert Numbers (01793362829, etc.) in DM if not already sent there
   const adminPhones = getAdminAlertPhones();
   for (const ph of adminPhones) {
     const normPh = normalizeBdPhone(ph);
     if (!normPh) continue;
-    const targetJid = `${normPh}@s.whatsapp.net`;
+    const dmJid = `${normPh}@s.whatsapp.net`;
+    if (sentToJids.has(dmJid)) continue;
+
+    // Also check if originRemoteJid is the LID DM of this same admin phone
+    const originRaw = (item.originRemoteJid || '').split('@')[0].split(':')[0];
+    if (lidToPhoneMap.get(originRaw) === normPh) continue;
+
     try {
-      const sent = await sock.sendMessage(targetJid, { text: promptText });
-      if (sent?.key?.id) {
-        pendingQuestionMsgIdMap.set(sent.key.id, token);
+      const sentDm = await sock.sendMessage(dmJid, { text: promptText });
+      if (sentDm?.key?.id) {
+        pendingQuestionMsgIdMap.set(sentDm.key.id, item.token);
       }
-      addLog(`📲 Sent interactive resolution prompt [${token}] to Admin +${normPh}`);
+      sentToJids.add(dmJid);
+      addLog(`📲 Sent prompt [${item.token}] to Admin DM +${normPh}`);
     } catch (err) {
-      addLog(`⚠️ Failed to send prompt [${token}] to +${normPh}: ${err.message}`);
+      addLog(`⚠️ Could not DM prompt [${item.token}] to +${normPh}: ${err.message}`);
     }
   }
 }
 
 /**
- * Enqueues an order with an unknown/missing DA ID or Name and asks Admin (01793362829)
+ * Builds the next question text for a pending order item (checks if DA is unresolved first, then checks unrecognized products)
  */
-async function createPendingDaResolution({
-  orders,
-  detectedDaId = null,
+function buildPromptTextForPendingItem(item) {
+  if (!item.daInfo || !item.daInfo.isKnownDA) {
+    item.type = 'UNKNOWN_DA';
+    const recognizedPreview = (item.orders || []).map((o) => `${o.productName} (${o.orderedQty})`).join(', ');
+    const unknownPreview = (item.unrecognizedItems || []).map((u) => `${u.unknownProductText} (${u.orderedQty})`).join(', ');
+    const allPreview = [recognizedPreview, unknownPreview].filter(Boolean).join(', ') || 'Order';
+    const detId = item.daInfo?.detectedDaId || item.detectedDaId;
+
+    if (detId) {
+      return (
+        `❓ *নতুন/অপরিচিত DA ID শনাক্ত হয়েছে!* (${item.token})\n` +
+        `🆔 শনাক্তকৃত ID: *${detId}* (ডেটাবেসে নাম নেই)\n` +
+        `🏪 ফার্মেসি: *${item.defaultPharmacy || 'General Party'}*\n` +
+        `💊 অর্ডার: *${allPreview}*\n\n` +
+        `👉 এই মেসেজের *Reply*-তে (অথবা সরাসরি) প্রতিনিধির *নাম* (যেমন: \`${detId} নাম\`) লিখে পাঠান।\n` +
+        `উত্তর দিলেই নাম ডেটাবেসে যোগ হবে এবং অর্ডারটি Google Sheet-এ সেভ হবে! (বাতিল করতে লিখুন \`/cnl\`)`
+      );
+    }
+    return (
+      `❓ *অর্ডারে কোনো পরিচিত DA ID বা নাম পাওয়া যায়নি!* (${item.token})\n` +
+      `🏪 ফার্মেসি: *${item.defaultPharmacy || 'General Party'}*\n` +
+      `💊 অর্ডার: *${allPreview}*\n` +
+      `📝 মূল লেখা: _"${(item.rawText || '').replace(/\n/g, ' | ').slice(0, 140)}"_\n\n` +
+      `👉 এই অর্ডারটি কার নামে সেভ হবে? এই মেসেজের *Reply*-তে (অথবা সরাসরি) *ID এবং নাম* লিখে পাঠান (যেমন: \`CF4526 Seraj\` বা \`RF9084 Tofayel\`)।\n` +
+      `উত্তর দিলেই এটি ডেটাবেসে ও Google Sheet-এ অটোমেটিক সেভ হয়ে যাবে! (বাতিল করতে লিখুন \`/cnl\`)`
+    );
+  }
+
+  if (item.unrecognizedItems && item.unrecognizedItems.length > 0) {
+    item.type = 'UNKNOWN_PRODUCT';
+    const currentUnk = item.unrecognizedItems[0];
+    item.unknownProductText = currentUnk.unknownProductText;
+    item.orderedQty = currentUnk.orderedQty;
+    item.rawLine = currentUnk.rawLine;
+
+    const knownListStr = (item.orders || []).length > 0
+      ? `✅ চেনা প্রোডাক্ট: *${item.orders.map((o) => `${o.productName} (${o.orderedQty})`).join(', ')}*\n`
+      : '';
+
+    return (
+      `🤔 *অপরিচিত প্রোডাক্ট বা ভুল বানান পাওয়া গেছে!* (${item.token})\n` +
+      `👤 প্রতিনিধি: *${item.daInfo.name}* (${item.daInfo.daId})\n` +
+      `🏪 ফার্মেসি: *${currentUnk.pharmacyName || item.defaultPharmacy || 'General Party'}*\n` +
+      knownListStr +
+      `📝 মেসেজে লিখেছে: *"${currentUnk.rawLine}"*\n` +
+      `❓ অপরিচিত বানান: *"${currentUnk.unknownProductText}"* | পরিমাণ: *${currentUnk.orderedQty}*\n\n` +
+      `👉 *"${currentUnk.unknownProductText}"* কোন প্রোডাক্ট? এই মেসেজের *Reply*-তে (অথবা সরাসরি) সঠিক প্রোডাক্টের *নাম বা কোড* পাঠান (যেমন: \`Totifen\` বা \`919\` বা \`Lucan R 200\`)।\n` +
+      `💡 নতুন প্রোডাক্ট হলে লিখুন: \`NEW | কোড | নাম | দাম\`\n` +
+      `❌ এই লাইনটি বাদ দিয়ে বাকি অর্ডার সেভ করতে লিখুন: \`skip\``
+    );
+  }
+
+  return '';
+}
+
+/**
+ * Holds an order in pendingResolutions until all unknown DA / Product questions are answered,
+ * then saves the complete order to Google Sheets!
+ */
+async function createPendingOrderResolution({
+  parsedResult,
   rawText = '',
   senderPhone = '',
   senderPushName = '',
+  rawSenderId = '',
   originRemoteJid = '',
-  originMsgKey = null,
+  originMsg = null,
   isImageOrder = false
 }) {
-  if (!orders || orders.length === 0) return null;
+  if (!parsedResult) return null;
   pendingCounter++;
-  const token = `#DA${pendingCounter}`;
-  const totalSummaryAmt = orders.reduce((s, o) => s + (o.totalAmount || 0), 0);
-  const itemsPreview = orders.map((o) => `${o.productName} (${o.orderedQty})`).join(', ');
+  const token = `#ORD${pendingCounter}`;
+
+  const firstPharmacy =
+    parsedResult.orders?.[0]?.pharmacyName ||
+    parsedResult.unrecognizedItems?.[0]?.pharmacyName ||
+    'General Party';
 
   const pendingItem = {
     token,
-    type: 'UNKNOWN_DA',
+    type: (!parsedResult.daInfo || !parsedResult.daInfo.isKnownDA) ? 'UNKNOWN_DA' : 'UNKNOWN_PRODUCT',
     createdAt: new Date().toISOString(),
-    orders,
-    detectedDaId,
-    rawText: rawText.slice(0, 300),
+    daInfo: parsedResult.daInfo || { daId: 'UNRESOLVED', altId: '-', name: 'Unknown DA', isKnownDA: false },
+    detectedDaId: parsedResult.daInfo?.detectedDaId || null,
+    orders: parsedResult.orders ? [...parsedResult.orders] : [],
+    unrecognizedItems: parsedResult.unrecognizedItems ? [...parsedResult.unrecognizedItems] : [],
+    unknownProductText: parsedResult.unrecognizedItems?.[0]?.unknownProductText || '',
+    orderedQty: parsedResult.unrecognizedItems?.[0]?.orderedQty || 0,
+    rawLine: parsedResult.unrecognizedItems?.[0]?.rawLine || '',
+    defaultPharmacy: firstPharmacy,
+    messageId: parsedResult.orders?.[0]?.whatsappMsgId || originMsg?.key?.id || `MSG_${Date.now()}`,
+    whatsappMsgId: parsedResult.orders?.[0]?.whatsappMsgId || originMsg?.key?.id || `MSG_${Date.now()}`,
+    dateStr: parsedResult.dateStr || new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Dhaka' }),
+    timeStr: parsedResult.timeStr || new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }),
+    displayPhone: parsedResult.displayPhone || (senderPhone ? `+${normalizeBdPhone(senderPhone)}` : '-'),
+    rawText: (rawText || '').slice(0, 300),
     senderPhone,
     senderPushName,
+    rawSenderId,
     originRemoteJid,
-    originMsgKey,
+    originMsg,
     isImageOrder
   };
-  pendingResolutions.set(token, pendingItem);
 
-  let promptMsg = '';
-  if (detectedDaId) {
-    promptMsg =
-      `❓ *নতুন/অপরিচিত DA ID শনাক্ত হয়েছে!* (${token})\n` +
-      `🆔 শনাক্তকৃত ID: *${detectedDaId}* (ডেটাবেসে নাম পাওয়া যায়নি)\n` +
-      `🏪 ফার্মেসি: *${orders[0]?.pharmacyName || 'General Party'}*\n` +
-      `💊 অর্ডার (${orders.length}টি): *${itemsPreview}*\n` +
-      `💰 মোট টাকা: *৳${totalSummaryAmt.toFixed(2)}*\n\n` +
-      `👉 এই মেসেজের *Reply*-তে প্রতিনিধির *নাম* (অথবা \`${detectedDaId} নাম\`) লিখে পাঠান।\n` +
-      `উত্তর দিলেই এটি ডেটাবেসে স্থায়ীভাবে সেভ হয়ে অর্ডারটি Google Sheet-এ যুক্ত হয়ে যাবে! (বাতিল করতে লিখুন \`/cnl\`)`;
-  } else {
-    promptMsg =
-      `❓ *অর্ডারে কোনো পরিচিত DA ID বা নাম পাওয়া যায়নি!* (${token})\n` +
-      `👤 প্রেরক: *${senderPushName || 'Unknown'}* (${senderPhone ? '+' + normalizeBdPhone(senderPhone) : 'N/A'})\n` +
-      `🏪 ফার্মেসি: *${orders[0]?.pharmacyName || 'General Party'}*\n` +
-      `💊 অর্ডার (${orders.length}টি): *${itemsPreview}*\n` +
-      `💰 মোট টাকা: *৳${totalSummaryAmt.toFixed(2)}*\n` +
-      `📝 মূল লেখা: _"${rawText.replace(/\n/g, ' | ').slice(0, 140)}"_\n\n` +
-      `👉 এই অর্ডারটি কার নামে সেভ হবে? এই মেসেজের *Reply*-তে *ID এবং নাম* লিখে পাঠান (যেমন: \`CF4526 Seraj\` বা \`CF9988 Rahim\`)।\n` +
-      `উত্তর দিলেই এটি ডেটাবেসে ও Google Sheet-এ অটোমেটিক সেভ হয়ে যাবে! (বাতিল করতে লিখুন \`/cnl\`)`;
+  pendingResolutions.set(token, pendingItem);
+  const promptText = buildPromptTextForPendingItem(pendingItem);
+  if (promptText) {
+    await sendInteractivePromptToAdminAndOrigin(pendingItem, promptText);
+  }
+  return pendingItem;
+}
+
+// Keep backward-compatible wrappers for unit tests & web endpoints
+async function createPendingDaResolution(opts) {
+  return createPendingOrderResolution({
+    parsedResult: {
+      daInfo: {
+        daId: opts.detectedDaId || 'UNRESOLVED',
+        name: 'Unknown DA',
+        isKnownDA: false,
+        detectedDaId: opts.detectedDaId || null
+      },
+      orders: opts.orders || [],
+      unrecognizedItems: [],
+      dateStr: opts.orders?.[0]?.date,
+      timeStr: opts.orders?.[0]?.time,
+      displayPhone: opts.orders?.[0]?.senderPhone
+    },
+    rawText: opts.rawText || '',
+    senderPhone: opts.senderPhone || '',
+    senderPushName: opts.senderPushName || '',
+    originRemoteJid: opts.originRemoteJid || '',
+    originMsg: opts.originMsgKey ? { key: opts.originMsgKey } : null,
+    isImageOrder: Boolean(opts.isImageOrder)
+  });
+}
+
+async function createPendingProductResolution(opts) {
+  return createPendingOrderResolution({
+    parsedResult: {
+      daInfo: opts.daInfo ? { ...opts.daInfo, isKnownDA: true } : { daId: 'UNKNOWN', name: 'Unknown DA', isKnownDA: true },
+      orders: [],
+      unrecognizedItems: opts.unknownItem ? [opts.unknownItem] : [],
+      dateStr: opts.dateStr,
+      timeStr: opts.timeStr,
+      displayPhone: opts.displayPhone
+    },
+    originRemoteJid: opts.originRemoteJid || ''
+  });
+}
+
+/**
+ * Finalizes a pending order once its DA and all Products are resolved:
+ * Saves all order lines to Google Sheets and sends confirmation!
+ */
+async function finalizeAndSavePendingOrder(item, learnedSummaryLines = []) {
+  pendingResolutions.delete(item.token);
+
+  const finalOrders = (item.orders || []).map((o, idx) => ({
+    ...o,
+    orderLineId: `${item.whatsappMsgId}_${idx + 1}`,
+    whatsappMsgId: item.whatsappMsgId,
+    daId: item.daInfo.daId,
+    altId: item.daInfo.altId || '-',
+    daName: item.daInfo.name,
+    senderPhone:
+      item.daInfo.phones && item.daInfo.phones.length > 0
+        ? `+${item.daInfo.phones[0]}`
+        : (o.senderPhone || item.displayPhone || '-')
+  }));
+
+  if (finalOrders.length === 0) {
+    return {
+      ok: true,
+      message: `🗑️ *${item.token}* অর্ডারে কোনো বৈধ প্রোডাক্ট না থাকায় Google Sheet-এ সেভ করা হয়নি।`
+    };
   }
 
-  await sendAdminResolutionPrompt(token, promptMsg);
-  return pendingItem;
-}
+  await appendOrdersToSheet(finalOrders);
 
-/**
- * Enqueues an unrecognized product line and asks Admin (01793362829) what product it is
- */
-async function createPendingProductResolution({
-  unknownItem,
-  daInfo,
-  messageId,
-  dateStr,
-  timeStr,
-  displayPhone,
-  originRemoteJid = ''
-}) {
-  if (!unknownItem) return null;
-  pendingCounter++;
-  const token = `#PR${pendingCounter}`;
+  cancellableOrderMap.set(item.whatsappMsgId, item.whatsappMsgId);
+  if (item.rawSenderId) lastOrderBySenderMap.set(item.rawSenderId, item.whatsappMsgId);
+  if (item.senderPhone) lastOrderBySenderMap.set(item.senderPhone, item.whatsappMsgId);
 
-  const pendingItem = {
-    token,
-    type: 'UNKNOWN_PRODUCT',
-    createdAt: new Date().toISOString(),
-    unknownProductText: unknownItem.unknownProductText,
-    orderedQty: unknownItem.orderedQty,
-    rawLine: unknownItem.rawLine,
-    pharmacyName: unknownItem.pharmacyName || 'General Party',
-    psoCode: unknownItem.psoCode || '-',
-    daInfo: daInfo || { daId: 'UNKNOWN', altId: '-', name: 'Unknown DA' },
-    messageId: `${messageId}_${token.replace('#', '')}`,
-    whatsappMsgId: messageId,
-    dateStr,
-    timeStr,
-    displayPhone,
-    originRemoteJid
+  const totalAmt = finalOrders.reduce((s, o) => s + (o.totalAmount || 0), 0);
+  const itemsLines = finalOrders.map(
+    (o, i) => `${i + 1}. *${o.productName}* — ${o.orderedQty} × ৳${Number(o.unitPrice).toFixed(2)} = *৳${Number(o.totalAmount).toFixed(2)}*`
+  );
+
+  const confirmMsg =
+    `✅ *ডেটাবেস আপডেট ও অর্ডারটি Google Sheet-এ সেভ হয়েছে!*\n` +
+    (learnedSummaryLines.length > 0 ? learnedSummaryLines.join('\n') + '\n' : '') +
+    `👤 *DA:* [${item.daInfo.daId}] ${item.daInfo.name}\n` +
+    `🏥 *Party:* ${finalOrders[0].pharmacyName} (PSO: ${finalOrders[0].psoCode})\n\n` +
+    `📦 *সেভ হওয়া অর্ডার:*\n` +
+    itemsLines.join('\n') +
+    `\n\n💰 *সর্বমোট:* *৳${totalAmt.toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*\n` +
+    `❌ _বাতিল করতে এই মেসেজের Reply-তে লিখুন:_ */cnl*`;
+
+  return {
+    ok: true,
+    finalOrders,
+    message: confirmMsg
   };
-  pendingResolutions.set(token, pendingItem);
-
-  const promptMsg =
-    `🤔 *অপরিচিত প্রোডাক্ট বা ভুল বানান পাওয়া গেছে!* (${token})\n` +
-    `👤 প্রতিনিধি: *${pendingItem.daInfo.name}* (${pendingItem.daInfo.daId})\n` +
-    `🏪 ফার্মেসি: *${pendingItem.pharmacyName}* (PSO: ${pendingItem.psoCode})\n` +
-    `📝 মেসেজে লিখেছে: *"${unknownItem.rawLine}"*\n` +
-    `❓ শনাক্তকৃত বানান: *"${unknownItem.unknownProductText}"* | পরিমাণ: *${unknownItem.orderedQty}*\n\n` +
-    `👉 এটি কোন প্রোডাক্ট? এই মেসেজের *Reply*-তে সঠিক প্রোডাক্টের *নাম অথবা কোড* পাঠান (যেমন: \`Totifen\` বা \`919\` বা \`Domiren 100ml\`)।\n` +
-    `💡 নতুন প্রোডাক্ট হলে লিখুন: \`NEW | কোড | নাম | দাম\`\n` +
-    `❌ এটি অর্ডার না হলে লিখুন: \`skip\` বা \`/cnl\``;
-
-  await sendAdminResolutionPrompt(token, promptMsg);
-  return pendingItem;
 }
 
 /**
- * Resolves a pending #DA... or #PR... item from Admin reply (via WhatsApp or Web Dashboard)
+ * Resolves a pending item (#ORD..., #DA..., #PR...) using Admin's reply (from WhatsApp or Web Dashboard)
  */
 async function resolvePendingItemWithAnswer(token, rawAnswerText) {
   const item = pendingResolutions.get(token);
@@ -2412,20 +2552,21 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
     return { ok: false, message: '⚠️ উত্তর খালি রাখা যাবে না।' };
   }
 
-  // Check if Admin wants to cancel/skip this pending item
-  if (/^(\/?cnl|cancel|skip|no|bad|না|বাদ)$/i.test(answer)) {
+  // If Admin typed "/cnl" or "cancel", cancel the entire pending order
+  if (/^(\/?cnl|cancel|বাতিল)$/i.test(answer)) {
     pendingResolutions.delete(token);
-    addLog(`🗑️ Pending item ${token} skipped/cancelled by Admin.`);
-    return { ok: true, cancelled: true, message: `🗑️ *${token}* বাতিল করা হয়েছে (Google Sheet-এ যোগ করা হয়নি)।` };
+    addLog(`🗑️ Pending order ${token} cancelled by Admin.`);
+    return { ok: true, cancelled: true, message: `❌ *${token}* অর্ডারটি বাতিল করা হয়েছে (Google Sheet-এ যোগ করা হয়নি)।` };
   }
 
+  if (!item.learnedLogs) item.learnedLogs = [];
+
   // ==========================================================================
-  // CASE A: RESOLVE UNKNOWN DA (#DA...)
+  // STEP 1: IF DA IS STILL UNRESOLVED, RESOLVE DA FROM ADMIN'S REPLY
   // ==========================================================================
-  if (item.type === 'UNKNOWN_DA') {
+  if (!item.daInfo || !item.daInfo.isKnownDA) {
     let resolvedDA = null;
 
-    // 1. Check if Admin's reply contains an explicit ID (e.g. "CF4526", "CF9988 Rahim")
     const idMatch = answer.toUpperCase().match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b/);
     if (idMatch) {
       const candidateId = `${idMatch[1]}${idMatch[2]}`;
@@ -2448,7 +2589,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
         }
         resolvedDA = existingById;
       } else {
-        // Brand new ID provided by Admin!
         const finalName = remainingName || `DA ${candidateId}`;
         resolvedDA = {
           daId: candidateId,
@@ -2462,7 +2602,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
         scheduleCloudStateBackup(2000);
       }
     } else {
-      // 2. Admin only typed a Name (e.g. "Seraj" or "Karim Uddin")
       const lowerAns = answer.toLowerCase();
       const existingByName = activeDAs.find(
         (d) =>
@@ -2471,11 +2610,11 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
           (d.aliases && d.aliases.some((a) => a.toLowerCase() === lowerAns))
       );
 
-      if (existingByName && !item.detectedDaId) {
+      const detId = item.daInfo?.detectedDaId || item.detectedDaId;
+      if (existingByName && !detId) {
         resolvedDA = existingByName;
       } else {
-        // Create new DA using detectedDaId (if present) or an auto-generated CF ID
-        const finalId = item.detectedDaId || `CF${Math.floor(10000 + Math.random() * 89999)}`;
+        const finalId = detId || `CF${Math.floor(10000 + Math.random() * 89999)}`;
         resolvedDA = {
           daId: finalId,
           altId: '',
@@ -2489,36 +2628,50 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       }
     }
 
-    // Update held orders with the resolved DA and save to Google Sheets!
-    const updatedOrders = item.orders.map((o) => ({
+    item.daInfo = { ...resolvedDA, isKnownDA: true };
+    item.learnedLogs.push(`🆔 প্রতিনিধি সেভ: *[${resolvedDA.daId}] ${resolvedDA.name}*`);
+    addLog(`✅ Resolved DA for ${token}: [${resolvedDA.daId}] ${resolvedDA.name}`);
+
+    // Update DA on any already-parsed orders in this item
+    item.orders = (item.orders || []).map((o) => ({
       ...o,
       daId: resolvedDA.daId,
       altId: resolvedDA.altId || '-',
-      daName: resolvedDA.name,
-      senderPhone:
-        resolvedDA.phones && resolvedDA.phones.length > 0
-          ? `+${resolvedDA.phones[0]}`
-          : o.senderPhone
+      daName: resolvedDA.name
     }));
 
-    await appendOrdersToSheet(updatedOrders);
-    pendingResolutions.delete(token);
+    // Check if there are STILL unrecognized products in this same order!
+    if (item.unrecognizedItems && item.unrecognizedItems.length > 0) {
+      const nextPrompt = buildPromptTextForPendingItem(item);
+      return {
+        ok: true,
+        needsMoreInput: true,
+        nextPromptToken: item.token,
+        message: `✅ প্রতিনিধি *[${resolvedDA.daId}] ${resolvedDA.name}* সেভ হয়েছে!\n\nএবার নিচের অপরিচিত প্রোডাক্টটির নাম দিন:\n\n${nextPrompt}`
+      };
+    }
 
-    const totalAmt = updatedOrders.reduce((s, o) => s + (o.totalAmount || 0), 0);
-    addLog(`✅ Resolved ${token} -> DA: ${resolvedDA.name} (${resolvedDA.daId}). Saved ${updatedOrders.length} order(s) to Sheet.`);
-
-    return {
-      ok: true,
-      message:
-        `✅ *ধন্যবাদ! প্রতিনিধি [${resolvedDA.daId} — ${resolvedDA.name}] ডেটাবেসে সেভ হয়েছে!*\n` +
-        `📦 মোট *${updatedOrders.length}টি অর্ডার লাইন (৳${totalAmt.toFixed(2)})* সফলভাবে Google Sheet-এ যুক্ত করা হয়েছে।`
-    };
+    // Otherwise all products are ready -> Save to Google Sheets now!
+    return await finalizeAndSavePendingOrder(item, item.learnedLogs);
   }
 
   // ==========================================================================
-  // CASE B: RESOLVE UNKNOWN PRODUCT / WRONG SPELLING (#PR...)
+  // STEP 2: RESOLVE UNKNOWN PRODUCT / WRONG SPELLING IN item.unrecognizedItems[0]
   // ==========================================================================
-  if (item.type === 'UNKNOWN_PRODUCT') {
+  if (item.unrecognizedItems && item.unrecognizedItems.length > 0) {
+    const currentUnk = item.unrecognizedItems[0];
+
+    // Check if Admin wants to skip just this unrecognized product line
+    if (/^(skip|no|bad|না|বাদ)$/i.test(answer)) {
+      item.unrecognizedItems.shift();
+      addLog(`⏭️ Skipped unrecognized product "${currentUnk.unknownProductText}" in ${token}.`);
+      if (item.unrecognizedItems.length > 0) {
+        const nextPrompt = buildPromptTextForPendingItem(item);
+        return { ok: true, needsMoreInput: true, nextPromptToken: item.token, message: nextPrompt };
+      }
+      return await finalizeAndSavePendingOrder(item, item.learnedLogs);
+    }
+
     let matchedProd = null;
 
     // 1. Check if Admin typed "NEW | CODE | NAME | PRICE"
@@ -2528,14 +2681,14 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
         const newCode = parts[1].toUpperCase();
         const newName = parts[2].toUpperCase();
         const newPrice = parseFloat(parts[3]) || 0;
-        const newUnit = parts[4] || "Box/Bottle";
+        const newUnit = parts[4] || 'Box/Bottle';
         matchedProd = {
           code: newCode,
           name: newName,
           unit: newUnit,
           price: newPrice,
           family: newName.split(/\s+/)[0],
-          aliases: [newName.toLowerCase(), item.unknownProductText.toLowerCase()]
+          aliases: [newName.toLowerCase(), currentUnk.unknownProductText.toLowerCase()]
         };
         masterDb.products.push(matchedProd);
         saveLocalMasterDb();
@@ -2543,13 +2696,27 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       }
     }
 
-    // 2. Otherwise match Admin's reply against existing products by Code or Name/Alias
+    // 2. Match Admin's reply against existing products by Code, Name, or Alias
+    //    (Also pass currentUnk.unknownProductText so any ml/mg size like "200" in "Luen R200" helps disambiguate variants!)
     if (!matchedProd) {
       const cleanAns = answer.trim();
-      matchedProd =
-        activeProducts.find((p) => String(p.code).toLowerCase() === cleanAns.toLowerCase()) ||
-        matchCRPProduct(cleanAns)?.product ||
-        activeProducts.find((p) => p.name.toLowerCase().includes(cleanAns.toLowerCase()));
+      const byExactCode = activeProducts.find((p) => String(p.code).toLowerCase() === cleanAns.toLowerCase());
+      if (byExactCode) {
+        matchedProd = byExactCode;
+      } else {
+        const combinedHint = `${cleanAns} ${currentUnk.unknownProductText || ''}`.toLowerCase();
+        const directMatch = matchCRPProduct(cleanAns);
+        if (directMatch?.product) {
+          matchedProd =
+            resolveBrandFamilyVariant(directMatch.product.family, combinedHint) ||
+            directMatch.product;
+        } else {
+          const bySubName = activeProducts.find((p) => p.name.toLowerCase().includes(cleanAns.toLowerCase()));
+          if (bySubName) {
+            matchedProd = resolveBrandFamilyVariant(bySubName.family, combinedHint) || bySubName;
+          }
+        }
+      }
     }
 
     if (!matchedProd) {
@@ -2557,13 +2724,13 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
         ok: false,
         message:
           `⚠️ *"${answer}"* দিয়ে কোনো প্রোডাক্ট খুঁজে পাওয়া যায়নি।\n` +
-          `সঠিক প্রোডাক্টের কোড (যেমন \`919\`) বা নাম (যেমন \`Totifen\`) লিখুন, অথবা নতুন প্রোডাক্ট যোগ করতে লিখুন:\n` +
+          `সঠিক প্রোডাক্টের কোড (যেমন \`919\`) বা নাম (যেমন \`Totifen\` বা \`Lucan R 200\`) লিখুন, অথবা নতুন প্রোডাক্ট যোগ করতে লিখুন:\n` +
           `\`NEW | কোড | নাম | দাম\``
       };
     }
 
-    // Add the unrecognized spelling to matchedProd.aliases in masterDb.products!
-    const learnedAlias = item.unknownProductText.toLowerCase().trim();
+    // Learn the wrong spelling into matchedProd.aliases in masterDb.products!
+    const learnedAlias = currentUnk.unknownProductText.toLowerCase().trim();
     if (!matchedProd.aliases) matchedProd.aliases = [];
     if (learnedAlias && !matchedProd.aliases.includes(learnedAlias)) {
       matchedProd.aliases.push(learnedAlias);
@@ -2571,10 +2738,10 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
     saveLocalMasterDb();
     scheduleCloudStateBackup(2000);
 
-    // Construct and save the order line to Google Sheets!
-    const totalAmount = Number((item.orderedQty * matchedProd.price).toFixed(2));
-    const newOrderRow = {
-      orderLineId: item.messageId,
+    // Convert currentUnk into a resolved order row and add to item.orders!
+    const totalAmount = Number((currentUnk.orderedQty * matchedProd.price).toFixed(2));
+    item.orders.push({
+      orderLineId: `${item.whatsappMsgId}_${item.orders.length + 1}`,
       whatsappMsgId: item.whatsappMsgId,
       date: item.dateStr,
       time: item.timeStr,
@@ -2582,36 +2749,42 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       altId: item.daInfo.altId || '-',
       daName: item.daInfo.name,
       senderPhone: item.displayPhone || '-',
-      psoCode: item.psoCode || '-',
-      pharmacyName: item.pharmacyName || 'General Party',
-      rawText: item.rawLine,
+      psoCode: currentUnk.psoCode || '-',
+      pharmacyName: currentUnk.pharmacyName || item.defaultPharmacy || 'General Party',
+      rawText: currentUnk.rawLine,
       crpCode: matchedProd.code,
       productName: matchedProd.name,
       packUnit: matchedProd.unit,
-      orderedQty: item.orderedQty,
+      orderedQty: currentUnk.orderedQty,
       unitPrice: matchedProd.price,
       totalAmount,
       matchType: 'AI-Learned',
       status: 'ACTIVE'
-    };
+    });
 
-    await appendOrdersToSheet([newOrderRow]);
-    pendingResolutions.delete(token);
+    item.learnedLogs.push(`🧠 নতুন বানান সেভ: *"${currentUnk.unknownProductText}"* ➔ *[${matchedProd.code}] ${matchedProd.name}*`);
+    item.unrecognizedItems.shift();
 
     addLog(
-      `🧠 Self-Learned Alias: "${learnedAlias}" -> [${matchedProd.code}] ${matchedProd.name} & saved order (${item.orderedQty} pcs = ৳${totalAmount})!`
+      `🧠 Self-Learned Alias: "${learnedAlias}" -> [${matchedProd.code}] ${matchedProd.name} (${currentUnk.orderedQty} pcs = ৳${totalAmount})`
     );
 
-    return {
-      ok: true,
-      message:
-        `✅ *ডেটাবেস আপডেট ও অর্ডার সেভ হয়েছে!*\n` +
-        `🧠 ভুল বানান *"${item.unknownProductText}"* এখন *[${matchedProd.code}] ${matchedProd.name}*-এর সাথে যুক্ত করা হয়েছে (ভবিষ্যতে কেউ এই বানান লিখলে বট অটো চিনে নেবে!)।\n` +
-        `📦 অর্ডার: *${item.orderedQty} × ৳${matchedProd.price.toFixed(2)} = ৳${totalAmount.toFixed(2)}* Google Sheet-এ সেভ হয়েছে।`
-    };
+    // If there are more unrecognized products in the same order, ask for the next one!
+    if (item.unrecognizedItems.length > 0) {
+      const nextPrompt = buildPromptTextForPendingItem(item);
+      return {
+        ok: true,
+        needsMoreInput: true,
+        nextPromptToken: item.token,
+        message: `✅ *"${currentUnk.unknownProductText}"* ➔ *${matchedProd.name}* সেভ হয়েছে!\n\nএবার পরের অপরিচিত প্রোডাক্টটির নাম দিন:\n\n${nextPrompt}`
+      };
+    }
+
+    // All products and DA are now resolved -> Save the complete order to Google Sheets!
+    return await finalizeAndSavePendingOrder(item, item.learnedLogs);
   }
 
-  return { ok: false, message: '⚠️ Unknown resolution type.' };
+  return { ok: false, message: '⚠️ Unknown resolution state.' };
 }
 
 function isAllowedTargetGroup(remoteJid) {
@@ -2637,15 +2810,29 @@ function isAllowedTargetGroup(remoteJid) {
   return false;
 }
 
+/**
+ * Unwraps nested Baileys message containers (deviceSentMessage, ephemeralMessage, viewOnceMessage, etc.)
+ */
+function unwrapBaileysMessageContainer(m) {
+  if (!m) return null;
+  if (m.deviceSentMessage?.message) return unwrapBaileysMessageContainer(m.deviceSentMessage.message);
+  if (m.ephemeralMessage?.message) return unwrapBaileysMessageContainer(m.ephemeralMessage.message);
+  if (m.viewOnceMessage?.message) return unwrapBaileysMessageContainer(m.viewOnceMessage.message);
+  if (m.viewOnceMessageV2?.message) return unwrapBaileysMessageContainer(m.viewOnceMessageV2.message);
+  if (m.documentWithCaptionMessage?.message) return unwrapBaileysMessageContainer(m.documentWithCaptionMessage.message);
+  return m;
+}
+
 function inspectBaileysMessage(msg) {
   if (!msg || !msg.message) return { type: 'IGNORE' };
 
-  const m = msg.message;
+  const rawM = msg.message;
+  const m = unwrapBaileysMessageContainer(rawM) || rawM;
 
   const proto =
     m.protocolMessage ||
-    m.ephemeralMessage?.message?.protocolMessage ||
-    m.viewOnceMessage?.message?.protocolMessage;
+    rawM.protocolMessage ||
+    rawM.ephemeralMessage?.message?.protocolMessage;
 
   if (proto && (proto.type === 0 || proto.type === 'REVOKE') && proto.key?.id) {
     return {
@@ -2681,8 +2868,6 @@ function inspectBaileysMessage(msg) {
 
   const imgMsg =
     m.imageMessage ||
-    m.ephemeralMessage?.message?.imageMessage ||
-    m.viewOnceMessage?.message?.imageMessage ||
     (m.documentMessage && String(m.documentMessage.mimetype || '').startsWith('image/')
       ? m.documentMessage
       : null);
@@ -2698,14 +2883,20 @@ function inspectBaileysMessage(msg) {
     };
   }
 
-  const extMsg = m.extendedTextMessage || m.ephemeralMessage?.message?.extendedTextMessage;
+  const extMsg = m.extendedTextMessage;
   const text =
     m.conversation ||
     extMsg?.text ||
-    m.ephemeralMessage?.message?.conversation ||
     '';
 
-  const quotedMsgId = extMsg?.contextInfo?.stanzaId || null;
+  const ctxInfo = extMsg?.contextInfo || m.contextInfo || null;
+  const quotedMsgId = ctxInfo?.stanzaId || null;
+  const qMsg = unwrapBaileysMessageContainer(ctxInfo?.quotedMessage) || ctxInfo?.quotedMessage;
+  const quotedText =
+    qMsg?.conversation ||
+    qMsg?.extendedTextMessage?.text ||
+    qMsg?.imageMessage?.caption ||
+    '';
 
   if (text.trim()) {
     return {
@@ -2713,6 +2904,7 @@ function inspectBaileysMessage(msg) {
       msgId: msg.key.id,
       text: text.trim(),
       quotedMsgId,
+      quotedText: quotedText.trim(),
       remoteJid: msg.key.remoteJid
     };
   }
@@ -2928,11 +3120,13 @@ async function startWhatsApp() {
             textOrCaption.includes('নতুন/অপরিচিত DA ID শনাক্ত হয়েছে!') ||
             textOrCaption.includes('অর্ডারে কোনো পরিচিত DA ID বা নাম পাওয়া যায়নি!') ||
             textOrCaption.includes('অপরিচিত প্রোডাক্ট বা ভুল বানান পাওয়া গেছে!') ||
+            textOrCaption.includes('ডেটাবেস আপডেট ও অর্ডারটি Google Sheet-এ সেভ হয়েছে!') ||
             textOrCaption.includes('ডেটাবেস আপডেট ও অর্ডার সেভ হয়েছে!') ||
             textOrCaption.includes('ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!') ||
             textOrCaption.includes('অর্ডারটি বাতিল (/cnl) করা হয়েছে!') ||
             textOrCaption.includes('ছবিটি ৩ বার অটো-রিচেক') ||
-            textOrCaption.includes('ডেটাবেসে সেভ হয়েছে!')
+            textOrCaption.includes('নতুন প্রতিনিধি অটো-যুক্ত হয়েছে!') ||
+            textOrCaption.includes('প্রোডাক্ট খুঁজে পাওয়া যায়নি।')
           ) {
             continue;
           }
@@ -2968,38 +3162,100 @@ async function startWhatsApp() {
             continue;
           }
 
-          // 1. CHECK IF THIS MESSAGE IS AN ADMIN REPLY TO A PENDING #DA... OR #PR... PROMPT!
+          // ==================================================================
+          // 1. CHECK IF THIS TEXT MESSAGE IS A REPLY TO A PENDING RESOLUTION
+          // ==================================================================
           if (inspected.type === 'TEXT' && pendingResolutions.size > 0) {
             let matchedToken = null;
             let answerBody = inspected.text.trim();
 
-            // Check if quoted message ID matches one of the bot's question messages
+            // A) Check if quoted message ID matches a registered question/order message ID
             if (inspected.quotedMsgId && pendingQuestionMsgIdMap.has(inspected.quotedMsgId)) {
-              matchedToken = pendingQuestionMsgIdMap.get(inspected.quotedMsgId);
+              const candidateTok = pendingQuestionMsgIdMap.get(inspected.quotedMsgId);
+              if (pendingResolutions.has(candidateTok)) {
+                matchedToken = candidateTok;
+              }
             }
 
-            // Or check if text starts with explicit token like "#DA101 CF4526 Seraj" or "#PR102 Totifen"
+            // B) Check if the quoted message's TEXT contains (#ORD101 / #DA101 / #PR101)
+            if (!matchedToken && inspected.quotedText) {
+              const qTokenMatch = inspected.quotedText.match(/#(?:ORD|DA|PR)\d+/i);
+              if (qTokenMatch) {
+                const candidateTok = qTokenMatch[0].toUpperCase();
+                if (pendingResolutions.has(candidateTok)) {
+                  matchedToken = candidateTok;
+                }
+              }
+            }
+
+            // C) Check if reply text itself starts with "#ORD101 ..." or "ORD101 ..."
             if (!matchedToken) {
-              const tokenPrefix = answerBody.match(/^(#(?:DA|PR)\d+)\s+([\s\S]+)$/i);
-              if (tokenPrefix && pendingResolutions.has(tokenPrefix[1].toUpperCase())) {
-                matchedToken = tokenPrefix[1].toUpperCase();
-                answerBody = tokenPrefix[2].trim();
+              const prefixMatch = answerBody.match(/^#?((?:ORD|DA|PR)\d+)\s+([\s\S]+)$/i);
+              if (prefixMatch) {
+                const candidateTok = '#' + prefixMatch[1].toUpperCase();
+                if (pendingResolutions.has(candidateTok)) {
+                  matchedToken = candidateTok;
+                  answerBody = prefixMatch[2].trim();
+                }
               }
             }
 
-            // Or if this is a direct DM from an Admin (01793362829) and there is a pending question, apply to the latest pending item!
-            if (!matchedToken && !isGroup && isAdminAlertSender(msg, senderPhone)) {
-              const allTokens = Array.from(pendingResolutions.keys());
-              if (allTokens.length > 0 && !/^\/?cnl\b/i.test(answerBody)) {
-                matchedToken = allTokens[allTokens.length - 1];
+            // D) Direct reply WITHOUT swiping/quoting:
+            //    - In 1-on-1 DM (!isGroup): ANY short reply automatically resolves the latest pending question!
+            //    - In Group (isGroup): If sent by Admin (01793362829 / 01732273944) or original order sender,
+            //      and it's a single-line answer (not a new multi-line order), resolve the latest pending question!
+            if (!matchedToken) {
+              const allPending = Array.from(pendingResolutions.values());
+              const latestPending = allPending[allPending.length - 1];
+              const isSingleLineReply = !answerBody.includes('\n') && answerBody.length <= 65;
+
+              if (!isGroup && isSingleLineReply) {
+                // Also auto-map this DM sender's LID to Admin phone so future checks know it's the Admin!
+                const primaryAdmin = getAdminAlertPhones()[0] || '8801793362829';
+                if (!senderPhone.startsWith('8801')) {
+                  lidToPhoneMap.set(rawSenderId, primaryAdmin);
+                  senderPhone = primaryAdmin;
+                }
+                matchedToken = latestPending.token;
+              } else if (
+                isGroup &&
+                isSingleLineReply &&
+                (isAdminAlertSender(msg, senderPhone) || rawSenderId === latestPending.rawSenderId)
+              ) {
+                // In group, ensure the reply doesn't look like a brand new order with quantities (unless it's "Lucan R 200")
+                const hasTrailingOrderQty = /[\-:=]\s*\d+\s*(?:ta|pes|pcs|pc|p|box|bx)?$/i.test(answerBody) || /\b\d+\s*(?:ta|pes|pcs|pc|box|bx)$/i.test(answerBody);
+                if (!hasTrailingOrderQty) {
+                  matchedToken = latestPending.token;
+                }
               }
             }
 
-            if (matchedToken && isAdminAlertSender(msg, senderPhone)) {
+            if (matchedToken && pendingResolutions.has(matchedToken)) {
+              const pItem = pendingResolutions.get(matchedToken);
+              addLog(`💬 Received reply for [${matchedToken}] from +${senderPhone || rawSenderId}: "${answerBody}"`);
               const resOut = await resolvePendingItemWithAnswer(matchedToken, answerBody);
+
               if (sock && resOut?.message) {
                 try {
-                  await sock.sendMessage(remoteJid, { text: resOut.message }, { quoted: msg });
+                  const sentConfirm = await sock.sendMessage(remoteJid, { text: resOut.message }, { quoted: msg });
+                  if (sentConfirm?.key?.id) {
+                    if (resOut.needsMoreInput && resOut.nextPromptToken) {
+                      pendingQuestionMsgIdMap.set(sentConfirm.key.id, resOut.nextPromptToken);
+                    } else if (pItem?.whatsappMsgId) {
+                      cancellableOrderMap.set(sentConfirm.key.id, pItem.whatsappMsgId);
+                    }
+                  }
+                  // If Admin replied in DM and the order originated in a Group, also notify the Group!
+                  if (!resOut.needsMoreInput && resOut.ok && pItem?.originRemoteJid && pItem.originRemoteJid !== remoteJid) {
+                    const sentGrp = await sock.sendMessage(
+                      pItem.originRemoteJid,
+                      { text: resOut.message },
+                      pItem.originMsg ? { quoted: pItem.originMsg } : undefined
+                    );
+                    if (sentGrp?.key?.id && pItem?.whatsappMsgId) {
+                      cancellableOrderMap.set(sentGrp.key.id, pItem.whatsappMsgId);
+                    }
+                  }
                 } catch (e) {}
               }
               continue;
@@ -3033,16 +3289,17 @@ async function startWhatsApp() {
               senderJid,
               isImageOrder: false
             });
-            if (parsedEdit.isOrder && parsedEdit.orders.length > 0) {
-              if (parsedEdit.daInfo && !parsedEdit.daInfo.isKnownDA) {
-                await createPendingDaResolution({
-                  orders: parsedEdit.orders,
-                  detectedDaId: parsedEdit.daInfo.detectedDaId,
+            if ((parsedEdit.orders && parsedEdit.orders.length > 0) || (parsedEdit.unrecognizedItems && parsedEdit.unrecognizedItems.length > 0)) {
+              const needsHold = (parsedEdit.daInfo && !parsedEdit.daInfo.isKnownDA) || (parsedEdit.unrecognizedItems && parsedEdit.unrecognizedItems.length > 0);
+              if (needsHold) {
+                await createPendingOrderResolution({
+                  parsedResult: parsedEdit,
                   rawText: inspected.text,
                   senderPhone,
                   senderPushName,
+                  rawSenderId,
                   originRemoteJid: remoteJid,
-                  originMsgKey: msg.key,
+                  originMsg: msg,
                   isImageOrder: false
                 });
               } else {
@@ -3103,46 +3360,28 @@ async function startWhatsApp() {
 
             const parsedImg = ocrPipelineResult.parsed;
 
-            if (ocrPipelineResult.ok && parsedImg && (parsedImg.orders?.length > 0 || parsedImg.unrecognizedItems?.length > 0)) {
+            if (ocrPipelineResult.ok && parsedImg && ((parsedImg.orders && parsedImg.orders.length > 0) || (parsedImg.unrecognizedItems && parsedImg.unrecognizedItems.length > 0))) {
               const orders = parsedImg.orders || [];
+              const unrecognized = parsedImg.unrecognizedItems || [];
               const daInfo = parsedImg.daInfo;
 
-              // Notify Admin if a new DA was auto-added from ID + Name on the paper
-              if (daInfo?.autoAddedNewDA) {
-                await sendAdminResolutionPrompt(
-                  `#AUTO_DA`,
-                  `🆕 *নতুন প্রতিনিধি অটো-যুক্ত হয়েছে!*\n🆔 ID: *${daInfo.daId}*\n👤 নাম: *${daInfo.name}*\nএটি ডেটাবেসে স্থায়ীভাবে সেভ করে নেওয়া হয়েছে।`
-                );
-              }
+              // Check if EITHER DA is unknown OR there is any unrecognized product spelling:
+              // Hold the entire order until Admin replies and fixes it, THEN save to Google Sheets!
+              const needsHold = (daInfo && !daInfo.isKnownDA) || unrecognized.length > 0;
 
-              // Check if DA ID/Name was NOT found on the image (preventing false CF10145 save!)
-              if (orders.length > 0 && daInfo && !daInfo.isKnownDA) {
-                const pendingDa = await createPendingDaResolution({
-                  orders,
-                  detectedDaId: daInfo.detectedDaId,
+              if (needsHold) {
+                await createPendingOrderResolution({
+                  parsedResult: parsedImg,
                   rawText: ocrPipelineResult.extractedText || inspected.caption,
                   senderPhone,
                   senderPushName,
+                  rawSenderId,
                   originRemoteJid: remoteJid,
-                  originMsgKey: msg.key,
+                  originMsg: msg,
                   isImageOrder: true
                 });
-
-                if (sock && pendingDa) {
-                  try {
-                    await sock.sendMessage(
-                      remoteJid,
-                      {
-                        text:
-                          `⏳ *ছবি থেকে ${orders.length}টি অর্ডার শনাক্ত হয়েছে, কিন্তু প্রতিনিধির (DA) ID/নাম চেনা যায়নি! (${pendingDa.token})*\n` +
-                          `অ্যাডমিন নম্বরে মেসেজ পাঠানো হয়েছে—ID ও নাম কনফার্ম করলেই অর্ডারটি Google Sheet-এ সেভ হয়ে যাবে।`
-                      },
-                      { quoted: msg }
-                    );
-                  } catch (e) {}
-                }
               } else if (orders.length > 0) {
-                // Known DA -> Save immediately to Google Sheets!
+                // Everything (DA + all Products) is known -> Save immediately to Google Sheets!
                 await appendOrdersToSheet(orders);
 
                 cancellableOrderMap.set(inspected.msgId, inspected.msgId);
@@ -3169,19 +3408,6 @@ async function startWhatsApp() {
                     addLog(`⚠️ Could not send confirmation reply: ${sendErr.message}`);
                   }
                 }
-              }
-
-              // If any unrecognized product lines were also found on the image, ask Admin 01793362829!
-              for (const unk of parsedImg.unrecognizedItems || []) {
-                await createPendingProductResolution({
-                  unknownItem: unk,
-                  daInfo: daInfo?.isKnownDA ? daInfo : { daId: daInfo?.detectedDaId || 'PENDING', name: 'Pending DA' },
-                  messageId: inspected.msgId,
-                  dateStr: parsedImg.dateStr,
-                  timeStr: parsedImg.timeStr,
-                  displayPhone: parsedImg.displayPhone,
-                  originRemoteJid: remoteJid
-                });
               }
             } else {
               addLog(
@@ -3268,27 +3494,24 @@ async function startWhatsApp() {
               isImageOrder: false
             });
 
-            if (parsed.daInfo?.autoAddedNewDA) {
-              await sendAdminResolutionPrompt(
-                `#AUTO_DA`,
-                `🆕 *গ্রুপ মেসেজ থেকে নতুন প্রতিনিধি অটো-যুক্ত হয়েছে!*\n🆔 ID: *${parsed.daInfo.daId}*\n👤 নাম: *${parsed.daInfo.name}*`
-              );
-            }
+            const hasOrders = parsed.orders && parsed.orders.length > 0;
+            const hasUnknownProd = parsed.unrecognizedItems && parsed.unrecognizedItems.length > 0;
 
-            if (parsed.isOrder && parsed.orders.length > 0) {
-              if (parsed.daInfo && !parsed.daInfo.isKnownDA) {
-                // Unknown DA in group message -> Ask Admin 01793362829!
-                await createPendingDaResolution({
-                  orders: parsed.orders,
-                  detectedDaId: parsed.daInfo.detectedDaId,
+            if (hasOrders || hasUnknownProd) {
+              const needsHold = (parsed.daInfo && !parsed.daInfo.isKnownDA) || hasUnknownProd;
+              if (needsHold) {
+                // Hold the entire order until Admin (01793362829) replies to confirm DA / Product!
+                await createPendingOrderResolution({
+                  parsedResult: parsed,
                   rawText: inspected.text,
                   senderPhone,
                   senderPushName,
+                  rawSenderId,
                   originRemoteJid: remoteJid,
-                  originMsgKey: msg.key,
+                  originMsg: msg,
                   isImageOrder: false
                 });
-              } else {
+              } else if (hasOrders) {
                 await appendOrdersToSheet(parsed.orders);
                 cancellableOrderMap.set(inspected.msgId, inspected.msgId);
                 lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
@@ -3302,21 +3525,6 @@ async function startWhatsApp() {
               }
             } else if (parsed.followUpPatch) {
               await applyFollowUpPatchToSheet(parsed.followUpPatch);
-            }
-
-            // If any unrecognized product lines were present in the group message, ask Admin 01793362829!
-            if (parsed.unrecognizedItems && parsed.unrecognizedItems.length > 0) {
-              for (const unk of parsed.unrecognizedItems) {
-                await createPendingProductResolution({
-                  unknownItem: unk,
-                  daInfo: parsed.daInfo,
-                  messageId: inspected.msgId,
-                  dateStr: parsed.dateStr,
-                  timeStr: parsed.timeStr,
-                  displayPhone: parsed.displayPhone,
-                  originRemoteJid: remoteJid
-                });
-              }
             }
           }
         } catch (err) {
