@@ -208,11 +208,114 @@ const DEFAULT_DA_MASTER = [
 ];
 
 // ============================================================================
-// 3B. DYNAMIC JSON MASTER DATABASE ENGINE (IN-MEMORY + DISK + CLOUD GZIP)
+// 3B. DYNAMIC JSON MASTER DATABASE ENGINE + PRODUCT BRAND GROUPS
 // ============================================================================
+
+const VARIANT_STOP_TOKENS = new Set([
+  '500', '200', '150', '120', '100', '90', '70', '60', '50', '40', '35', '30', '28', '24', '21', '20', '15', '10', '6', '5', '4', '3', '2', '1',
+  '40000', '20000', '1500', 'ml', 'mg', 'mcg', 'gm', 'g', 'iu', 'syp', 'syr', 'sry', 'sryp', 'syrp', 'srp', 'syrup', 'syrap', 'syraf', 'sy',
+  'susp', 'suspension', 'tab', 'tap', 'tb', 'tablet', 'cap', 'caps', 'capsule', 'cream', 'crem', 'creem', 'crm', 'ointment', 'oientment', 'olntment',
+  'fc', 'ec', 'ds', 'jr', 'lite', 'dry', 'pwd', 'oral', 'solution', 'linctus', 'veg', 'inj', 'dots', 'all', 'night', 'dotted', 'gold', 'electrify',
+  'ulta', 'ultra', 'thin', 'small', 'smal', 'ta', 'tah', 'pes', 'pcs', 'pc', 'ps', 'pic', 'p', 'box', 'bx', 'b', 'bot', 'bt', 'bottle', 'pack', 'pkt'
+]);
+
+/**
+ * Extracts the common brand name / stem from any alias or product name:
+ * e.g. "luen 200" -> "luen", "luncanr 150mg" -> "luncanr", "lucan r 50" -> "lucan r", "domirn 60ml" -> "domirn"
+ */
+function extractCommonBrandStem(rawText) {
+  if (!rawText) return '';
+  const spaced = String(rawText)
+    .replace(/([a-zA-Z])(\d)/g, '$1 $2')
+    .replace(/(\d)([a-zA-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const words = spaced.split(' ').filter((w) => {
+    const cleanW = w.replace(/\-/g, '');
+    if (!cleanW) return false;
+    if (/^\d+$/.test(cleanW)) return false;
+    if (/^\d+x\d+$/i.test(cleanW)) return false;
+    if (VARIANT_STOP_TOKENS.has(cleanW)) return false;
+    return true;
+  });
+
+  const stem = words.join(' ').replace(/\s+/g, ' ').trim();
+  return stem.length >= 3 ? stem : '';
+}
+
+/**
+ * Builds the default Product Brand Groups from DEFAULT_CRP_PRODUCTS
+ * Groups products that share a common brand name (e.g. LUCAN-R, DOMIREN, DELTASONE, ZITHRIN, BECONEX, etc.)
+ */
+function buildDefaultProductGroups(productsList) {
+  const groupsMap = new Map();
+  for (const p of productsList || DEFAULT_CRP_PRODUCTS) {
+    const grpName = String(p.family || String(p.name || '').split(/\s+/)[0] || 'GENERAL').trim().toUpperCase();
+    if (!groupsMap.has(grpName)) {
+      groupsMap.set(grpName, {
+        groupName: grpName,
+        keywords: new Set([
+          grpName.toLowerCase(),
+          grpName.toLowerCase().replace(/\-/g, ' '),
+          grpName.toLowerCase().replace(/\-/g, '')
+        ])
+      });
+    }
+    const g = groupsMap.get(grpName);
+    const nameStem = extractCommonBrandStem(p.name.split(/\s+/)[0]);
+    if (nameStem) g.keywords.add(nameStem);
+
+    for (const al of p.aliases || []) {
+      const stem = extractCommonBrandStem(al);
+      if (stem && stem.length >= 3) {
+        g.keywords.add(stem);
+        const noSpace = stem.replace(/[\s\-]+/g, '');
+        if (noSpace.length >= 4) g.keywords.add(noSpace);
+      }
+    }
+  }
+
+  // Ensure common handwritten/OCR variations for multi-variant groups are pre-populated
+  const extraGroupKeywords = {
+    'LUCAN-R': ['lucan r', 'lucan-r', 'lucanr', 'luncanr', 'luncan r', 'locan r', 'locanr', 'lukan r', 'lukanr', 'lokanar', 'luknar', 'lucon r', 'lucanar', 'luen r', 'luen', 'lucar', 'luna r', 'lacan r'],
+    'DOMIREN': ['domiren', 'domeren', 'domirn', 'domniren', 'domira', 'dumiren', 'dmiren'],
+    'DELTASONE': ['deltasone', 'deltason', 'daltasone', 'daltason', 'delta sone', 'delta som', 'dellthesun', 'delterson', 'deltarson', 'deltasonne'],
+    'ZITHRIN': ['zithrin', 'zitrin', 'zitthrin', 'zithren', 'zrithrin', 'zithirin', 'ziyhrin'],
+    'BECONEX': ['beconex', 'biconex', 'beconez', 'beconix', 'be conex', 'becoxnex'],
+    'FLONTIN': ['flontin', 'flontine', 'foltin', 'flotin', 'falntin', 'flonten'],
+    'FUROCEF': ['furocef', 'feurocef', 'furosef', 'furoccfe', 'reocef'],
+    'FLUSTAR': ['flustar', 'fluster', 'fullstar', 'fulustar'],
+    'PROTONIL': ['protonil', 'protonel'],
+    'PCAB': ['pcab', 'p cab', 'p-cab', 'pacb', 'pcap', 'p-cap', 'picap'],
+    'COPNAT': ['copnat n', 'copnet n', 'cophnet n', 'copmate n', 'copnat'],
+    'FENADIN': ['fenadin', 'fanadin'],
+    'ALGIN': ['algin', 'algine'],
+    'MAZIC': ['mazic', 'magic'],
+    'RECOX': ['recox', 'ricox'],
+    'NEXDEX': ['nexdex', 'nex dex'],
+    'VITA': ['vita d3', 'vita d', 'bita d3', 'vita']
+  };
+
+  for (const [gName, kwList] of Object.entries(extraGroupKeywords)) {
+    if (groupsMap.has(gName)) {
+      const g = groupsMap.get(gName);
+      for (const kw of kwList) g.keywords.add(kw.toLowerCase());
+    }
+  }
+
+  return Array.from(groupsMap.values()).map((g) => ({
+    groupName: g.groupName,
+    keywords: Array.from(g.keywords).filter(Boolean)
+  }));
+}
+
 let masterDb = {
   das: JSON.parse(JSON.stringify(DEFAULT_DA_MASTER)),
   products: JSON.parse(JSON.stringify(DEFAULT_CRP_PRODUCTS)),
+  productGroups: buildDefaultProductGroups(DEFAULT_CRP_PRODUCTS),
   adminAlertPhones: [...DEFAULT_ADMIN_ALERT_PHONES],
   authorizedImagePhones: [...DEFAULT_AUTHORIZED_IMAGE_PHONES],
   updatedAt: new Date().toISOString()
@@ -221,12 +324,83 @@ let masterDb = {
 // Pointers used by fast matching functions
 let activeProducts = masterDb.products;
 let activeDAs = masterDb.das;
+let activeProductGroups = masterDb.productGroups;
 let TRADE_PRICE_MAP = new Map(activeProducts.map((p) => [String(p.code), Number(p.price)]));
 
 function rebuildMasterLookupCaches() {
   activeProducts = masterDb.products || [];
   activeDAs = masterDb.das || [];
+  if (!Array.isArray(masterDb.productGroups) || masterDb.productGroups.length === 0) {
+    masterDb.productGroups = buildDefaultProductGroups(activeProducts);
+  }
+  activeProductGroups = masterDb.productGroups;
   TRADE_PRICE_MAP = new Map(activeProducts.map((p) => [String(p.code), Number(p.price)]));
+}
+
+/**
+ * Automatically finds an existing Product Group for a product or creates one if none exists,
+ * and adds any common brand stem from new aliases into that group's shared keywords!
+ */
+function syncProductWithBrandGroup(prod, newAliasText = '') {
+  if (!prod) return null;
+  if (!Array.isArray(masterDb.productGroups)) {
+    masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
+  }
+
+  let familyCandidate = String(prod.family || String(prod.name || '').split(/\s+/)[0] || 'GENERAL')
+    .trim()
+    .toUpperCase();
+
+  // Check if an existing group matches familyCandidate or the product's brand prefix
+  let group = masterDb.productGroups.find(
+    (g) =>
+      g.groupName.toUpperCase() === familyCandidate ||
+      g.groupName.toUpperCase().replace(/\-/g, '') === familyCandidate.replace(/\-/g, '')
+  );
+
+  if (!group) {
+    const firstWordStem = extractCommonBrandStem(prod.name);
+    if (firstWordStem) {
+      group = masterDb.productGroups.find((g) =>
+        (g.keywords || []).some((k) => k.toLowerCase() === firstWordStem.toLowerCase())
+      );
+    }
+  }
+
+  if (!group) {
+    group = {
+      groupName: familyCandidate,
+      keywords: [...new Set([
+        familyCandidate.toLowerCase(),
+        familyCandidate.toLowerCase().replace(/\-/g, ' '),
+        familyCandidate.toLowerCase().replace(/\-/g, '')
+      ].filter(Boolean))]
+    };
+    masterDb.productGroups.push(group);
+  } else {
+    prod.family = group.groupName;
+  }
+
+  // Extract common brand stem from newAliasText and all prod.aliases and add to group.keywords!
+  const candidateAliases = [
+    ...(prod.aliases || []),
+    ...(newAliasText ? [newAliasText] : [])
+  ];
+
+  for (const al of candidateAliases) {
+    const stem = extractCommonBrandStem(al);
+    if (stem && stem.length >= 3) {
+      if (!group.keywords.includes(stem)) {
+        group.keywords.push(stem);
+      }
+      const compactStem = stem.replace(/[\s\-]+/g, '');
+      if (compactStem.length >= 4 && !group.keywords.includes(compactStem)) {
+        group.keywords.push(compactStem);
+      }
+    }
+  }
+
+  return group;
 }
 
 function getAuthorizedImagePhones() {
@@ -255,7 +429,6 @@ function loadLocalMasterDb() {
 function applyMasterDbObject(raw, shouldSaveLocal = true) {
   if (!raw || typeof raw !== 'object') return;
   if (Array.isArray(raw.das)) {
-    // Ensure CF10145 does not carry admin phones in its phone fallback array unless explicitly added later
     masterDb.das = raw.das.map((d) => ({
       daId: String(d.daId || '').trim().toUpperCase(),
       altId: String(d.altId || '').trim().toUpperCase(),
@@ -275,6 +448,20 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
         ? Array.from(new Set(p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean)))
         : []
     })).filter((p) => p.code && p.name);
+  }
+  if (Array.isArray(raw.productGroups) && raw.productGroups.length > 0) {
+    masterDb.productGroups = raw.productGroups.map((g) => ({
+      groupName: String(g.groupName || '').trim().toUpperCase(),
+      keywords: Array.isArray(g.keywords)
+        ? Array.from(new Set(g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)))
+        : []
+    })).filter((g) => g.groupName);
+  } else {
+    masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
+  }
+  // Ensure all products are synced with their brand groups
+  for (const p of masterDb.products) {
+    syncProductWithBrandGroup(p);
   }
   if (Array.isArray(raw.adminAlertPhones) && raw.adminAlertPhones.length > 0) {
     masterDb.adminAlertPhones = Array.from(new Set(raw.adminAlertPhones.map((p) => normalizeBdPhone(p)).filter(Boolean)));
@@ -298,7 +485,7 @@ function saveLocalMasterDb() {
 }
 
 // ============================================================================
-// 4. FUZZY SPELL-CHECKING, DYNAMIC ALIASES & VARIANT DISAMBIGUATION ENGINE
+// 4. FUZZY SPELL-CHECKING, GROUP KEYWORDS & VARIANT DISAMBIGUATION ENGINE
 // ============================================================================
 
 function levenshtein(a, b) {
@@ -327,11 +514,41 @@ function stringSimilarity(s1, s2) {
   return (longer.length - levenshtein(longer, shorter)) / longer.length;
 }
 
+/**
+ * Carefully resolves the exact product variant inside a Brand Group (e.g. LUCAN-R 200 vs 150 vs 50 vs 35ml)
+ * Supports both built-in rules AND dynamic variant matching for newly added products in any group!
+ */
 function resolveBrandFamilyVariant(family, rawTextLower) {
   const byCode = (c) => activeProducts.find((p) => String(p.code).toUpperCase() === String(c).toUpperCase());
   const text = rawTextLower.replace(/([a-zA-Z])(\d)/g, '$1 $2').replace(/(\d)([a-zA-Z])/g, '$1 $2');
+  const familyUpper = String(family || '').trim().toUpperCase();
+  const groupProducts = activeProducts.filter((p) => String(p.family || '').toUpperCase() === familyUpper);
 
-  switch (family) {
+  // Dynamic Variant Check: If group has multiple products and user added a custom variant (or specified an exact strength/ml not equal to the trailing order quantity), check groupProducts!
+  if (groupProducts.length > 1) {
+    // Strip the final order quantity at the end of the line so "lucan r 50" (where 50 is strength) vs "lucan r 200 = 50" (where 200 is strength and 50 is qty) is disambiguated accurately!
+    const textWithoutTrailingQty = text
+      .replace(/[\-:=]+\s*\d+(?:\+\d+)?\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)?\.?\s*$/i, ' ')
+      .replace(/^(\s*[a-z\s\-]+\s+\d+\s*(?:mg|ml|mcg|gm|g|iu)?)\s+\d+\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)?\.?\s*$/i, '$1 ');
+
+    for (const gp of groupProducts) {
+      // Extract distinctive strength/volume numbers from gp.name (excluding pack sizes like 3x10, 4x10)
+      const nameClean = gp.name.replace(/\b\d+\s*[\*x]\s*\d+'?s?\b/gi, ' ').replace(/\b\d+'s\b/gi, ' ');
+      const strengthMatches = [...nameClean.matchAll(/\b(40000|20000|1500|500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\s*(ml|mg|mcg|gm|g|iu)?\b/gi)];
+      for (const sm of strengthMatches) {
+        const numStr = sm[1];
+        const unitStr = (sm[2] || '').toLowerCase();
+        // Check if textWithoutTrailingQty or text explicitly mentions this strength/volume
+        const explicitUnitRegex = unitStr ? new RegExp(`\\b${numStr}\\s*${unitStr}\\b`, 'i') : null;
+        const bareStrengthRegex = new RegExp(`\\b${numStr}\\b`, 'i');
+        if ((explicitUnitRegex && explicitUnitRegex.test(text)) || bareStrengthRegex.test(textWithoutTrailingQty)) {
+          return gp;
+        }
+      }
+    }
+  }
+
+  switch (familyUpper) {
     case 'DOMIREN': {
       if (/\b(tab|tap|tb|tablet|fc|10\s*mg)\b/i.test(text)) return byCode('60');
       if (/\b60\s*(ml)?\b/i.test(text) && !/\b100\s*ml\b/i.test(text)) return byCode('286');
@@ -419,7 +636,7 @@ function resolveBrandFamilyVariant(family, rawTextLower) {
       return byCode('18');
     }
     default: {
-      return activeProducts.find((p) => p.family === family) || null;
+      return groupProducts[0] || activeProducts.find((p) => p.family === familyUpper) || null;
     }
   }
 }
@@ -434,7 +651,7 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'XAMIC', regex: /\b(xamic|xmaic|examic|zamic)\b/i },
   { family: 'RECOF', regex: /\b(recof|recop|rekof)\b/i },
   { family: 'TRULAX', regex: /\b(trul[ae]x|tulax|trulux)\b/i },
-  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luen\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*150)\b/i },
+  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luncan\s*[\-_]?r?|luen\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*150)\b/i },
   { family: 'FLONTIN', regex: /\b(fl?ont[ie]ne?|foltin|flotin|falntin)\b/i },
   { family: 'NORMANAL', regex: /\b(norm[ao]n[ao]l|narmonal|nomanal|normal\s*500|normal(?=\s*[\-:=]?\s*\d))\b/i },
   { family: 'FUROCEF', regex: /\b(fe?uroc[ce]fe?|furosef|reocef)\b/i },
@@ -488,8 +705,9 @@ function matchCRPProduct(rawLine) {
     return null;
   }
 
-  // 1. Check Custom / Learned Aliases in activeProducts first (longest alias first so specific sizes/spellings win)
   const cleanNormSpace = ` ${normalized.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()} `;
+
+  // 1. Check Custom / Learned Aliases in activeProducts first
   let bestAliasProd = null;
   let bestAliasLen = 0;
 
@@ -513,15 +731,43 @@ function matchCRPProduct(rawLine) {
   }
 
   if (bestAliasProd) {
-    // If alias did not specify size, allow family variant disambiguation when size is present in normalized
-    const hasSizeInAlias = /\b(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\b/.test(String(bestAliasProd.name));
-    const resolved = hasSizeInAlias
-      ? (resolveBrandFamilyVariant(bestAliasProd.family, normalized) || bestAliasProd)
-      : bestAliasProd;
+    // Always pass through resolveBrandFamilyVariant so if a group sibling has a different strength (e.g. "luen 150" vs "luen 200"), the exact variant is selected!
+    const resolved = resolveBrandFamilyVariant(bestAliasProd.family, normalized) || bestAliasProd;
     return { product: resolved, matchType: 'Alias/Learned', confidence: 0.99 };
   }
 
-  // 2. Check Brand Family Regex Patterns
+  // 2. Check Product Brand Groups (masterDb.productGroups) Shared Keywords!
+  //    If ANY keyword in a Product Group (e.g. "luen" or "luncanr" in LUCAN-R group) appears in the line,
+  //    resolve the exact variant (200mg vs 150mg vs 50mg vs 35ml) from that group!
+  let bestGroup = null;
+  let bestGroupKwLen = 0;
+  for (const grp of activeProductGroups || []) {
+    for (const kw of grp.keywords || []) {
+      const cleanKw = String(kw || '')
+        .replace(/([a-zA-Z])(\d)/g, '$1 $2')
+        .replace(/(\d)([a-zA-Z])/g, '$1 $2')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (cleanKw.length < 3) continue;
+      if (cleanNormSpace.includes(` ${cleanKw} `)) {
+        if (cleanKw.length > bestGroupKwLen) {
+          bestGroupKwLen = cleanKw.length;
+          bestGroup = grp;
+        }
+      }
+    }
+  }
+
+  if (bestGroup) {
+    const resolvedFromGroup = resolveBrandFamilyVariant(bestGroup.groupName, normalized);
+    if (resolvedFromGroup) {
+      return { product: resolvedFromGroup, matchType: `Group (${bestGroup.groupName})`, confidence: 0.98 };
+    }
+  }
+
+  // 3. Check Brand Family Regex Patterns
   for (const item of BRAND_FAMILY_PATTERNS) {
     if (item.regex.test(normalized)) {
       const product = resolveBrandFamilyVariant(item.family, normalized);
@@ -531,7 +777,7 @@ function matchCRPProduct(rawLine) {
     }
   }
 
-  // 3. Check Direct Product Name Prefix
+  // 4. Check Direct Product Name Prefix
   for (const prod of activeProducts) {
     const cleanProdName = prod.name.toLowerCase().split(/\s+/)[0];
     if (cleanProdName.length >= 4 && normalized.includes(cleanProdName)) {
@@ -540,7 +786,7 @@ function matchCRPProduct(rawLine) {
     }
   }
 
-  // 4. Fuzzy Token Similarity across all Product Names & Aliases
+  // 5. Fuzzy Token Similarity across all Product Groups, Product Names & Aliases
   const STOP_WORDS = new Set([
     'syp', 'syr', 'sry', 'srp', 'syrup', 'syrap', 'syraf', 'sy', 'susp', 'tab', 'tap', 'tb', 'tablet',
     'cap', 'caps', 'capsule', 'cream', 'crem', 'creem', 'crm', 'ointment', 'ta', 'tah', 'pes', 'pcs',
@@ -563,6 +809,22 @@ function matchCRPProduct(rawLine) {
   let bestScore = 0;
 
   for (const token of tokens) {
+    // Check similarity against Product Group keywords too
+    for (const grp of activeProductGroups || []) {
+      for (const kw of grp.keywords || []) {
+        const kwWord = kw.split(/\s+/)[0].toLowerCase();
+        if (kwWord.length < 4) continue;
+        const sim = stringSimilarity(token, kwWord);
+        if (sim > bestScore) {
+          const candProd = resolveBrandFamilyVariant(grp.groupName, normalized);
+          if (candProd) {
+            bestScore = sim;
+            bestMatch = candProd;
+          }
+        }
+      }
+    }
+
     for (const prod of activeProducts) {
       const candidateAliases = [
         prod.name.split(/\s+/)[0].toLowerCase(),
@@ -1301,14 +1563,14 @@ function parseWhatsAppOrderMessage({
 }
 
 // ============================================================================
-// 7. 3-STAGE AUTO-RETRY IMAGE OCR + KEYLESS VISION AI FALLBACK ENGINE
+// 7. 5-STAGE AUTO-RETRY IMAGE OCR + 2 KEYLESS VISION AI ENGINES + FIFO QUEUE
 // ============================================================================
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 16000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 18000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -1318,11 +1580,34 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 16000) {
   }
 }
 
+// Sequential FIFO Queue for Burst Image Orders (processes 1 image at a time so sending 10 images at once NEVER causes rate-limit or memory errors!)
+let imageProcessingChain = Promise.resolve();
+let pendingImageQueueCount = 0;
+
+function enqueueImageOrderTask(taskFn) {
+  pendingImageQueueCount++;
+  const runTask = async () => {
+    try {
+      await taskFn();
+    } catch (err) {
+      addLog(`❌ Queued Image Task Error: ${err.message}`);
+    } finally {
+      pendingImageQueueCount = Math.max(0, pendingImageQueueCount - 1);
+      // Cool-down pause between consecutive burst images so free OCR/Vision APIs never rate-limit
+      if (pendingImageQueueCount > 0) {
+        await sleep(1400);
+      }
+    }
+  };
+  imageProcessingChain = imageProcessingChain.then(runTask, runTask);
+  return imageProcessingChain;
+}
+
 /**
- * Call OCR.space with configurable engine (Engine 2 = Handwriting/Camera, Engine 1 = Fast Printed/Contrast)
+ * Method 1, 2, 3 helper: Call OCR.space with configurable engine & parameters
  */
-async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true') {
-  const ocrKey = (process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
+async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true', customKey = '') {
+  const ocrKey = (customKey || process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
   const formBody = new URLSearchParams();
   formBody.append('apikey', ocrKey);
   formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
@@ -1337,7 +1622,7 @@ async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTabl
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody.toString()
-  }, 15000);
+  }, 16000);
   const json = await res.json();
   return (json?.ParsedResults || [])
     .map((r) => r.ParsedText || '')
@@ -1346,22 +1631,23 @@ async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTabl
 }
 
 /**
- * Keyless Free Vision AI Fallback (Pollinations OpenAI-Compatible Multimodal Vision Endpoint)
- * Works with ZERO API Key or account setup!
+ * Method 4 & 5 helper: Keyless Free Multimodal Vision AI (Pollinations OpenAI-Compatible Vision Endpoint)
+ * Supports multiple vision models ('openai', 'openai-large', 'claude-hybridspace') with ZERO API Key!
  */
-async function runKeylessVisionAiFallback(base64Image, mimeType) {
-  const productHint = activeProducts.slice(0, 45).map((p) => p.name.split(' ')[0]).join(', ');
+async function runKeylessVisionAiModel(base64Image, mimeType, modelName = 'openai') {
+  const brandGroupsHint = (activeProductGroups || []).slice(0, 45).map((g) => g.groupName).join(', ');
   const promptText =
     'Read this handwritten or printed pharmaceutical order sheet photo from Bangladesh (Renata PLC). ' +
-    'Extract and output ONLY the raw order lines: include DA Code (e.g. CF9054, RF20363, C122210), ' +
-    'Customer/Pharmacy Name, PSO Code, and each Medicine Name with its ordered Quantity on the same line (e.g. "Totifen 50", "Doxicap 10", "Domiren 100ml 20"). ' +
-    `Common medicine names include: ${productHint}. Output plain text lines only, no commentary.`;
+    'Extract and output ONLY the raw order lines: include DA Code (e.g. CF9054, RF9084, C122210), ' +
+    'Customer/Pharmacy Name, PSO Code, and each Medicine Name with its strength/ml and ordered Quantity on the same line ' +
+    '(e.g. "Totifen 50", "Doxicap = 100 pes", "Lucan R 200 = 40P", "Domiren 100ml 20"). ' +
+    `Known medicine brands include: ${brandGroupsHint}. Output plain text lines only, no markdown or commentary.`;
 
   const res = await fetchWithTimeout('https://text.pollinations.ai/openai', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'openai',
+      model: modelName,
       messages: [
         {
           role: 'user',
@@ -1373,7 +1659,7 @@ async function runKeylessVisionAiFallback(base64Image, mimeType) {
       ],
       temperature: 0.1
     })
-  }, 20000);
+  }, 22000);
 
   if (!res.ok) return '';
   const data = await res.json();
@@ -1406,7 +1692,7 @@ async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
           }],
           generationConfig: { temperature: 0.1 }
         })
-      }, 15000);
+      }, 16000);
       const data = await response.json();
       const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
       if (extracted) return { text: extracted, engine: `Gemini Vision (${modelName})` };
@@ -1416,9 +1702,8 @@ async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
 }
 
 /**
- * 3-Stage Server-Side Auto-Retry + Keyless Vision AI Pipeline:
- * Automatically checks and parses the image up to 3+ times across different OCR & AI Vision engines
- * BEFORE returning failure, so the user NEVER has to resend an image multiple times!
+ * 5-Stage Server-Side Auto-Retry + Dual Keyless Vision AI Pipeline:
+ * Automatically checks the image across 5 distinct keyless OCR & AI Vision methods before ever returning an error!
  */
 async function processImageOrderWithThreeRetries({
   imageBuffer,
@@ -1434,40 +1719,52 @@ async function processImageOrderWithThreeRetries({
   const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
   const collectedTexts = [];
 
-  // Define the 3 automatic retry stages + final keyless AI Vision stage
   const stages = [
     {
-      name: 'Attempt 1/3 (Neural Handwriting & Table OCR Engine 2)',
+      name: 'Method 1/5 (Neural Handwriting & Table OCR Engine 2)',
       run: async () => {
         if (geminiKey) {
           const g = await runGeminiVisionPass(base64Image, mimeType, geminiKey);
           if (g && g.text) return g;
         }
         const t = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
-        return { text: t, engine: 'Cloud OCR Engine 2 (Table Mode)' };
+        return { text: t, engine: 'Method 1: Neural Table OCR (Engine 2)' };
       }
     },
     {
-      name: 'Attempt 2/3 (Auto-Recheck: Raw Line Handwriting OCR + Orientation Engine 1)',
+      name: 'Method 2/5 (Raw Line-by-Line Camera Handwriting OCR Engine 2)',
       run: async () => {
         const t2Raw = await runOcrSpacePass(base64Image, mimeType, '2', 'false');
+        return { text: t2Raw, engine: 'Method 2: Raw Line Camera OCR (Engine 2)' };
+      }
+    },
+    {
+      name: 'Method 3/5 (High-Contrast & Auto-Orientation OCR Engine 1)',
+      run: async () => {
         const t1 = await runOcrSpacePass(base64Image, mimeType, '1', 'true');
+        const t1Raw = await runOcrSpacePass(base64Image, mimeType, '1', 'false');
         return {
-          text: [t2Raw, t1].filter(Boolean).join('\n'),
-          engine: 'Cloud OCR Engine 1+2 (Multi-Pass)'
+          text: [t1, t1Raw].filter(Boolean).join('\n'),
+          engine: 'Method 3: High-Contrast Orientation OCR (Engine 1)'
         };
       }
     },
     {
-      name: 'Attempt 3/3 (Auto-Recheck: Keyless AI Vision Fallback — Zero API Key)',
+      name: 'Method 4/5 (Keyless Multimodal Vision AI #1 — GPT-4o Vision)',
       run: async () => {
-        const aiText = await runKeylessVisionAiFallback(base64Image, mimeType);
-        if (aiText) {
-          return { text: aiText, engine: 'Keyless Vision AI (GPT-4o Vision Fallback)' };
+        const aiText = await runKeylessVisionAiModel(base64Image, mimeType, 'openai');
+        return { text: aiText, engine: 'Method 4: Keyless Vision AI #1 (GPT-4o Vision)' };
+      }
+    },
+    {
+      name: 'Method 5/5 (Keyless Multimodal Vision AI #2 — Large Vision + Consensus)',
+      run: async () => {
+        const aiLarge = await runKeylessVisionAiModel(base64Image, mimeType, 'openai-large');
+        if (aiLarge) {
+          return { text: aiLarge, engine: 'Method 5: Keyless Vision AI #2 (Large Vision)' };
         }
-        // Final retry on OCR Engine 2 if Vision endpoint was unreachable
-        const tRetry = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
-        return { text: tRetry, engine: 'Cloud OCR Engine 2 (Retry 3)' };
+        const tFinal = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
+        return { text: tFinal, engine: 'Method 5: Final Deep Recheck OCR' };
       }
     }
   ];
@@ -1476,8 +1773,8 @@ async function processImageOrderWithThreeRetries({
     const stage = stages[i];
     try {
       if (i > 0) {
-        addLog(`🔄 Image Recheck [${stage.name}] running automatically...`);
-        await sleep(1200);
+        addLog(`🔄 Image Auto-Recheck [${stage.name}] running...`);
+        await sleep(1100);
       }
       const res = await stage.run();
       const rawExtracted = (res?.text || '').trim();
@@ -1512,7 +1809,7 @@ async function processImageOrderWithThreeRetries({
     }
   }
 
-  // Final Combined Pass: If individual passes had partial text (e.g. DA ID in Pass 1 and Product in Pass 2), try combined text!
+  // Final Combined Consensus Pass across all 5 methods
   if (collectedTexts.length > 1) {
     const mergedAll = [caption, ...collectedTexts].filter(Boolean).join('\n');
     const parsedMerged = parseWhatsAppOrderMessage({
@@ -1521,22 +1818,22 @@ async function processImageOrderWithThreeRetries({
       timestamp,
       senderPhone,
       senderPushName,
-      senderJid
+      senderJid,
+      isImageOrder: true
     });
     if ((parsedMerged.isOrder && parsedMerged.orders.length > 0) || (parsedMerged.unrecognizedItems && parsedMerged.unrecognizedItems.length > 0)) {
-      // Deduplicate by crpCode + orderedQty in case multiple passes extracted the same line
       const seen = new Set();
-      parsedMerged.orders = parsedMerged.orders.filter((o) => {
+      parsedMerged.orders = (parsedMerged.orders || []).filter((o) => {
         const k = `${o.crpCode}_${o.orderedQty}`;
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
       });
-      addLog(`✅ Image Order succeeded via Combined Multi-Pass Text (${parsedMerged.orders.length} items).`);
+      addLog(`✅ Image Order succeeded via 5-Method Combined Consensus (${parsedMerged.orders.length} items).`);
       return {
         ok: true,
-        attemptUsed: 3,
-        engine: 'Combined Multi-Pass OCR',
+        attemptUsed: 5,
+        engine: '5-Method Combined Consensus',
         extractedText: mergedAll,
         parsed: parsedMerged
       };
@@ -1545,8 +1842,8 @@ async function processImageOrderWithThreeRetries({
 
   return {
     ok: false,
-    attemptUsed: 3,
-    engine: 'All 3 Retries Exhausted',
+    attemptUsed: 5,
+    engine: 'All 5 Methods Exhausted',
     extractedText: collectedTexts.join('\n').trim(),
     parsed: null
   };
@@ -2277,6 +2574,50 @@ function addLog(msg) {
  * 2) The origin chat/group (if different from the Admin DM) quoting the original message
  * And registers ALL sent message IDs in pendingQuestionMsgIdMap so replying in EITHER chat works 100%!
  */
+// Cache of sent WhatsApp messages (msgId -> proto.IMessage) so Baileys can fulfill retry receipts
+// This permanently fixes "Waiting for this message. This may take a while." on WhatsApp!
+const sentMessagesCache = new Map();
+let sendMsgMutex = Promise.resolve();
+
+function cacheSentProtoMessage(sentObj, fallbackText = '') {
+  if (!sentObj?.key?.id) return;
+  const msgContent = sentObj.message || (fallbackText ? { conversation: fallbackText } : { conversation: 'CRP Bot' });
+  sentMessagesCache.set(sentObj.key.id, msgContent);
+  if (sentMessagesCache.size > 400) {
+    const oldestKey = sentMessagesCache.keys().next().value;
+    if (oldestKey) sentMessagesCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Serializes all outgoing WhatsApp messages through a sequential mutex queue
+ * and caches the proto.IMessage for retry receipts so Signal sessions NEVER collide or show "Waiting for this message"!
+ */
+function safeSendMessage(jid, content, options = undefined) {
+  const runSend = async () => {
+    if (!sock || waStatus !== 'CONNECTED' || !jid) return null;
+    try {
+      if (typeof sock.assertSessions === 'function' && !jid.endsWith('@g.us')) {
+        try {
+          await sock.assertSessions([jid], false);
+        } catch (e) {}
+      }
+      const sent = await sock.sendMessage(jid, content, options);
+      if (sent?.key?.id) {
+        cacheSentProtoMessage(sent, content?.text || '');
+      }
+      await sleep(220);
+      return sent;
+    } catch (err) {
+      addLog(`⚠️ safeSendMessage warning (${jid}): ${err.message}`);
+      return null;
+    }
+  };
+  const p = sendMsgMutex.then(runSend, runSend);
+  sendMsgMutex = p.catch(() => null);
+  return p;
+}
+
 async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
   if (item.originMsg?.key?.id) {
     pendingQuestionMsgIdMap.set(item.originMsg.key.id, item.token);
@@ -2287,24 +2628,24 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
   }
 
   const sentToJids = new Set();
+  const senderNormPhone = normalizeBdPhone(item.senderPhone || '');
 
   // 1. Send in the chat where the order was posted (quoting the order message)
   if (item.originRemoteJid) {
-    try {
-      const sentOrigin = await sock.sendMessage(
-        item.originRemoteJid,
-        { text: promptText },
-        item.originMsg ? { quoted: item.originMsg } : undefined
-      );
-      if (sentOrigin?.key?.id) {
-        pendingQuestionMsgIdMap.set(sentOrigin.key.id, item.token);
-      }
-      sentToJids.add(item.originRemoteJid);
-      addLog(`📲 Sent prompt [${item.token}] in origin chat (${item.originRemoteJid})`);
-    } catch (e) {}
+    const sentOrigin = await safeSendMessage(
+      item.originRemoteJid,
+      { text: promptText },
+      item.originMsg ? { quoted: item.originMsg } : undefined
+    );
+    if (sentOrigin?.key?.id) {
+      pendingQuestionMsgIdMap.set(sentOrigin.key.id, item.token);
+    }
+    sentToJids.add(item.originRemoteJid);
+    addLog(`📲 Sent prompt [${item.token}] in origin chat (${item.originRemoteJid})`);
   }
 
-  // 2. Also send to all Admin Alert Numbers (01793362829, etc.) in DM if not already sent there
+  // 2. Send to Admin Alert Numbers (01793362829) in DM ONLY if the message wasn't already sent in that Admin's DM
+  //    or if someone else in a group triggered the prompt!
   const adminPhones = getAdminAlertPhones();
   for (const ph of adminPhones) {
     const normPh = normalizeBdPhone(ph);
@@ -2312,20 +2653,22 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
     const dmJid = `${normPh}@s.whatsapp.net`;
     if (sentToJids.has(dmJid)) continue;
 
-    // Also check if originRemoteJid is the LID DM of this same admin phone
     const originRaw = (item.originRemoteJid || '').split('@')[0].split(':')[0];
-    if (lidToPhoneMap.get(originRaw) === normPh) continue;
-
-    try {
-      const sentDm = await sock.sendMessage(dmJid, { text: promptText });
-      if (sentDm?.key?.id) {
-        pendingQuestionMsgIdMap.set(sentDm.key.id, item.token);
-      }
-      sentToJids.add(dmJid);
-      addLog(`📲 Sent prompt [${item.token}] to Admin DM +${normPh}`);
-    } catch (err) {
-      addLog(`⚠️ Could not DM prompt [${item.token}] to +${normPh}: ${err.message}`);
+    if (lidToPhoneMap.get(originRaw) === normPh || normalizeBdPhone(originRaw) === normPh) {
+      continue;
     }
+    // If the Admin themselves sent the message in the group and we already quoted them in the group,
+    // don't double-send to their @s.whatsapp.net DM at the same instant (prevents @lid vs @s.whatsapp.net Signal collision!)
+    if (item.originRemoteJid && senderNormPhone === normPh) {
+      continue;
+    }
+
+    const sentDm = await safeSendMessage(dmJid, { text: promptText });
+    if (sentDm?.key?.id) {
+      pendingQuestionMsgIdMap.set(sentDm.key.id, item.token);
+    }
+    sentToJids.add(dmJid);
+    addLog(`📲 Sent prompt [${item.token}] to Admin DM +${normPh}`);
   }
 }
 
@@ -2690,6 +3033,7 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
           family: newName.split(/\s+/)[0],
           aliases: [newName.toLowerCase(), currentUnk.unknownProductText.toLowerCase()]
         };
+        syncProductWithBrandGroup(matchedProd, currentUnk.unknownProductText.toLowerCase());
         masterDb.products.push(matchedProd);
         saveLocalMasterDb();
         scheduleCloudStateBackup(2000);
@@ -2729,12 +3073,13 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       };
     }
 
-    // Learn the wrong spelling into matchedProd.aliases in masterDb.products!
+    // Learn the wrong spelling into matchedProd.aliases AND sync common brand stem to its Product Group!
     const learnedAlias = currentUnk.unknownProductText.toLowerCase().trim();
     if (!matchedProd.aliases) matchedProd.aliases = [];
     if (learnedAlias && !matchedProd.aliases.includes(learnedAlias)) {
       matchedProd.aliases.push(learnedAlias);
     }
+    const syncedGroup = syncProductWithBrandGroup(matchedProd, learnedAlias);
     saveLocalMasterDb();
     scheduleCloudStateBackup(2000);
 
@@ -3020,7 +3365,12 @@ async function startWhatsApp() {
       syncFullHistory: false,
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
-      getMessage: async () => undefined
+      getMessage: async (key) => {
+        if (key?.id && sentMessagesCache.has(key.id)) {
+          return sentMessagesCache.get(key.id);
+        }
+        return { conversation: 'CRP Order Bot Message' };
+      }
     });
 
     sock.ev.on('creds.update', async () => {
@@ -3237,7 +3587,7 @@ async function startWhatsApp() {
 
               if (sock && resOut?.message) {
                 try {
-                  const sentConfirm = await sock.sendMessage(remoteJid, { text: resOut.message }, { quoted: msg });
+                  const sentConfirm = await safeSendMessage(remoteJid, { text: resOut.message }, { quoted: msg });
                   if (sentConfirm?.key?.id) {
                     if (resOut.needsMoreInput && resOut.nextPromptToken) {
                       pendingQuestionMsgIdMap.set(sentConfirm.key.id, resOut.nextPromptToken);
@@ -3245,9 +3595,8 @@ async function startWhatsApp() {
                       cancellableOrderMap.set(sentConfirm.key.id, pItem.whatsappMsgId);
                     }
                   }
-                  // If Admin replied in DM and the order originated in a Group, also notify the Group!
                   if (!resOut.needsMoreInput && resOut.ok && pItem?.originRemoteJid && pItem.originRemoteJid !== remoteJid) {
-                    const sentGrp = await sock.sendMessage(
+                    const sentGrp = await safeSendMessage(
                       pItem.originRemoteJid,
                       { text: resOut.message },
                       pItem.originMsg ? { quoted: pItem.originMsg } : undefined
@@ -3326,111 +3675,110 @@ async function startWhatsApp() {
               continue;
             }
 
-            addLog(`📸 Authorized image received from +${senderPhone || rawSenderId}. Starting 3-Stage OCR Pipeline...`);
+            addLog(`📥 Image received from +${senderPhone || rawSenderId}. Added to Sequential Image Queue (Queue size: ${pendingImageQueueCount + 1})...`);
             if (sock) {
               try {
                 await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
               } catch (e) {}
             }
 
-            let imageBuffer = null;
-            try {
-              imageBuffer = await downloadMediaMessage(
-                msg,
-                'buffer',
-                {},
-                { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-              );
-            } catch (dlErr) {
-              addLog(`❌ Failed to download image media: ${dlErr.message}`);
-              continue;
-            }
+            // Process images strictly ONE BY ONE in a sequential FIFO queue so sending multiple images at once never causes errors!
+            enqueueImageOrderTask(async () => {
+              addLog(`📸 Processing queued image (${inspected.msgId}) via 5-Method OCR & Vision Pipeline...`);
+              let imageBuffer = null;
+              try {
+                imageBuffer = await downloadMediaMessage(
+                  msg,
+                  'buffer',
+                  {},
+                  { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+                );
+              } catch (dlErr) {
+                addLog(`❌ Failed to download image media: ${dlErr.message}`);
+                return;
+              }
 
-            const ocrPipelineResult = await processImageOrderWithThreeRetries({
-              imageBuffer,
-              mimeType: inspected.mimeType,
-              caption: inspected.caption,
-              messageId: inspected.msgId,
-              timestamp: msgTimestamp,
-              senderPhone,
-              senderPushName,
-              senderJid
-            });
-            imageBuffer = null;
+              const ocrPipelineResult = await processImageOrderWithThreeRetries({
+                imageBuffer,
+                mimeType: inspected.mimeType,
+                caption: inspected.caption,
+                messageId: inspected.msgId,
+                timestamp: msgTimestamp,
+                senderPhone,
+                senderPushName,
+                senderJid
+              });
+              imageBuffer = null;
 
-            const parsedImg = ocrPipelineResult.parsed;
+              const parsedImg = ocrPipelineResult.parsed;
 
-            if (ocrPipelineResult.ok && parsedImg && ((parsedImg.orders && parsedImg.orders.length > 0) || (parsedImg.unrecognizedItems && parsedImg.unrecognizedItems.length > 0))) {
-              const orders = parsedImg.orders || [];
-              const unrecognized = parsedImg.unrecognizedItems || [];
-              const daInfo = parsedImg.daInfo;
+              if (ocrPipelineResult.ok && parsedImg && ((parsedImg.orders && parsedImg.orders.length > 0) || (parsedImg.unrecognizedItems && parsedImg.unrecognizedItems.length > 0))) {
+                const orders = parsedImg.orders || [];
+                const unrecognized = parsedImg.unrecognizedItems || [];
+                const daInfo = parsedImg.daInfo;
 
-              // Check if EITHER DA is unknown OR there is any unrecognized product spelling:
-              // Hold the entire order until Admin replies and fixes it, THEN save to Google Sheets!
-              const needsHold = (daInfo && !daInfo.isKnownDA) || unrecognized.length > 0;
+                const needsHold = (daInfo && !daInfo.isKnownDA) || unrecognized.length > 0;
 
-              if (needsHold) {
-                await createPendingOrderResolution({
-                  parsedResult: parsedImg,
-                  rawText: ocrPipelineResult.extractedText || inspected.caption,
-                  senderPhone,
-                  senderPushName,
-                  rawSenderId,
-                  originRemoteJid: remoteJid,
-                  originMsg: msg,
-                  isImageOrder: true
-                });
-              } else if (orders.length > 0) {
-                // Everything (DA + all Products) is known -> Save immediately to Google Sheets!
-                await appendOrdersToSheet(orders);
+                if (needsHold) {
+                  await createPendingOrderResolution({
+                    parsedResult: parsedImg,
+                    rawText: ocrPipelineResult.extractedText || inspected.caption,
+                    senderPhone,
+                    senderPushName,
+                    rawSenderId,
+                    originRemoteJid: remoteJid,
+                    originMsg: msg,
+                    isImageOrder: true
+                  });
+                } else if (orders.length > 0) {
+                  await appendOrdersToSheet(orders);
 
-                cancellableOrderMap.set(inspected.msgId, inspected.msgId);
-                lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
-                if (senderPhone) lastOrderBySenderMap.set(senderPhone, inspected.msgId);
+                  cancellableOrderMap.set(inspected.msgId, inspected.msgId);
+                  lastOrderBySenderMap.set(rawSenderId, inspected.msgId);
+                  if (senderPhone) lastOrderBySenderMap.set(senderPhone, inspected.msgId);
 
-                const replyText = buildImageOrderReplyMessage(
-                  orders,
-                  ocrPipelineResult.engine,
-                  ocrPipelineResult.attemptUsed
+                  const replyText = buildImageOrderReplyMessage(
+                    orders,
+                    ocrPipelineResult.engine,
+                    ocrPipelineResult.attemptUsed
+                  );
+                  const sentReply = await safeSendMessage(
+                    remoteJid,
+                    { text: replyText },
+                    { quoted: msg }
+                  );
+                  if (sentReply?.key?.id) {
+                    cancellableOrderMap.set(sentReply.key.id, inspected.msgId);
+                  }
+                  if (sock) {
+                    try {
+                      await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                    } catch (e) {}
+                  }
+                }
+              } else {
+                addLog(
+                  `❌ All 5 OCR/Vision methods found no valid CRP order. Extracted: "${(ocrPipelineResult.extractedText || '').replace(/\n/g, ' | ').slice(0, 180)}"`
                 );
                 if (sock) {
                   try {
-                    const sentReply = await sock.sendMessage(
-                      remoteJid,
-                      { text: replyText },
-                      { quoted: msg }
-                    );
-                    if (sentReply?.key?.id) {
-                      cancellableOrderMap.set(sentReply.key.id, inspected.msgId);
-                    }
-                    await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
-                  } catch (sendErr) {
-                    addLog(`⚠️ Could not send confirmation reply: ${sendErr.message}`);
-                  }
+                    await sock.sendMessage(remoteJid, { react: { text: '⚠️', key: msg.key } });
+                  } catch (e) {}
                 }
+                await safeSendMessage(
+                  remoteJid,
+                  {
+                    text:
+                      '⚠️ *ছবিটি ৫টি ভিন্ন পদ্ধতিতে (OCR + Dual AI Vision) চেক করার পরও কোনো CRP প্রোডাক্টের অর্ডার পাওয়া যায়নি।*\n' +
+                      'অনুগ্রহ করে খাতার লেখাটি আরেকটু পরিষ্কার করে ছবি তুলে পাঠান।' +
+                      (ocrPipelineResult.extractedText
+                        ? `\n\n_শনাক্তকৃত লেখা:_\n${ocrPipelineResult.extractedText.slice(0, 220)}`
+                        : '')
+                  },
+                  { quoted: msg }
+                );
               }
-            } else {
-              addLog(
-                `❌ All 3 OCR retries & Vision AI fallback found no valid CRP order. Extracted: "${(ocrPipelineResult.extractedText || '').replace(/\n/g, ' | ').slice(0, 180)}"`
-              );
-              if (sock) {
-                try {
-                  await sock.sendMessage(remoteJid, { react: { text: '⚠️', key: msg.key } });
-                  await sock.sendMessage(
-                    remoteJid,
-                    {
-                      text:
-                        '⚠️ *ছবিটি ৩ বার অটো-রিচেক ও AI Vision দিয়ে চেক করার পরও কোনো CRP প্রোডাক্টের অর্ডার পাওয়া যায়নি।*\n' +
-                        'অনুগ্রহ করে খাতার লেখাটি আরেকটু পরিষ্কার করে ছবি তুলে পাঠান।' +
-                        (ocrPipelineResult.extractedText
-                          ? `\n\n_শনাক্তকৃত লেখা:_\n${ocrPipelineResult.extractedText.slice(0, 220)}`
-                          : '')
-                    },
-                    { quoted: msg }
-                  );
-                } catch (e) {}
-              }
-            }
+            });
             continue;
           }
 
@@ -3640,11 +3988,79 @@ app.get('/api/master-db', (req, res) => {
     ok: true,
     das: masterDb.das,
     products: masterDb.products,
+    productGroups: masterDb.productGroups || [],
+    imageQueueCount: pendingImageQueueCount,
     adminAlertPhones: getAdminAlertPhones(),
     authorizedImagePhones: getAuthorizedImagePhones(),
     pendingResolutions: Array.from(pendingResolutions.values()),
     updatedAt: masterDb.updatedAt
   });
+});
+
+// Product Brand Group CRUD Endpoints (Add / Edit / Add Keyword / Delete Group)
+app.post('/api/product-group/save', (req, res) => {
+  const { groupName, keywords } = req.body || {};
+  const cleanGroup = String(groupName || '').trim().toUpperCase();
+  if (!cleanGroup) {
+    return res.status(400).json({ ok: false, error: 'গ্রুপের নাম (Group Name) দিতে হবে।' });
+  }
+  const cleanKeywords = Array.from(
+    new Set(
+      [
+        cleanGroup.toLowerCase(),
+        ...(Array.isArray(keywords) ? keywords : String(keywords || '').split(','))
+          .map((k) => String(k || '').trim().toLowerCase())
+          .filter(Boolean)
+      ]
+    )
+  );
+  if (!Array.isArray(masterDb.productGroups)) masterDb.productGroups = [];
+  const idx = masterDb.productGroups.findIndex((g) => g.groupName.toUpperCase() === cleanGroup);
+  if (idx >= 0) {
+    masterDb.productGroups[idx].keywords = cleanKeywords;
+    addLog(`🗂️ Updated Product Group [${cleanGroup}] (${cleanKeywords.length} keywords)`);
+  } else {
+    masterDb.productGroups.unshift({ groupName: cleanGroup, keywords: cleanKeywords });
+    addLog(`➕ Created New Product Group [${cleanGroup}]`);
+  }
+  saveLocalMasterDb();
+  scheduleCloudStateBackup(1500);
+  res.json({ ok: true, productGroups: masterDb.productGroups });
+});
+
+app.post('/api/product-group/keyword', (req, res) => {
+  const { groupName, keyword, action } = req.body || {};
+  const cleanGroup = String(groupName || '').trim().toUpperCase();
+  const cleanKw = String(keyword || '').trim().toLowerCase();
+  const grp = (masterDb.productGroups || []).find((g) => g.groupName.toUpperCase() === cleanGroup);
+  if (!grp) return res.status(404).json({ ok: false, error: 'Group not found' });
+  if (!grp.keywords) grp.keywords = [];
+
+  if (action === 'remove') {
+    grp.keywords = grp.keywords.filter((k) => k.toLowerCase() !== cleanKw);
+  } else if (cleanKw) {
+    const stem = extractCommonBrandStem(cleanKw) || cleanKw;
+    if (!grp.keywords.includes(stem)) grp.keywords.push(stem);
+    if (!grp.keywords.includes(cleanKw)) grp.keywords.push(cleanKw);
+  }
+  saveLocalMasterDb();
+  scheduleCloudStateBackup(1500);
+  res.json({ ok: true, group: grp });
+});
+
+app.post('/api/product-group/delete', (req, res) => {
+  const { groupName, resetDefault } = req.body || {};
+  if (resetDefault) {
+    masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
+    saveLocalMasterDb();
+    scheduleCloudStateBackup(1500);
+    return res.json({ ok: true, productGroups: masterDb.productGroups });
+  }
+  const cleanGroup = String(groupName || '').trim().toUpperCase();
+  masterDb.productGroups = (masterDb.productGroups || []).filter((g) => g.groupName.toUpperCase() !== cleanGroup);
+  saveLocalMasterDb();
+  scheduleCloudStateBackup(1500);
+  res.json({ ok: true, productGroups: masterDb.productGroups });
 });
 
 // Export Master DB as downloadable JSON file
@@ -3779,12 +4195,13 @@ app.post('/api/product/save', async (req, res) => {
     aliases: cleanAliases
   };
 
+  syncProductWithBrandGroup(prodRecord);
   if (existingIdx >= 0) {
     masterDb.products[existingIdx] = prodRecord;
-    addLog(`✏️ Updated Product [${cleanCode}] ${cleanName} (TP: ৳${prodRecord.price}, Aliases: ${cleanAliases.length})`);
+    addLog(`✏️ Updated Product [${cleanCode}] ${cleanName} in Group [${prodRecord.family}] (TP: ৳${prodRecord.price})`);
   } else {
     masterDb.products.unshift(prodRecord);
-    addLog(`➕ Added New Product [${cleanCode}] ${cleanName} (TP: ৳${prodRecord.price})`);
+    addLog(`➕ Added New Product [${cleanCode}] ${cleanName} to Group [${prodRecord.family}] (TP: ৳${prodRecord.price})`);
   }
 
   saveLocalMasterDb();
@@ -3808,7 +4225,8 @@ app.post('/api/product/alias', async (req, res) => {
   } else if (cleanAlias) {
     if (!prod.aliases.includes(cleanAlias)) {
       prod.aliases.push(cleanAlias);
-      addLog(`🧠 Added wrong-spelling alias "${cleanAlias}" -> [${cleanCode}] ${prod.name}`);
+      syncProductWithBrandGroup(prod, cleanAlias);
+      addLog(`🧠 Added wrong-spelling alias "${cleanAlias}" -> [${cleanCode}] ${prod.name} & Group [${prod.family}]`);
     }
   }
 
@@ -4027,7 +4445,7 @@ app.post('/api/whatsapp/logout', async (req, res) => {
 // Serve Neo-Brutalism v5.0 Master Command Center UI at "/"
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v5.0 \u2014 Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    /* Navigation Tabs */\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>\u26a1 Renata PLC (NK Depot) \u2014 CRP Order Bot v5.0</h1>\n        <p>Dynamic JSON Master DB \u2022 Self-Learning WhatsApp Admin Bot (01793362829) \u2022 3x AI OCR</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">\u23f3 WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">\u23f3 Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">\u26a1 RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">\ud83d\udcca Google Sheet \u2197</a>\n      </div>\n    </header>\n\n    <!-- NAVIGATION TABS -->\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">\ud83d\udce1 \u09e7. \u09ac\u099f \u0995\u09a8\u09cd\u099f\u09cd\u09b0\u09cb\u09b2 \u0993 \u09b2\u09be\u0987\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">\ud83d\udc65 \u09e8. \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">\ud83d\udc8a \u09e9. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">\ud83d\udcf1 \u09ea. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0993 \u0987\u09ae\u09c7\u099c \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u099f\u09bf\u0982\u09b8</button>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 1: BOT CONTROL, PENDING RESOLUTIONS, LIVE ORDERS & LOGS         -->\n    <!-- =================================================================== -->\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">\ud83c\udfaf \u09b8\u0995\u09cd\u09b0\u09bf\u09df \u0997\u09cd\u09b0\u09c1\u09aa</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">\ud83d\udce6 \u09ae\u09cb\u099f \u09b8\u09c7\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">\ud83d\udcb0 \u09ae\u09cb\u099f \u0985\u09b0\u09cd\u09a1\u09be\u09b0 (\u09f3)</div>\n          <div class=\"val\" id=\"statAmount\">\u09f30.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">\u2753 \u09aa\u09c7\u09a8\u09cd\u09a1\u09bf\u0982 \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">\ud83d\udcf2 \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u09a8\u09ae\u09cd\u09ac\u09b0</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <!-- PENDING AI QUESTIONS CARD (When unknown DA or unknown Product is waiting for reply) -->\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u0993 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8\u09b8\u09ae\u09c2\u09b9 (WhatsApp 01793362829 \u0985\u09a5\u09ac\u09be \u098f\u0996\u09be\u09a8 \u09a5\u09c7\u0995\u09c7 \u0989\u09a4\u09cd\u09a4\u09b0 \u09a6\u09bf\u09a8)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <!-- WHATSAPP QR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>\u09e7. WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09b6\u09a8</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <!-- GROUP SELECTOR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\u09e8. WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">\ud83d\udd04 \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09ab\u09cd\u09b0\u09c7\u09b6</button>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0986\u09aa\u09a8\u09be\u09b0 WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>\n            </select>\n            <label>\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u09b0\u09cd\u09a6\u09bf\u09b7\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b8\u09c7\u09ad \u09b9\u09b2\u09c7 \u09ae\u09c7\u09b8\u09c7\u099c\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u2705 \u09b0\u09bf\u09df\u09c7\u0995\u09b6\u09a8 \u09a6\u09bf\u09ac\u09c7\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">\ud83d\udcbe Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">\ud83d\udcb2 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n          </div>\n        </div>\n\n        <!-- TEST PARSER -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>\ud83e\uddea \u09e9. \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0993 \u09b8\u09c7\u09b2\u09ab-\u09b2\u09be\u09b0\u09cd\u09a8\u09bf\u0982 \u099f\u09c7\u09b8\u09cd\u099f\u09be\u09b0</span>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09ae\u09c7\u09b8\u09c7\u099c \u09b2\u09bf\u0996\u09c7 \u099f\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09a8\u09be\u09ae/\u0993\u09b7\u09c1\u09a7 \u09a6\u09bf\u09b2\u09c7 01793362829-\u098f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09ac\u09c7):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nCus: Nipun pharmacy E71\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">\ud83d\udd0d Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">\ud83d\ude80 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIVE ORDERS -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udccb \u09b8\u09b0\u09cd\u09ac\u09b6\u09c7\u09b7 \u099f\u09cd\u09b0\u09cd\u09af\u09be\u0995 \u09b9\u0993\u09df\u09be \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09b8\u09ae\u09c2\u09b9 (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">\ud83e\uddf9 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- SERVER LOGS -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udda5\ufe0f \u09b8\u09bf\u09b8\u09cd\u099f\u09c7\u09ae \u09b2\u0997 (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">\ud83e\uddf9 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 2: DA DATABASE MANAGER (ADD / EDIT / DELETE / CLEAR ALL)        -->\n    <!-- =================================================================== -->\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>\u2795 \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">\ud83d\uddd1\ufe0f \u09b8\u09ac DA \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09c1\u09a8 (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (\u09af\u09c7\u09ae\u09a8: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a6\u09c7\u0993\u09df\u09be \u09af\u09be\u09ac\u09c7):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>\u09a1\u09be\u0995\u09a8\u09be\u09ae / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udc65 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a4\u09be\u09b2\u09bf\u0995\u09be (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"\ud83d\udd0d ID, \u09a8\u09be\u09ae \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (Name)</th>\n                  <th>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0</th>\n                  <th>Aliases / \u09a1\u09be\u0995\u09a8\u09be\u09ae</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8 (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 3: PRODUCT & WRONG SPELLING (ALIASES) MANAGER                   -->\n    <!-- =================================================================== -->\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>\ud83d\udc8a \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u09a6\u09be\u09ae \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (\u09af\u09c7\u09ae\u09a8: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09af\u09be\u0995 \u09b8\u09be\u0987\u099c (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (\u09f3 \u09a6\u09b0):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. TOTIFEN\" />\n            </div>\n          </div>\n          <label>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u09b8\u09cd\u099f / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09b2\u09bf\u0996\u09c1\u09a8 \u2014 \u09af\u09c7\u0995\u09cb\u09a8\u09cb \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09b2\u09c7\u0987 \u098f\u0987 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>\ud83d\udc8a \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"\ud83d\udd0d \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae, \u0995\u09cb\u09a1 \u09ac\u09be \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u0993 \u09aa\u09cd\u09af\u09be\u0995</th>\n                  <th>Trade Price (\u09f3)</th>\n                  <th>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09ae\u09c2\u09b9 (Recognized Wrong Spellings / Aliases)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 4: MULTIPLE PHONE NUMBERS & JSON DATABASE BACKUP                -->\n    <!-- =================================================================== -->\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\">\n          <div class=\"card-header h-yellow\">\n            <span>\ud83d\udcf2 \u09e7. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u0993 \u09b0\u09bf\u09aa\u09cd\u09b2\u09be\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7 <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 DA ID/\u09a8\u09be\u09ae</b> \u0985\u09a5\u09ac\u09be <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u0993\u09b7\u09c1\u09a7\u09c7\u09b0 \u09ac\u09be\u09a8\u09be\u09a8</b> \u09aa\u09be\u0993\u09df\u09be \u0997\u09c7\u09b2\u09c7 \u09ac\u099f \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb\u09a4\u09c7 WhatsApp \u09ae\u09c7\u09b8\u09c7\u099c \u09aa\u09be\u09a0\u09bf\u09df\u09c7 \u099c\u09bf\u099c\u09cd\u099e\u09c7\u09b8 \u0995\u09b0\u09ac\u09c7 \u098f\u09ac\u0982 \u098f\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 Reply \u09a6\u09bf\u09b2\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n            </p>\n            <label>\u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\">\n          <div class=\"card-header h-mint\">\n            <span>\ud83d\udcf8 \u09e8. \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0996\u09be\u09a4\u09be\u09df \u09b2\u09bf\u0996\u09c7 \u099b\u09ac\u09bf \u09a4\u09c1\u09b2\u09c7 \u09aa\u09be\u09a0\u09be\u09b2\u09c7 \u09b6\u09c1\u09a7\u09c1\u09ae\u09be\u09a4\u09cd\u09b0 \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 \u09ac\u099f \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b0\u09bf\u09a1 \u0995\u09b0\u09ac\u09c7 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09af\u09a4\u0996\u09c1\u09b6\u09bf \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u09ac\u09be \u09b0\u09bf\u09ae\u09c1\u09ad \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8):\n            </p>\n            <label>\u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u099b\u09ac\u09bf\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udce6 \u09e9. JSON \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09ac\u09cd\u09af\u09be\u0995\u0986\u09aa \u0993 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 (Master DB JSON)</span>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:12px;\">\n            \u0986\u09aa\u09a8\u09be\u09b0 \u09b8\u09ae\u09b8\u09cd\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f, \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09ac\u0982 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09ae\u09c7\u09ae\u09cb\u09b0\u09bf\u09a4\u09c7 \u0993 Google Sheet-\u098f\u09b0 <code>_Bot_State</code>-\u098f \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09b8\u09c7\u09ad \u09a5\u09be\u0995\u09c7\u0964 \u099a\u09be\u0987\u09b2\u09c7 JSON \u09ab\u09be\u0987\u09b2 \u09b9\u09bf\u09b8\u09c7\u09ac\u09c7 \u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1 \u09ac\u09be \u0986\u09aa\u09b2\u09cb\u09a1\u0993 \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8:\n          </p>\n          <div class=\"btn-row\">\n            <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">\u2b07 Download master_db.json</a>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">\ud83d\uddd1\ufe0f Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a8\u09bf\u09b6\u09cd\u099a\u09bf\u09a4 \u09af\u09c7 [${daId}] \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09a5\u09c7\u0995\u09c7 \u09b8\u09ac \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (All DAs) \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">\u09f3${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"\u09ae\u09c1\u099b\u09c1\u09a8\">\u00d7</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09c1\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ \u09af\u09cb\u0997</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">\ud83d\uddd1\ufe0f</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${code}] \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u098f\u09ac\u0982 \u0985\u09ab\u09bf\u09b6\u09bf\u09df\u09be\u09b2 Trade Price \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('\u2705 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '\ud83d\udfe2 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '\ud83d\udcf2 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '\u23f3 ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '\ud83d\udfe2 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '\u26a0\ufe0f Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '\u26a1 RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '\u09f3' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        // Render Pending Resolutions Box\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          pList.innerHTML = pendings.map((p) => {\n            if (p.type === 'UNKNOWN_DA') {\n              return `\n                <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (Unknown DA)</b> ${p.detectedDaId ? `[\u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 ID: <b>${esc(p.detectedDaId)}</b>]` : ''}</div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', '))}</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID \u0993 \u09a8\u09be\u09ae \u09b2\u09bf\u0996\u09c1\u09a8 (\u09af\u09c7\u09ae\u09a8: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\u2705 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a4\u09bf\u09b2</button>\n                  </div>\n                </div>\n              `;\n            } else {\n              return `\n                <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f/\u09ac\u09be\u09a8\u09be\u09a8: \"${esc(p.unknownProductText)}\" (\u09aa\u09b0\u09bf\u09ae\u09be\u09a3: ${esc(p.orderedQty)})</b></div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf: ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | \u09ae\u09c2\u09b2 \u09b2\u09be\u0987\u09a8: \"${esc(p.rawLine)}\"</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"\u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u09ac\u09be \u0995\u09cb\u09a1 (\u09af\u09c7\u09ae\u09a8: Totifen \u09ac\u09be 919)\" style=\"max-width:320px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\ud83e\udde0 \u09ac\u09be\u09a8\u09be\u09a8 \u09b6\u09c7\u0996\u09be\u09a8 \u0993 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a6 \u09a6\u09bf\u09a8</button>\n                  </div>\n                </div>\n              `;\n            }\n          }).join('');\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">\u2705</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp \u09b8\u099a\u09b2 \u0986\u099b\u09c7!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">\u2601\ufe0f Cloud Session & Master DB Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp \u2794 Linked Devices \u09a5\u09c7\u0995\u09c7 \u09b8\u09cd\u0995\u09cd\u09af\u09be\u09a8 \u0995\u09b0\u09c1\u09a8</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">\ud83d\udd04 WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...</p>';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        if (groups.length !== lastGroupsCount && !groupInputTouched) {\n          lastGroupsCount = groups.length;\n          select.innerHTML = '<option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>';\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (data.botConfig.targetGroupId === g.id) opt.selected = true;\n            select.appendChild(opt);\n          });\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o) =>\n                '<tr>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>\u09f3' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">\u09f3' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td>' + esc(o.matchType) + '</td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"10\" style=\"text-align:center; font-weight:700;\">\u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u09ac\u09be\u09ab\u09be\u09b0\u09c7 \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09c7\u0987\u0964</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('\u0997\u09cd\u09b0\u09c1\u09aa \u09b2\u09bf\u09b8\u09cd\u099f \u0986\u09aa\u09a1\u09c7\u099f \u09b9\u09df\u09c7\u099b\u09c7! \u09ae\u09cb\u099f \u0997\u09cd\u09b0\u09c1\u09aa: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '\u2705 \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '\u2705 Google Sheet-\u098f \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 DA \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b8\u09bf\u0999\u09cd\u0995 \u09b9\u09df\u09c7\u099b\u09c7!' : '\u26a0\ufe0f Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">\ud83d\udc64 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) \u2014 ${data.daInfo.isKnownDA ? '\u2705 \u09aa\u09b0\u09bf\u099a\u09bf\u09a4' : '\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 (Admin \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09a8\u09cb \u09b9\u09ac\u09c7)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">\u2705 \u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 \u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${data.orders.length}\u099f\u09bf</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">\ud83e\udd14 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be\u09a8\u09be\u09a8: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || '\u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964';\n      fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('\u09a8\u09a4\u09c1\u09a8 WhatsApp \u0985\u09cd\u09af\u09be\u0995\u09be\u0989\u09a8\u09cd\u099f \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
+  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v5.5 \u2014 Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    /* Navigation Tabs */\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>\u26a1 Renata PLC (NK Depot) \u2014 CRP Order Bot v5.5</h1>\n        <p>Dynamic JSON Master DB \u2022 Self-Learning WhatsApp Admin Bot (01793362829) \u2022 5x Keyless AI OCR • Brand Group AI • Sequential Queue</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">\u23f3 WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">\u23f3 Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">\u26a1 RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">\ud83d\udcca Google Sheet \u2197</a>\n      </div>\n    </header>\n\n    <!-- NAVIGATION TABS -->\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">\ud83d\udce1 \u09e7. \u09ac\u099f \u0995\u09a8\u09cd\u099f\u09cd\u09b0\u09cb\u09b2 \u0993 \u09b2\u09be\u0987\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">\ud83d\udc65 \u09e8. \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">\ud83d\udc8a \u09e9. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">\ud83d\udcf1 \u09ea. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0993 \u0987\u09ae\u09c7\u099c \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u099f\u09bf\u0982\u09b8</button>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 1: BOT CONTROL, PENDING RESOLUTIONS, LIVE ORDERS & LOGS         -->\n    <!-- =================================================================== -->\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">\ud83c\udfaf \u09b8\u0995\u09cd\u09b0\u09bf\u09df \u0997\u09cd\u09b0\u09c1\u09aa</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">\ud83d\udce6 \u09ae\u09cb\u099f \u09b8\u09c7\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">\ud83d\udcb0 \u09ae\u09cb\u099f \u0985\u09b0\u09cd\u09a1\u09be\u09b0 (\u09f3)</div>\n          <div class=\"val\" id=\"statAmount\">\u09f30.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">\u2753 \u09aa\u09c7\u09a8\u09cd\u09a1\u09bf\u0982 \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">\ud83d\udcf2 \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u09a8\u09ae\u09cd\u09ac\u09b0</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <!-- PENDING AI QUESTIONS CARD (When unknown DA or unknown Product is waiting for reply) -->\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u0993 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8\u09b8\u09ae\u09c2\u09b9 (WhatsApp 01793362829 \u0985\u09a5\u09ac\u09be \u098f\u0996\u09be\u09a8 \u09a5\u09c7\u0995\u09c7 \u0989\u09a4\u09cd\u09a4\u09b0 \u09a6\u09bf\u09a8)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <!-- WHATSAPP QR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>\u09e7. WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09b6\u09a8</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <!-- GROUP SELECTOR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\u09e8. WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">\ud83d\udd04 \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09ab\u09cd\u09b0\u09c7\u09b6</button>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0986\u09aa\u09a8\u09be\u09b0 WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>\n            </select>\n            <label>\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u09b0\u09cd\u09a6\u09bf\u09b7\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b8\u09c7\u09ad \u09b9\u09b2\u09c7 \u09ae\u09c7\u09b8\u09c7\u099c\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u2705 \u09b0\u09bf\u09df\u09c7\u0995\u09b6\u09a8 \u09a6\u09bf\u09ac\u09c7\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">\ud83d\udcbe Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">\ud83d\udcb2 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n          </div>\n        </div>\n\n        <!-- TEST PARSER -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>\ud83e\uddea \u09e9. \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0993 \u09b8\u09c7\u09b2\u09ab-\u09b2\u09be\u09b0\u09cd\u09a8\u09bf\u0982 \u099f\u09c7\u09b8\u09cd\u099f\u09be\u09b0</span>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09ae\u09c7\u09b8\u09c7\u099c \u09b2\u09bf\u0996\u09c7 \u099f\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09a8\u09be\u09ae/\u0993\u09b7\u09c1\u09a7 \u09a6\u09bf\u09b2\u09c7 01793362829-\u098f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09ac\u09c7):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nCus: Nipun pharmacy E71\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">\ud83d\udd0d Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">\ud83d\ude80 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIVE ORDERS -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udccb \u09b8\u09b0\u09cd\u09ac\u09b6\u09c7\u09b7 \u099f\u09cd\u09b0\u09cd\u09af\u09be\u0995 \u09b9\u0993\u09df\u09be \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09b8\u09ae\u09c2\u09b9 (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">\ud83e\uddf9 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- SERVER LOGS -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udda5\ufe0f \u09b8\u09bf\u09b8\u09cd\u099f\u09c7\u09ae \u09b2\u0997 (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">\ud83e\uddf9 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 2: DA DATABASE MANAGER (ADD / EDIT / DELETE / CLEAR ALL)        -->\n    <!-- =================================================================== -->\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>\u2795 \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">\ud83d\uddd1\ufe0f \u09b8\u09ac DA \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09c1\u09a8 (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (\u09af\u09c7\u09ae\u09a8: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a6\u09c7\u0993\u09df\u09be \u09af\u09be\u09ac\u09c7):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>\u09a1\u09be\u0995\u09a8\u09be\u09ae / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udc65 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a4\u09be\u09b2\u09bf\u0995\u09be (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"\ud83d\udd0d ID, \u09a8\u09be\u09ae \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (Name)</th>\n                  <th>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0</th>\n                  <th>Aliases / \u09a1\u09be\u0995\u09a8\u09be\u09ae</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8 (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 3: PRODUCT & WRONG SPELLING (ALIASES) MANAGER                   -->\n    <!-- =================================================================== -->\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <!-- PRODUCT BRAND GROUPS MANAGER (COMMON KEYWORDS ACROSS VARIANTS) -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\uddc2\ufe0f \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09ae\u09cd\u09af\u09be\u09a8\u09c7\u099c\u09be\u09b0 (Total Groups: <span id=\"grpTotalLabel\">0</span>)</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap;\">\n            <input type=\"text\" id=\"newGroupNameInput\" placeholder=\"\u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (e.g. LUCAN-R)\" style=\"max-width:160px; padding:5px 8px;\" />\n            <input type=\"text\" id=\"newGroupKeywordsInput\" placeholder=\"\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (e.g. lucanr, luen, luncanr)\" style=\"max-width:240px; padding:5px 8px;\" />\n            <button class=\"btn-primary btn-sm\" onclick=\"saveBrandGroup()\">\ud83d\udcbe \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.83rem; font-weight:700; margin-bottom:10px;\">\n            \ud83d\udca1 <b>\u0995\u09c0\u09ad\u09be\u09ac\u09c7 \u0995\u09be\u099c \u0995\u09b0\u09c7:</b> \u098f\u0995\u0987 \u09a8\u09be\u09ae\u09c7\u09b0 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f (\u09af\u09c7\u09ae\u09a8: <code>LUCAN-R 200</code>, <code>LUCAN-R 150</code>, <code>LUCAN-R 50</code>, <code>LUCAN-R SYP</code>) \u098f\u0995\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09a5\u09be\u0995\u09c7\u0964 \u0995\u09cb\u09a8\u09cb \u098f\u0995\u099f\u09bf \u09ad\u09cd\u09af\u09be\u09b0\u09bf\u09df\u09c7\u09a8\u09cd\u099f\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 (\u09af\u09c7\u09ae\u09a8: <code>luen 200</code> \u09ac\u09be <code>luncanr 200</code>) \u09b6\u09c7\u0996\u09be\u09b2\u09c7 \u0995\u09ae\u09a8 \u09a8\u09be\u09ae <code>luen</code> / <code>luncanr</code> \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u098f\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09df\u2014\u09ab\u09b2\u09c7 \u09aa\u09b0\u09ac\u09b0\u09cd\u09a4\u09c0\u09a4\u09c7 \u0995\u09c7\u0989 <code>luen 150</code> \u09ac\u09be <code>luen 50</code> \u09b2\u09bf\u0996\u09b2\u09c7\u0993 \u09ac\u099f \u09a8\u09bf\u099c\u09c7 \u09a5\u09c7\u0995\u09c7\u0987 \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7!\n          </p>\n          <div class=\"table-wrap\" style=\"max-height:320px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Group Name (\u0995\u09ae\u09a8 \u09a8\u09be\u09ae)</th>\n                  <th>\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09b8\u09ae\u09c2\u09b9 (Variants)</th>\n                  <th>\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 / \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Shared Keywords)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productGroupsBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>\ud83d\udc8a \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u09a6\u09be\u09ae \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (\u09af\u09c7\u09ae\u09a8: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09af\u09be\u0995 \u09b8\u09be\u0987\u099c (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (\u09f3 \u09a6\u09b0):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. TOTIFEN\" />\n            </div>\n          </div>\n          <label>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u09b8\u09cd\u099f / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09b2\u09bf\u0996\u09c1\u09a8 \u2014 \u09af\u09c7\u0995\u09cb\u09a8\u09cb \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09b2\u09c7\u0987 \u098f\u0987 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>\ud83d\udc8a \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"\ud83d\udd0d \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae, \u0995\u09cb\u09a1 \u09ac\u09be \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u0993 \u09aa\u09cd\u09af\u09be\u0995</th>\n                  <th>Trade Price (\u09f3)</th>\n                  <th>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09ae\u09c2\u09b9 (Recognized Wrong Spellings / Aliases)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 4: MULTIPLE PHONE NUMBERS & JSON DATABASE BACKUP                -->\n    <!-- =================================================================== -->\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\">\n          <div class=\"card-header h-yellow\">\n            <span>\ud83d\udcf2 \u09e7. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u0993 \u09b0\u09bf\u09aa\u09cd\u09b2\u09be\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7 <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 DA ID/\u09a8\u09be\u09ae</b> \u0985\u09a5\u09ac\u09be <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u0993\u09b7\u09c1\u09a7\u09c7\u09b0 \u09ac\u09be\u09a8\u09be\u09a8</b> \u09aa\u09be\u0993\u09df\u09be \u0997\u09c7\u09b2\u09c7 \u09ac\u099f \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb\u09a4\u09c7 WhatsApp \u09ae\u09c7\u09b8\u09c7\u099c \u09aa\u09be\u09a0\u09bf\u09df\u09c7 \u099c\u09bf\u099c\u09cd\u099e\u09c7\u09b8 \u0995\u09b0\u09ac\u09c7 \u098f\u09ac\u0982 \u098f\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 Reply \u09a6\u09bf\u09b2\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n            </p>\n            <label>\u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\">\n          <div class=\"card-header h-mint\">\n            <span>\ud83d\udcf8 \u09e8. \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0996\u09be\u09a4\u09be\u09df \u09b2\u09bf\u0996\u09c7 \u099b\u09ac\u09bf \u09a4\u09c1\u09b2\u09c7 \u09aa\u09be\u09a0\u09be\u09b2\u09c7 \u09b6\u09c1\u09a7\u09c1\u09ae\u09be\u09a4\u09cd\u09b0 \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 \u09ac\u099f \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b0\u09bf\u09a1 \u0995\u09b0\u09ac\u09c7 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09af\u09a4\u0996\u09c1\u09b6\u09bf \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u09ac\u09be \u09b0\u09bf\u09ae\u09c1\u09ad \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8):\n            </p>\n            <label>\u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u099b\u09ac\u09bf\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udce6 \u09e9. JSON \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09ac\u09cd\u09af\u09be\u0995\u0986\u09aa \u0993 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 (Master DB JSON)</span>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:12px;\">\n            \u0986\u09aa\u09a8\u09be\u09b0 \u09b8\u09ae\u09b8\u09cd\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f, \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09ac\u0982 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09ae\u09c7\u09ae\u09cb\u09b0\u09bf\u09a4\u09c7 \u0993 Google Sheet-\u098f\u09b0 <code>_Bot_State</code>-\u098f \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09b8\u09c7\u09ad \u09a5\u09be\u0995\u09c7\u0964 \u099a\u09be\u0987\u09b2\u09c7 JSON \u09ab\u09be\u0987\u09b2 \u09b9\u09bf\u09b8\u09c7\u09ac\u09c7 \u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1 \u09ac\u09be \u0986\u09aa\u09b2\u09cb\u09a1\u0993 \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8:\n          </p>\n          <div class=\"btn-row\">\n            <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">\u2b07 Download master_db.json</a>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n          renderProductGroupsTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">\ud83d\uddd1\ufe0f Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a8\u09bf\u09b6\u09cd\u099a\u09bf\u09a4 \u09af\u09c7 [${daId}] \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09a5\u09c7\u0995\u09c7 \u09b8\u09ac \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (All DAs) \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    \n    function renderProductGroupsTable() {\n      const groups = masterData.productGroups || [];\n      const prods = masterData.products || [];\n      const lbl = document.getElementById('grpTotalLabel');\n      if (lbl) lbl.textContent = groups.length;\n      const tbody = document.getElementById('productGroupsBody');\n      if (!tbody) return;\n      if (groups.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"5\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09c7\u0987\u0964</td></tr>';\n        return;\n      }\n      tbody.innerHTML = groups.map((g) => {\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        return `\n          <tr>\n            <td><span class=\"badge ok\">${esc(g.groupName)}</span></td>\n            <td style=\"font-size:0.78rem;\">\n              ${members.map((m) => `<div><b>[${esc(m.code)}]</b> ${esc(m.name)} (\u09f3${Number(m.price).toFixed(2)})</div>`).join('') || '\u2014'}\n            </td>\n            <td>\n              ${(g.keywords || []).map((kw) => `\n                <span class=\"alias-chip\">\n                  ${esc(kw)}\n                  <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyGroupKeyword('${esc(g.groupName)}', '${esc(kw)}', 'remove')\">\u00d7</span>\n                </span>\n              `).join('')}\n            </td>\n            <td>\n              <div style=\"display:flex; gap:4px; min-width:150px;\">\n                <input type=\"text\" id=\"grpKw_${esc(g.groupName)}\" placeholder=\"\u0995\u09ae\u09a8 \u09ac\u09be\u09a8\u09be\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n                <button class=\"btn-primary btn-sm\" onclick=\"quickAddGroupKw('${esc(g.groupName)}')\">+ \u09af\u09cb\u0997</button>\n              </div>\n            </td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"editBrandGroup('${esc(g.groupName)}')\">\u270f\ufe0f</button>\n              <button class=\"btn-danger btn-sm\" onclick=\"deleteBrandGroup('${esc(g.groupName)}')\">\ud83d\uddd1\ufe0f</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function editBrandGroup(groupName) {\n      const g = (masterData.productGroups || []).find((x) => x.groupName === groupName);\n      if (!g) return;\n      document.getElementById('newGroupNameInput').value = g.groupName;\n      document.getElementById('newGroupKeywordsInput').value = (g.keywords || []).join(', ');\n    }\n\n    async function saveBrandGroup() {\n      const groupName = document.getElementById('newGroupNameInput').value;\n      const keywords = document.getElementById('newGroupKeywordsInput').value;\n      if (!groupName.trim()) return alert('\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae \u09a6\u09bf\u09a8');\n      await fetch('/api/product-group/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keywords })\n      });\n      document.getElementById('newGroupNameInput').value = '';\n      document.getElementById('newGroupKeywordsInput').value = '';\n      await loadMasterDb();\n    }\n\n    async function quickAddGroupKw(groupName) {\n      const inp = document.getElementById('grpKw_' + groupName);\n      if (!inp || !inp.value.trim()) return;\n      await modifyGroupKeyword(groupName, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyGroupKeyword(groupName, keyword, action) {\n      await fetch('/api/product-group/keyword', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keyword, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteBrandGroup(groupName) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${groupName}] \u0997\u09cd\u09b0\u09c1\u09aa\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName })\n      });\n      await loadMasterDb();\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">\u09f3${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"\u09ae\u09c1\u099b\u09c1\u09a8\">\u00d7</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09c1\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ \u09af\u09cb\u0997</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">\ud83d\uddd1\ufe0f</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${code}] \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u098f\u09ac\u0982 \u0985\u09ab\u09bf\u09b6\u09bf\u09df\u09be\u09b2 Trade Price \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('\u2705 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '\ud83d\udfe2 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '\ud83d\udcf2 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '\u23f3 ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '\ud83d\udfe2 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '\u26a0\ufe0f Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '\u26a1 RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '\u09f3' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        // Render Pending Resolutions Box\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          pList.innerHTML = pendings.map((p) => {\n            if (p.type === 'UNKNOWN_DA') {\n              return `\n                <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (Unknown DA)</b> ${p.detectedDaId ? `[\u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 ID: <b>${esc(p.detectedDaId)}</b>]` : ''}</div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', '))}</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID \u0993 \u09a8\u09be\u09ae \u09b2\u09bf\u0996\u09c1\u09a8 (\u09af\u09c7\u09ae\u09a8: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\u2705 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a4\u09bf\u09b2</button>\n                  </div>\n                </div>\n              `;\n            } else {\n              return `\n                <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f/\u09ac\u09be\u09a8\u09be\u09a8: \"${esc(p.unknownProductText)}\" (\u09aa\u09b0\u09bf\u09ae\u09be\u09a3: ${esc(p.orderedQty)})</b></div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf: ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | \u09ae\u09c2\u09b2 \u09b2\u09be\u0987\u09a8: \"${esc(p.rawLine)}\"</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"\u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u09ac\u09be \u0995\u09cb\u09a1 (\u09af\u09c7\u09ae\u09a8: Totifen \u09ac\u09be 919)\" style=\"max-width:320px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\ud83e\udde0 \u09ac\u09be\u09a8\u09be\u09a8 \u09b6\u09c7\u0996\u09be\u09a8 \u0993 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a6 \u09a6\u09bf\u09a8</button>\n                  </div>\n                </div>\n              `;\n            }\n          }).join('');\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">\u2705</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp \u09b8\u099a\u09b2 \u0986\u099b\u09c7!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">\u2601\ufe0f Cloud Session & Master DB Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp \u2794 Linked Devices \u09a5\u09c7\u0995\u09c7 \u09b8\u09cd\u0995\u09cd\u09af\u09be\u09a8 \u0995\u09b0\u09c1\u09a8</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">\ud83d\udd04 WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...</p>';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        if (groups.length !== lastGroupsCount && !groupInputTouched) {\n          lastGroupsCount = groups.length;\n          select.innerHTML = '<option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>';\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (data.botConfig.targetGroupId === g.id) opt.selected = true;\n            select.appendChild(opt);\n          });\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o) =>\n                '<tr>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>\u09f3' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">\u09f3' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td>' + esc(o.matchType) + '</td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"10\" style=\"text-align:center; font-weight:700;\">\u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u09ac\u09be\u09ab\u09be\u09b0\u09c7 \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09c7\u0987\u0964</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('\u0997\u09cd\u09b0\u09c1\u09aa \u09b2\u09bf\u09b8\u09cd\u099f \u0986\u09aa\u09a1\u09c7\u099f \u09b9\u09df\u09c7\u099b\u09c7! \u09ae\u09cb\u099f \u0997\u09cd\u09b0\u09c1\u09aa: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '\u2705 \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '\u2705 Google Sheet-\u098f \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 DA \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b8\u09bf\u0999\u09cd\u0995 \u09b9\u09df\u09c7\u099b\u09c7!' : '\u26a0\ufe0f Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">\ud83d\udc64 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) \u2014 ${data.daInfo.isKnownDA ? '\u2705 \u09aa\u09b0\u09bf\u099a\u09bf\u09a4' : '\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 (Admin \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09a8\u09cb \u09b9\u09ac\u09c7)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">\u2705 \u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 \u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${data.orders.length}\u099f\u09bf</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">\ud83e\udd14 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be\u09a8\u09be\u09a8: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || '\u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964';\n      fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('\u09a8\u09a4\u09c1\u09a8 WhatsApp \u0985\u09cd\u09af\u09be\u0995\u09be\u0989\u09a8\u09cd\u099f \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
 });
 
 // ============================================================================
@@ -4047,7 +4465,7 @@ function startKeepAliveLoop() {
 async function bootstrap() {
   loadLocalMasterDb();
   app.listen(PORT, '0.0.0.0', () => {
-    addLog(`🚀 Renata CRP Order Tracker v5.0 running on port ${PORT}`);
+    addLog(`🚀 Renata CRP Order Tracker v5.5 running on port ${PORT}`);
   });
 
   await initGoogleSheetsClient();
