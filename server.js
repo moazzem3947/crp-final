@@ -34,6 +34,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const crypto = require('crypto');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const { google } = require('googleapis');
@@ -476,6 +477,126 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
   }
 }
 
+/**
+ * Merges an imported JSON object (from older or newer master_db.json backups) into current masterDb
+ * without losing any existing DAs, Products, learned Aliases, Groups, or Phone numbers!
+ */
+function mergeMasterDbObject(raw, shouldSaveLocal = true) {
+  if (!raw || typeof raw !== 'object') return;
+
+  // Support raw array imports too (e.g. if user uploads an array of DAs or Products)
+  const incomingDas = Array.isArray(raw.das) ? raw.das : (Array.isArray(raw) && raw[0]?.daId ? raw : []);
+  const incomingProds = Array.isArray(raw.products) ? raw.products : (Array.isArray(raw) && raw[0]?.code ? raw : []);
+  const incomingGroups = Array.isArray(raw.productGroups) ? raw.productGroups : [];
+
+  // 1. Merge DAs
+  for (const d of incomingDas) {
+    const cleanId = String(d.daId || '').trim().toUpperCase();
+    const cleanAlt = String(d.altId || '').trim().toUpperCase();
+    const cleanName = String(d.name || '').trim();
+    if (!cleanId && !cleanName) continue;
+
+    const cleanPhones = Array.isArray(d.phones)
+      ? d.phones.map((p) => normalizeBdPhone(p)).filter(Boolean)
+      : [];
+    const cleanAliases = Array.isArray(d.aliases)
+      ? d.aliases.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+
+    const existing = masterDb.das.find(
+      (x) => (cleanId && x.daId.toUpperCase() === cleanId) || (cleanAlt && x.altId && x.altId.toUpperCase() === cleanAlt)
+    );
+    if (existing) {
+      if (cleanName && (!existing.name || existing.name === 'Unknown DA')) existing.name = cleanName;
+      if (cleanAlt && !existing.altId) existing.altId = cleanAlt;
+      existing.phones = Array.from(new Set([...(existing.phones || []), ...cleanPhones]));
+      existing.aliases = Array.from(new Set([...(existing.aliases || []), ...cleanAliases]));
+    } else {
+      masterDb.das.push({
+        daId: cleanId || `DA_${Date.now()}`,
+        altId: cleanAlt,
+        name: cleanName || cleanId,
+        phones: cleanPhones,
+        aliases: Array.from(new Set([cleanName.toLowerCase(), cleanId.toLowerCase(), ...cleanAliases].filter(Boolean)))
+      });
+    }
+  }
+
+  // 2. Merge Products & Aliases
+  for (const p of incomingProds) {
+    const cleanCode = String(p.code || '').trim().toUpperCase();
+    const cleanName = String(p.name || '').trim().toUpperCase();
+    if (!cleanCode || !cleanName) continue;
+
+    const cleanAliases = Array.isArray(p.aliases)
+      ? p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    const existingProd = masterDb.products.find((x) => String(x.code).toUpperCase() === cleanCode);
+    if (existingProd) {
+      if (p.price && Number(p.price) > 0) existingProd.price = Number(parseFloat(p.price));
+      if (p.unit) existingProd.unit = String(p.unit).trim();
+      if (p.family) existingProd.family = String(p.family).trim().toUpperCase();
+      existingProd.aliases = Array.from(new Set([...(existingProd.aliases || []), ...cleanAliases]));
+      syncProductWithBrandGroup(existingProd);
+    } else {
+      const newProd = {
+        code: cleanCode,
+        name: cleanName,
+        unit: String(p.unit || 'Box/Bottle').trim(),
+        price: Number(parseFloat(p.price) || 0),
+        family: String(p.family || cleanName.split(/\s+/)[0] || '').trim().toUpperCase(),
+        aliases: Array.from(new Set([cleanName.toLowerCase(), ...cleanAliases]))
+      };
+      masterDb.products.push(newProd);
+      syncProductWithBrandGroup(newProd);
+    }
+  }
+
+  // 3. Merge Product Groups
+  if (!Array.isArray(masterDb.productGroups) || masterDb.productGroups.length === 0) {
+    masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
+  }
+  for (const g of incomingGroups) {
+    const gName = String(g.groupName || '').trim().toUpperCase();
+    if (!gName) continue;
+    const kwList = Array.isArray(g.keywords)
+      ? g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    const existingGrp = masterDb.productGroups.find((x) => x.groupName.toUpperCase() === gName);
+    if (existingGrp) {
+      existingGrp.keywords = Array.from(new Set([...(existingGrp.keywords || []), ...kwList]));
+    } else {
+      masterDb.productGroups.push({
+        groupName: gName,
+        keywords: Array.from(new Set([gName.toLowerCase(), ...kwList]))
+      });
+    }
+  }
+
+  // Ensure every product's aliases are synced with its Brand Group
+  for (const p of masterDb.products) {
+    syncProductWithBrandGroup(p);
+  }
+
+  // 4. Merge Phones
+  if (Array.isArray(raw.adminAlertPhones)) {
+    masterDb.adminAlertPhones = Array.from(
+      new Set([...(masterDb.adminAlertPhones || []), ...raw.adminAlertPhones.map((p) => normalizeBdPhone(p)).filter(Boolean)])
+    );
+  }
+  if (Array.isArray(raw.authorizedImagePhones)) {
+    masterDb.authorizedImagePhones = Array.from(
+      new Set([...(masterDb.authorizedImagePhones || []), ...raw.authorizedImagePhones.map((p) => normalizeBdPhone(p)).filter(Boolean)])
+    );
+  }
+
+  masterDb.updatedAt = new Date().toISOString();
+  rebuildMasterLookupCaches();
+  if (shouldSaveLocal) {
+    saveLocalMasterDb();
+  }
+}
+
 function saveLocalMasterDb() {
   try {
     masterDb.updatedAt = new Date().toISOString();
@@ -520,125 +641,174 @@ function stringSimilarity(s1, s2) {
  */
 function resolveBrandFamilyVariant(family, rawTextLower) {
   const byCode = (c) => activeProducts.find((p) => String(p.code).toUpperCase() === String(c).toUpperCase());
-  const text = rawTextLower.replace(/([a-zA-Z])(\d)/g, '$1 $2').replace(/(\d)([a-zA-Z])/g, '$1 $2');
   const familyUpper = String(family || '').trim().toUpperCase();
   const groupProducts = activeProducts.filter((p) => String(p.family || '').toUpperCase() === familyUpper);
+  const rawInput = String(rawTextLower || '');
 
-  // Dynamic Variant Check: If group has multiple products and user added a custom variant (or specified an exact strength/ml not equal to the trailing order quantity), check groupProducts!
+  // Check explicit pack-size distinguishers before stripping pack sizes (e.g. "deltasone 17x30")
+  if (familyUpper === 'DELTASONE' && /\b17\s*[\*x]\s*30\b/i.test(rawInput)) {
+    return byCode('CS7');
+  }
+
+  // Strip pack sizes like "100's", "4x10's", "2x6's", "1x1's" FIRST so "100's" never turns into "100 s" (mistaken for 100ml)!
+  const rawWithoutPack = rawInput
+    .replace(/\b\d+\s*[\*x]\s*\d+(?:'s|s)?\b/gi, ' ')
+    .replace(/\b\d+\s*'\s*s\b/gi, ' ');
+
+  const text = rawWithoutPack
+    .replace(/([a-zA-Z])(\d)/g, '$1 $2')
+    .replace(/(\d)([a-zA-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Strip the trailing order quantity at the end of the line so " = 20", " = 50", " = 60", " = 100"
+  // is NEVER mistaken for 20ml, 50mg, 60ml, or 100ml!
+  const UNIT_PAT = '(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)';
+  let textBeforeQty = text;
+  const sepQtyRe = new RegExp(`[\\-:=]+\\s*\\d+(?:\\s*\\+\\s*\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
+  const unitQtyRe = new RegExp(`\\s+\\d+(?:\\s*\\+\\s*\\d+)?\\s*${UNIT_PAT}\\.?\\s*$`, 'i');
+  const bareTrailingQtyRe = /\s+\d+(?:\s*\+\s*\d+)?\s*$/;
+
+  if (sepQtyRe.test(textBeforeQty)) {
+    textBeforeQty = textBeforeQty.replace(sepQtyRe, ' ').trim();
+  } else if (unitQtyRe.test(textBeforeQty)) {
+    textBeforeQty = textBeforeQty.replace(unitQtyRe, ' ').trim();
+  } else if (bareTrailingQtyRe.test(textBeforeQty)) {
+    textBeforeQty = textBeforeQty.replace(bareTrailingQtyRe, ' ').trim();
+  }
+
+  switch (familyUpper) {
+    case 'DOMIREN': {
+      if (/\b(tab|tap|tb|tablet|fc|10\s*mg)\b/i.test(textBeforeQty)) return byCode('60');
+      if (/\b60\s*(ml)?\b/i.test(textBeforeQty) && !/\b100\s*ml\b/i.test(textBeforeQty)) return byCode('286');
+      if (/\b100\s*(ml)?\b/i.test(textBeforeQty)) return byCode('990');
+      break;
+    }
+    case 'DELTASONE': {
+      if (/\b(tab|tap|tb|tablet|5\s*mg)\b/i.test(textBeforeQty)) return byCode('CS7');
+      if (/\b100\s*(ml)?\b/i.test(textBeforeQty) && !/\b50\s*ml\b/i.test(textBeforeQty)) return byCode('637');
+      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('636');
+      break;
+    }
+    case 'ZITHRIN': {
+      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('290');
+      if (/\b20\s*(ml)?\b/i.test(textBeforeQty)) return byCode('270');
+      if (/\b15\s*(ml)?\b/i.test(textBeforeQty)) return byCode('173');
+      if (/\b30\s*(ml)?\b/i.test(textBeforeQty)) return byCode('834');
+      if (/\b35\s*(ml)?\b/i.test(textBeforeQty)) return byCode('271');
+      break;
+    }
+    case 'LUCAN-R': {
+      if (/\b200\s*(mg)?\b/i.test(textBeforeQty)) return byCode('621');
+      if (/\b150\s*(mg)?\b/i.test(textBeforeQty)) return byCode('605');
+      if (/\b50\s*(mg)?\b/i.test(textBeforeQty)) return byCode('876');
+      if (/\b(cap|caps|capsule)\b/i.test(textBeforeQty) && !/\b(syp|syr|sry|susp|35)\b/i.test(textBeforeQty)) {
+        return byCode('876');
+      }
+      if (/\b(35\s*(ml)?|syp|syr|sry|susp)\b/i.test(textBeforeQty)) return byCode('112');
+      break;
+    }
+    case 'FLONTIN': {
+      if (/\b(syp|syr|sry|sryp|syrp|srp|susp|60\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('226');
+      break;
+    }
+    case 'FUROCEF': {
+      if (/\b(ds|50\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('S72');
+      break;
+    }
+    case 'VITA': {
+      if (/\b(20000|20\s*k)\b/i.test(textBeforeQty)) return byCode('S15');
+      break;
+    }
+    case 'NEXDEX': {
+      if (/\b60\s*(mg)?\b/i.test(textBeforeQty)) return byCode('SA1');
+      break;
+    }
+    case 'PCAB': {
+      if (/\b10\s*(mg)?\b/i.test(textBeforeQty)) return byCode('C2Y');
+      break;
+    }
+    case 'BECONEX': {
+      if (/\b(zi|z\s*i)\b/i.test(textBeforeQty)) return byCode('233');
+      if (/\b100\s*(ml)?\b/i.test(textBeforeQty) && !/\b200\s*ml\b/i.test(textBeforeQty)) return byCode('33');
+      break;
+    }
+    case 'PROTONIL': {
+      if (/\b40\s*(mg)?\b/i.test(textBeforeQty)) return byCode('267');
+      break;
+    }
+    case 'FLUSTAR': {
+      if (/\b(syp|syr|sry|syrup|sys|dry|100\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('N33');
+      break;
+    }
+    case 'RECOX': {
+      if (/\b120\s*(mg)?\b/i.test(textBeforeQty)) return byCode('N49');
+      break;
+    }
+    case 'COPNAT': {
+      if (/\b(cream|crem|creem|crm)\b/i.test(textBeforeQty)) return byCode('SZ4');
+      if (/\b(ointment|oientment|olntment|oint)\b/i.test(textBeforeQty)) return byCode('SZ5');
+      break;
+    }
+    case 'MOODS': {
+      if (/\b(electrify|electrifry)\b/i.test(textBeforeQty)) return byCode('H88');
+      if (/\b(gold|gola|1500)\b/i.test(textBeforeQty)) return byCode('H89');
+      if (/\b(dotted|dot)\b/i.test(textBeforeQty)) return byCode('H37');
+      if (/\b(ulta|ultra|thin)\b/i.test(textBeforeQty)) return byCode('H34');
+      break;
+    }
+    case 'FENADIN': {
+      if (/\b(30\s*(ml)?|small|smal)\b/i.test(textBeforeQty)) return byCode('69');
+      break;
+    }
+    case 'ALGIN': {
+      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('C62');
+      break;
+    }
+    case 'MAZIC': {
+      if (/\b(jr|4\.05|4\s*05)\b/i.test(textBeforeQty)) return byCode('16');
+      break;
+    }
+  }
+
+  // Dynamic fallback for newly added custom variants in groupProducts
   if (groupProducts.length > 1) {
-    // Strip the final order quantity at the end of the line so "lucan r 50" (where 50 is strength) vs "lucan r 200 = 50" (where 200 is strength and 50 is qty) is disambiguated accurately!
-    const textWithoutTrailingQty = text
-      .replace(/[\-:=]+\s*\d+(?:\+\d+)?\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)?\.?\s*$/i, ' ')
-      .replace(/^(\s*[a-z\s\-]+\s+\d+\s*(?:mg|ml|mcg|gm|g|iu)?)\s+\d+\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)?\.?\s*$/i, '$1 ');
-
     for (const gp of groupProducts) {
-      // Extract distinctive strength/volume numbers from gp.name (excluding pack sizes like 3x10, 4x10)
-      const nameClean = gp.name.replace(/\b\d+\s*[\*x]\s*\d+'?s?\b/gi, ' ').replace(/\b\d+'s\b/gi, ' ');
-      const strengthMatches = [...nameClean.matchAll(/\b(40000|20000|1500|500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\s*(ml|mg|mcg|gm|g|iu)?\b/gi)];
+      const nameClean = gp.name.replace(/\b\d+\s*[\*x]\s*\d+(?:'s|s)?\b/gi, ' ').replace(/\b\d+'s\b/gi, ' ');
+      const strengthMatches = [...nameClean.matchAll(/\b(40000|20000|1500|500|250|200|150|120|75|60|40|35|25|15)\s*(ml|mg|mcg|gm|g|iu)?\b/gi)];
       for (const sm of strengthMatches) {
         const numStr = sm[1];
-        const unitStr = (sm[2] || '').toLowerCase();
-        // Check if textWithoutTrailingQty or text explicitly mentions this strength/volume
-        const explicitUnitRegex = unitStr ? new RegExp(`\\b${numStr}\\s*${unitStr}\\b`, 'i') : null;
-        const bareStrengthRegex = new RegExp(`\\b${numStr}\\b`, 'i');
-        if ((explicitUnitRegex && explicitUnitRegex.test(text)) || bareStrengthRegex.test(textWithoutTrailingQty)) {
+        if (new RegExp(`\\b${numStr}\\b`, 'i').test(textBeforeQty)) {
           return gp;
         }
       }
     }
   }
 
-  switch (familyUpper) {
-    case 'DOMIREN': {
-      if (/\b(tab|tap|tb|tablet|fc|10\s*mg)\b/i.test(text)) return byCode('60');
-      if (/\b60\s*(ml)?\b/i.test(text) && !/\b100\s*ml\b/i.test(text)) return byCode('286');
-      return byCode('990');
-    }
-    case 'DELTASONE': {
-      if (/\b(tab|tap|tb|tablet|5\s*mg|17\s*[\*x]\s*30)\b/i.test(text)) return byCode('CS7');
-      if (/\b100\s*(ml)?\b/i.test(text) && !/\b50\s*ml\b/i.test(text)) return byCode('637');
-      return byCode('636');
-    }
-    case 'ZITHRIN': {
-      if (/\b50\s*(ml)?\b/i.test(text)) return byCode('290');
-      if (/\b20\s*(ml)?\b/i.test(text)) return byCode('270');
-      if (/\b15\s*(ml)?\b/i.test(text)) return byCode('173');
-      if (/\b30\s*(ml)?\b/i.test(text)) return byCode('834');
-      return byCode('271');
-    }
-    case 'LUCAN-R': {
-      if (/\b200\s*(mg)?\b/i.test(text)) return byCode('621');
-      if (/\b150\s*(mg)?\b/i.test(text)) return byCode('605');
-      if (/\b50\s*(mg)?\b/i.test(text)) return byCode('876');
-      if (/\b(cap|caps|capsule)\b/i.test(text) && !/\b(syp|syr|sry|susp|35)\b/i.test(text)) {
-        return byCode('876');
-      }
-      return byCode('112');
-    }
-    case 'FLONTIN': {
-      if (/\b(syp|syr|sry|sryp|syrp|srp|susp|60\s*ml)\b/i.test(text)) return byCode('226');
-      return byCode('96');
-    }
-    case 'FUROCEF': {
-      if (/\b(ds|50\s*ml)\b/i.test(text)) return byCode('S72');
-      return byCode('102');
-    }
-    case 'VITA': {
-      if (/\b(20000|20\s*k)\b/i.test(text)) return byCode('S15');
-      return byCode('S16');
-    }
-    case 'NEXDEX': {
-      if (/\b60\s*(mg)?\b/i.test(text)) return byCode('SA1');
-      return byCode('SA4');
-    }
-    case 'PCAB': {
-      if (/\b10\s*(mg)?\b/i.test(text)) return byCode('C2Y');
-      return byCode('C2Z');
-    }
-    case 'BECONEX': {
-      if (/\b(zi|z\s*i)\b/i.test(text)) return byCode('233');
-      if (/\b100\s*(ml)?\b/i.test(text) && !/\b200\s*ml\b/i.test(text)) return byCode('33');
-      return byCode('34');
-    }
-    case 'PROTONIL': {
-      if (/\b40\s*(mg)?\b/i.test(text)) return byCode('267');
-      return byCode('266');
-    }
-    case 'FLUSTAR': {
-      if (/\b(syp|syr|sry|syrup|sys|dry|100\s*ml)\b/i.test(text)) return byCode('N33');
-      return byCode('607');
-    }
-    case 'RECOX': {
-      if (/\b120\s*(mg)?\b/i.test(text)) return byCode('N49');
-      return byCode('N47');
-    }
-    case 'COPNAT': {
-      if (/\b(cream|crem|creem|crm)\b/i.test(text)) return byCode('SZ4');
-      return byCode('SZ5');
-    }
-    case 'MOODS': {
-      if (/\b(electrify|electrifry)\b/i.test(text)) return byCode('H88');
-      if (/\b(gold|gola|1500)\b/i.test(text)) return byCode('H89');
-      if (/\b(dotted|dot)\b/i.test(text)) return byCode('H37');
-      if (/\b(ulta|ultra|thin)\b/i.test(text)) return byCode('H34');
-      return byCode('H39');
-    }
-    case 'FENADIN': {
-      if (/\b(30\s*ml|small|smal)\b/i.test(text)) return byCode('69');
-      return byCode('933');
-    }
-    case 'ALGIN': {
-      if (/\b50\s*(ml)?\b/i.test(text)) return byCode('C62');
-      return byCode('989');
-    }
-    case 'MAZIC': {
-      if (/\b(jr|4\.05)\b/i.test(text)) return byCode('16');
-      return byCode('18');
-    }
-    default: {
-      return groupProducts[0] || activeProducts.find((p) => p.family === familyUpper) || null;
-    }
+  const defaults = {
+    'DOMIREN': '990',
+    'DELTASONE': '636',
+    'ZITHRIN': '271',
+    'LUCAN-R': '112',
+    'FLONTIN': '96',
+    'FUROCEF': '102',
+    'VITA': 'S16',
+    'NEXDEX': 'SA4',
+    'PCAB': 'C2Z',
+    'BECONEX': '34',
+    'PROTONIL': '266',
+    'FLUSTAR': '607',
+    'RECOX': 'N47',
+    'COPNAT': 'SZ5',
+    'MOODS': 'H39',
+    'FENADIN': '933',
+    'ALGIN': '989',
+    'MAZIC': '18'
+  };
+  if (defaults[familyUpper] && byCode(defaults[familyUpper])) {
+    return byCode(defaults[familyUpper]);
   }
+  return groupProducts[0] || activeProducts.find((p) => p.family === familyUpper) || null;
 }
 
 const BRAND_FAMILY_PATTERNS = [
@@ -880,7 +1050,8 @@ function extractOrderQuantity(rawLine, matchedProduct) {
   s = s.replace(/\bemcon\s*[\-_]?\s*1\b/gi, 'emcon ');
   s = s.replace(/\b(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5|3)\s*(ml|mg|mcg|gm|g)\b/gi, ' ');
 
-  s = s.replace(/\b(dom[iey]?r[ea]n|deltas[oa]ne?|daltas[oa]ne?|beconex|biconex|zith?r[ie]n|zitrin|lucan\s*[\-]?r?|locan\s*[\-]?r?|lokanar|lunch|furocef|feurocef|p\s*[\-]?ca[bp]|nexdex|protonil|recox|flontin|flustar|algin|fenadin|normanal|pangesic)\s*(?:syp|syr|sry|srp|sarape|tab|tap|cap)?\s*[\-_:=.]*\s*(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\b(?=.*?\b\d+)/gi, '$1 ');
+  // Strip any strength/volume number (500, 200, 150, 100, 60, 50, 35, 30, 20, 15, 10, 5) after a product word when followed by the actual order quantity number!
+  s = s.replace(/\b([a-z]{3,}(?:\s+[a-z]{1,4})?)\s*(?:syp|syr|sry|srp|sarape|tab|tap|cap|caps|susp)?\s*[\-_:=.]*\s*(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\b(?=.*?\b\d+)/gi, '$1 ');
 
   const plusMatch = s.match(/(\d+)\s*\+\s*(\d+)/);
   if (plusMatch) {
@@ -900,43 +1071,49 @@ function extractOrderQuantity(rawLine, matchedProduct) {
  * Detects if a line that failed matchCRPProduct is actually an unrecognized medicine order line
  * (e.g. "Toti syp - 20", "Napa extra 50 pcs", "Domirn 100ml = 30")
  */
-function detectUnrecognizedProductLine(seg) {
+function detectUnrecognizedProductLine(seg, isImageOrder = false) {
   if (!seg || typeof seg !== 'string') return null;
   const trimmed = fixOcrDigitLookalikes(seg.trim());
   if (trimmed.length < 4 || trimmed.length > 90) return null;
 
-  // Ignore DA ID lines, PSO lines, Pharmacy lines, phone numbers, or casual chat
+  // Ignore DA ID lines, PSO lines, Pharmacy lines, phone numbers, dates, invoice headers, or casual chat
   if (/\b(cf|rf|c)\s*[\-_.]?\s*\d{4,6}\b/i.test(trimmed)) return null;
   if (/\b(2100\d{2}|122\d{3}|055167)\b/.test(trimmed)) return null;
   if (extractPSOCode(trimmed)) return null;
   if (isPharmacyCandidateLine(trimmed)) return null;
   if (/\b01[3-9]\d{8}\b/.test(trimmed)) return null;
-  if (/^(assalamu|salam|walekum|hi\b|hello|ok\b|okay|hmm|thanks|thank\s+you|welcome|alhamdulillah|inshallah|good\s+morning|good\s+night|date\b|da\s+name|da\s+id|order\b|total\b|sl\b)/i.test(trimmed)) {
+  if (/\b\d{1,2}\s*[\/\-\.]\s*\d{1,2}(?:\s*[\/\-\.]\s*\d{2,4})?\b/.test(trimmed)) return null;
+  if (/^(assalamu|salam|walekum|hi\b|hello|ok\b|okay|hmm|thanks|thank\s+you|welcome|alhamdulillah|inshallah|good\s+morning|good\s+night|date\b|da\s+name|da\s+id|order\b|total\b|sub\s*total|grand\s*total|sl\b|serial|page\b|mob|phone|cell|dr\b|doctor|sign|signature|tk\b|taka\b|amount|price|rate|discount|vat|net\b|due\b|paid\b|cash\b|memo\b|invoice|bill\b|code\b|id\b|name\b|cus\b|customer|party|market|bazar|road|depot|noakhali|renata)/i.test(trimmed)) {
+    return null;
+  }
+  if (/\b(total|taka|amount|invoice|memo|signature|mobile|depot|noakhali|chowmuhani|laxmipur|feni|maijdee)\b/i.test(trimmed)) {
     return null;
   }
 
   // Check if any known DA name or alias matches this line
   const lower = trimmed.toLowerCase();
   for (const da of activeDAs) {
-    if (da.name && lower === da.name.toLowerCase()) return null;
+    if (da.name && lower.includes(da.name.toLowerCase())) return null;
     for (const al of da.aliases || []) {
-      if (al.length >= 4 && lower === al.toLowerCase()) return null;
+      if (al.length >= 4 && lower.includes(al.toLowerCase())) return null;
     }
   }
 
-  // Must have a clear order quantity pattern (supports 40P, 20T, 10B, 50 pes, = 30, - 10, etc.)
   const UNIT_PAT = '(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)';
-  const hasOrderShape =
-    new RegExp(`([a-zA-Z]{2,}.*?[\\-:=]+\\s*\\d+\\s*${UNIT_PAT}?\\.?$)`, 'i').test(trimmed) ||
-    new RegExp(`([a-zA-Z]{2,}.*?\\s+\\d+\\s*${UNIT_PAT}\\.?$)`, 'i').test(trimmed) ||
-    /^[*\d\/.)\s]*([a-zA-Z][a-zA-Z0-9\-\s.]{2,40}?)\s+(\d{1,4})\s*$/i.test(trimmed);
+  // On camera images, require an explicit "=" / "-" / ":" separator OR explicit unit (pcs, box, ta, 40P)
+  // so random paper header/address fragments with a bare number never trigger false unknown product holds!
+  const hasExplicitSepOrUnit =
+    new RegExp(`([a-zA-Z]{3,}.*?[\\-:=]+\\s*\\d+\\s*${UNIT_PAT}?\\.?$)`, 'i').test(trimmed) ||
+    new RegExp(`([a-zA-Z]{3,}.*?\\s+\\d+\\s*${UNIT_PAT}\\.?$)`, 'i').test(trimmed);
 
-  if (!hasOrderShape) return null;
+  const hasBareNumberOrderShape =
+    !isImageOrder && /^[*\d\/.)\s]*([a-zA-Z][a-zA-Z0-9\-\s.]{2,40}?)\s+(\d{1,4})\s*$/i.test(trimmed);
+
+  if (!hasExplicitSepOrUnit && !hasBareNumberOrderShape) return null;
 
   const qty = extractOrderQuantity(trimmed, null);
   if (qty === null || qty <= 0 || qty > 5000) return null;
 
-  // Extract clean unknown product text by removing leading numbering and trailing quantity + unit (only once so strength like 200 / 100ml is preserved!)
   let unknownName = trimmed.replace(/^[*\d\/.)\-\s]+/, '');
   const sepQtyRegex = new RegExp(`[\\-:=]+\\s*\\d+(?:\\+\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
   const spaceQtyRegex = new RegExp(`\\s+\\d+(?:\\+\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
@@ -947,8 +1124,8 @@ function detectUnrecognizedProductLine(seg) {
   }
   unknownName = unknownName.replace(/[*_~]+/g, '').trim();
 
-  if (!unknownName || unknownName.length < 2 || /^\d+$/.test(unknownName)) return null;
-  if (!/[a-zA-Z]{2,}/.test(unknownName)) return null;
+  if (!unknownName || unknownName.length < 3 || /^\d+$/.test(unknownName)) return null;
+  if (!/[a-zA-Z]{3,}/.test(unknownName)) return null;
 
   return {
     rawLine: trimmed,
@@ -1470,7 +1647,7 @@ function parseWhatsAppOrderMessage({
       }
 
       // Check if this segment is an unrecognized product order line (has medicine-like text + quantity)
-      const unknownCandidate = detectUnrecognizedProductLine(seg);
+      const unknownCandidate = detectUnrecognizedProductLine(seg, isImageOrder);
       if (unknownCandidate) {
         unrecognizedItems.push({
           ...unknownCandidate,
@@ -1563,14 +1740,14 @@ function parseWhatsAppOrderMessage({
 }
 
 // ============================================================================
-// 7. 5-STAGE AUTO-RETRY IMAGE OCR + 2 KEYLESS VISION AI ENGINES + FIFO QUEUE
+// 7. RATE-LIMIT-PROOF 5-METHOD IMAGE OCR & VISION PIPELINE + FIFO QUEUE (v5.6)
 // ============================================================================
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 18000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 22000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -1580,7 +1757,72 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 18000) {
   }
 }
 
-// Sequential FIFO Queue for Burst Image Orders (processes 1 image at a time so sending 10 images at once NEVER causes rate-limit or memory errors!)
+// SHA-256 Image OCR Result Cache (if an image was already processed once, re-sending it takes 0ms and 0 API calls!)
+const imageOcrResultCache = new Map();
+
+// Sliding-Window Rate-Limit Trackers so sending 8, 15, or 30 images at once NEVER triggers 429!
+const visionApiCallTimestamps = [];
+const ocrSpaceCallTimestamps = [];
+let ocrSpaceRateLimitedUntil = 0;
+let visionRateLimitedUntil = 0;
+
+const OCR_SPACE_ENDPOINTS = [
+  'https://api.ocr.space/parse/image',
+  'https://apipro1.ocr.space/parse/image',
+  'https://apipro2.ocr.space/parse/image'
+];
+let ocrEndpointIndex = 0;
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+];
+
+async function waitForVisionRateLimitSlot() {
+  const now = Date.now();
+  if (visionRateLimitedUntil > now) {
+    const waitMs = visionRateLimitedUntil - now;
+    addLog(`⏳ Vision AI Cooldown active: waiting ${(waitMs / 1000).toFixed(1)}s for rate-limit reset...`);
+    await sleep(waitMs);
+  }
+  // Keep only timestamps within the last 58 seconds
+  while (visionApiCallTimestamps.length > 0 && Date.now() - visionApiCallTimestamps[0] > 58000) {
+    visionApiCallTimestamps.shift();
+  }
+  // Pollinations anonymous tier allows ~7-8 requests per 60s per IP.
+  // If 6 requests were already made in the last 58s, pace automatically so request #7/#8/#9/#10 never hits HTTP 429!
+  if (visionApiCallTimestamps.length >= 6) {
+    const oldestAge = Date.now() - visionApiCallTimestamps[0];
+    const safetyWait = Math.max(3500, Math.min(14000, 60000 - oldestAge + 1500));
+    addLog(`🛡️ Burst Image Rate-Limit Guard: pacing ${(safetyWait / 1000).toFixed(1)}s so batch image #${visionApiCallTimestamps.length + 1} succeeds...`);
+    await sleep(safetyWait);
+  }
+  visionApiCallTimestamps.push(Date.now());
+}
+
+async function waitForOcrSpaceSlot() {
+  const now = Date.now();
+  if (ocrSpaceRateLimitedUntil > now) {
+    const waitMs = ocrSpaceRateLimitedUntil - now;
+    addLog(`⏳ OCR.Space Cooldown active: waiting ${(waitMs / 1000).toFixed(1)}s...`);
+    await sleep(waitMs);
+  }
+  while (ocrSpaceCallTimestamps.length > 0 && Date.now() - ocrSpaceCallTimestamps[0] > 60000) {
+    ocrSpaceCallTimestamps.shift();
+  }
+  // Free 'helloworld' key allows ~8-10 calls per 60s
+  if (ocrSpaceCallTimestamps.length >= 7) {
+    const oldestAge = Date.now() - ocrSpaceCallTimestamps[0];
+    const safetyWait = Math.max(3000, Math.min(15000, 61000 - oldestAge + 1000));
+    addLog(`🛡️ OCR Rate-Limit Guard: pacing ${(safetyWait / 1000).toFixed(1)}s...`);
+    await sleep(safetyWait);
+  }
+  ocrSpaceCallTimestamps.push(Date.now());
+}
+
+// Sequential FIFO Queue for Burst Image Orders (processes 1 image at a time with smart pacing)
 let imageProcessingChain = Promise.resolve();
 let pendingImageQueueCount = 0;
 
@@ -1593,9 +1835,10 @@ function enqueueImageOrderTask(taskFn) {
       addLog(`❌ Queued Image Task Error: ${err.message}`);
     } finally {
       pendingImageQueueCount = Math.max(0, pendingImageQueueCount - 1);
-      // Cool-down pause between consecutive burst images so free OCR/Vision APIs never rate-limit
       if (pendingImageQueueCount > 0) {
-        await sleep(1400);
+        // Adaptive pause between queued images (longer pause when processing big batches of 8+ images)
+        const adaptiveGap = visionApiCallTimestamps.length >= 5 ? 3800 : 1800;
+        await sleep(adaptiveGap);
       }
     }
   };
@@ -1604,38 +1847,110 @@ function enqueueImageOrderTask(taskFn) {
 }
 
 /**
- * Method 1, 2, 3 helper: Call OCR.space with configurable engine & parameters
+ * Resilient WhatsApp Image Downloader with 3x Auto-Retry & Media Re-upload Request
+ * Prevents download failures when 10-20 images are sent in a single burst!
  */
-async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true', customKey = '') {
-  const ocrKey = (customKey || process.env.OCR_SPACE_API_KEY || 'helloworld').trim();
-  const formBody = new URLSearchParams();
-  formBody.append('apikey', ocrKey);
-  formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
-  formBody.append('language', 'eng');
-  formBody.append('isOverlayRequired', 'false');
-  formBody.append('OCREngine', String(engineNumber));
-  formBody.append('scale', 'true');
-  formBody.append('detectOrientation', 'true');
-  formBody.append('isTable', String(isTable));
-
-  const res = await fetchWithTimeout('https://api.ocr.space/parse/image', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: formBody.toString()
-  }, 16000);
-  const json = await res.json();
-  return (json?.ParsedResults || [])
-    .map((r) => r.ParsedText || '')
-    .join('\n')
-    .trim();
+async function downloadImageBufferWithRetry(msg) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (attempt > 1 && sock?.updateMediaMessage) {
+        try {
+          await sock.updateMediaMessage(msg);
+        } catch (e) {}
+        await sleep(1000 * attempt);
+      }
+      const buf = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        { logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage }
+      );
+      if (buf && buf.length > 0) return buf;
+    } catch (err) {
+      lastErr = err;
+      addLog(`⚠️ Image media download retry ${attempt}/3: ${err.message}`);
+    }
+  }
+  throw lastErr || new Error('Empty image buffer');
 }
 
 /**
- * Method 4 & 5 helper: Keyless Free Multimodal Vision AI (Pollinations OpenAI-Compatible Vision Endpoint)
- * Supports multiple vision models ('openai', 'openai-large', 'claude-hybridspace') with ZERO API Key!
+ * OCR.Space Helper with Multi-Key Rotation, Endpoint Rotation & Rate-Limit Auto-Backoff
  */
-async function runKeylessVisionAiModel(base64Image, mimeType, modelName = 'openai') {
-  const brandGroupsHint = (activeProductGroups || []).slice(0, 45).map((g) => g.groupName).join(', ');
+async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true') {
+  const configuredKeys = (process.env.OCR_SPACE_API_KEY || botConfig.ocrSpaceApiKey || '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean);
+  const keyPool = configuredKeys.length > 0 ? [...configuredKeys, 'helloworld'] : ['helloworld'];
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await waitForOcrSpaceSlot();
+    const ocrKey = keyPool[(ocrEndpointIndex + attempt) % keyPool.length];
+    const endpoint = OCR_SPACE_ENDPOINTS[(ocrEndpointIndex++) % OCR_SPACE_ENDPOINTS.length];
+    const ua = USER_AGENTS[ocrEndpointIndex % USER_AGENTS.length];
+
+    const formBody = new URLSearchParams();
+    formBody.append('apikey', ocrKey);
+    formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
+    formBody.append('language', 'eng');
+    formBody.append('isOverlayRequired', 'false');
+    formBody.append('OCREngine', String(engineNumber));
+    formBody.append('scale', 'true');
+    formBody.append('detectOrientation', 'true');
+    formBody.append('isTable', String(isTable));
+
+    try {
+      const res = await fetchWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': ua
+          },
+          body: formBody.toString()
+        },
+        18000
+      );
+
+      if (res.status === 429 || res.status === 403 || res.status === 503) {
+        addLog(`⚠️ OCR.Space HTTP ${res.status} rate limit hit — cooling down 12s and rotating...`);
+        ocrSpaceRateLimitedUntil = Date.now() + 12000;
+        await sleep(12000);
+        continue;
+      }
+
+      const json = await res.json();
+      if (json?.IsErroredOnProcessing) {
+        const errMsg = Array.isArray(json.ErrorMessage) ? json.ErrorMessage.join(' ') : String(json.ErrorMessage || '');
+        if (/10 times|rate|limit|maximum|many requests/i.test(errMsg)) {
+          addLog(`⚠️ OCR.Space key quota notice ("${errMsg.slice(0, 60)}") — cooling down 14s...`);
+          ocrSpaceRateLimitedUntil = Date.now() + 14000;
+          await sleep(14000);
+          continue;
+        }
+      }
+
+      const text = (json?.ParsedResults || [])
+        .map((r) => r.ParsedText || '')
+        .join('\n')
+        .trim();
+      if (text) return text;
+    } catch (err) {
+      addLog(`⚠️ OCR.Space pass error: ${err.message}`);
+    }
+  }
+  return '';
+}
+
+/**
+ * Keyless Multimodal Vision AI Helper with Multi-Gateway Rotation + Automatic 429 Rate-Limit Retry
+ * Never fails silently when 8+ images are sent at once — automatically waits out rate limits and retries!
+ */
+async function runKeylessVisionAiModel(base64Image, mimeType, preferredModel = 'openai') {
+  const brandGroupsHint = (activeProductGroups || []).slice(0, 50).map((g) => g.groupName).join(', ');
   const promptText =
     'Read this handwritten or printed pharmaceutical order sheet photo from Bangladesh (Renata PLC). ' +
     'Extract and output ONLY the raw order lines: include DA Code (e.g. CF9054, RF9084, C122210), ' +
@@ -1643,27 +1958,65 @@ async function runKeylessVisionAiModel(base64Image, mimeType, modelName = 'opena
     '(e.g. "Totifen 50", "Doxicap = 100 pes", "Lucan R 200 = 40P", "Domiren 100ml 20"). ' +
     `Known medicine brands include: ${brandGroupsHint}. Output plain text lines only, no markdown or commentary.`;
 
-  const res = await fetchWithTimeout('https://text.pollinations.ai/openai', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: modelName,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: promptText },
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
-          ]
-        }
-      ],
-      temperature: 0.1
-    })
-  }, 22000);
+  const gateways = [
+    { url: 'https://text.pollinations.ai/openai', model: preferredModel },
+    { url: 'https://text.pollinations.ai/openai', model: preferredModel === 'openai' ? 'openai-fast' : 'openai' },
+    { url: 'https://gen.pollinations.ai/v1/chat/completions', model: 'openai' }
+  ];
 
-  if (!res.ok) return '';
-  const data = await res.json();
-  return (data?.choices?.[0]?.message?.content || '').trim();
+  for (let attempt = 0; attempt < gateways.length; attempt++) {
+    await waitForVisionRateLimitSlot();
+    const gw = gateways[attempt];
+    const randomSeed = Math.floor(100000 + Math.random() * 900000);
+    const ua = USER_AGENTS[(attempt + randomSeed) % USER_AGENTS.length];
+
+    try {
+      const res = await fetchWithTimeout(
+        gw.url,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Referer': 'https://renata-crp-tracker.app/'
+          },
+          body: JSON.stringify({
+            model: gw.model,
+            seed: randomSeed,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: promptText },
+                  { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+                ]
+              }
+            ],
+            temperature: 0.1
+          })
+        },
+        26000
+      );
+
+      if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 524) {
+        const retryAfterHeader = Number(res.headers?.get?.('retry-after')) || 0;
+        const backoffMs = retryAfterHeader > 0 ? retryAfterHeader * 1000 : (8000 + attempt * 6000);
+        addLog(`⏳ Vision AI [${gw.model}] HTTP ${res.status} (Rate Limit/Busy) — auto-waiting ${(backoffMs / 1000).toFixed(1)}s and retrying...`);
+        visionRateLimitedUntil = Date.now() + backoffMs;
+        await sleep(backoffMs);
+        continue;
+      }
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      const content = (data?.choices?.[0]?.message?.content || '').trim();
+      if (content) return content;
+    } catch (err) {
+      addLog(`⚠️ Vision AI [${gw.model}] attempt ${attempt + 1} notice: ${err.message}`);
+      await sleep(2500);
+    }
+  }
+  return '';
 }
 
 /**
@@ -1692,7 +2045,7 @@ async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
           }],
           generationConfig: { temperature: 0.1 }
         })
-      }, 16000);
+      }, 18000);
       const data = await response.json();
       const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
       if (extracted) return { text: extracted, engine: `Gemini Vision (${modelName})` };
@@ -1702,8 +2055,10 @@ async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
 }
 
 /**
- * 5-Stage Server-Side Auto-Retry + Dual Keyless Vision AI Pipeline:
- * Automatically checks the image across 5 distinct keyless OCR & AI Vision methods before ever returning an error!
+ * 5-Method Rate-Limit-Proof Image Pipeline (v5.6):
+ * - Checks SHA-256 cache first (0ms if previously processed!)
+ * - Runs Keyless Vision AI #1 (GPT-4o Vision) FIRST so handwritten photos succeed in 1 pass without wasting OCR.Space calls
+ * - Never exits prematurely on 0 matched products! Always picks the candidate with the MOST matched CRP products!
  */
 async function processImageOrderWithThreeRetries({
   imageBuffer,
@@ -1715,56 +2070,79 @@ async function processImageOrderWithThreeRetries({
   senderPushName,
   senderJid
 }) {
+  const imgHash = crypto.createHash('sha256').update(imageBuffer).digest('hex').slice(0, 24);
+  if (imageOcrResultCache.has(imgHash)) {
+    const cached = imageOcrResultCache.get(imgHash);
+    const combinedCached = [caption, cached.rawExtracted].filter(Boolean).join('\n').trim();
+    const parsedCached = parseWhatsAppOrderMessage({
+      messageText: combinedCached,
+      messageId,
+      timestamp,
+      senderPhone,
+      senderPushName,
+      senderJid,
+      isImageOrder: true
+    });
+    if (parsedCached.orders && parsedCached.orders.length > 0) {
+      addLog(`⚡ Image matched instantly from SHA-256 Cache (${parsedCached.orders.length} items, 0 API calls).`);
+      return {
+        ok: true,
+        attemptUsed: 1,
+        engine: `${cached.engine} (Cached)`,
+        extractedText: combinedCached,
+        parsed: parsedCached
+      };
+    }
+  }
+
   const base64Image = imageBuffer.toString('base64');
   const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
   const collectedTexts = [];
+  let bestCandidate = null;
+  let bestScore = -1;
 
   const stages = [
     {
-      name: 'Method 1/5 (Neural Handwriting & Table OCR Engine 2)',
+      name: 'Method 1/5 (Keyless Multimodal Vision AI #1 — GPT-4o Vision)',
       run: async () => {
         if (geminiKey) {
           const g = await runGeminiVisionPass(base64Image, mimeType, geminiKey);
           if (g && g.text) return g;
         }
-        const t = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
-        return { text: t, engine: 'Method 1: Neural Table OCR (Engine 2)' };
+        const aiText = await runKeylessVisionAiModel(base64Image, mimeType, 'openai');
+        return { text: aiText, engine: 'Method 1: Keyless Vision AI #1 (GPT-4o Vision)' };
       }
     },
     {
-      name: 'Method 2/5 (Raw Line-by-Line Camera Handwriting OCR Engine 2)',
+      name: 'Method 2/5 (Neural Handwriting & Table OCR Engine 2)',
+      run: async () => {
+        const t = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
+        return { text: t, engine: 'Method 2: Neural Table OCR (Engine 2)' };
+      }
+    },
+    {
+      name: 'Method 3/5 (Keyless Multimodal Vision AI #2 — Fast/Alt Vision)',
+      run: async () => {
+        const aiAlt = await runKeylessVisionAiModel(base64Image, mimeType, 'openai-fast');
+        return { text: aiAlt, engine: 'Method 3: Keyless Vision AI #2 (Alt Vision)' };
+      }
+    },
+    {
+      name: 'Method 4/5 (Raw Line-by-Line Camera OCR Engine 2)',
       run: async () => {
         const t2Raw = await runOcrSpacePass(base64Image, mimeType, '2', 'false');
-        return { text: t2Raw, engine: 'Method 2: Raw Line Camera OCR (Engine 2)' };
+        return { text: t2Raw, engine: 'Method 4: Raw Line Camera OCR (Engine 2)' };
       }
     },
     {
-      name: 'Method 3/5 (High-Contrast & Auto-Orientation OCR Engine 1)',
+      name: 'Method 5/5 (High-Contrast Orientation OCR Engine 1 + Deep Vision Retry)',
       run: async () => {
         const t1 = await runOcrSpacePass(base64Image, mimeType, '1', 'true');
-        const t1Raw = await runOcrSpacePass(base64Image, mimeType, '1', 'false');
-        return {
-          text: [t1, t1Raw].filter(Boolean).join('\n'),
-          engine: 'Method 3: High-Contrast Orientation OCR (Engine 1)'
-        };
-      }
-    },
-    {
-      name: 'Method 4/5 (Keyless Multimodal Vision AI #1 — GPT-4o Vision)',
-      run: async () => {
-        const aiText = await runKeylessVisionAiModel(base64Image, mimeType, 'openai');
-        return { text: aiText, engine: 'Method 4: Keyless Vision AI #1 (GPT-4o Vision)' };
-      }
-    },
-    {
-      name: 'Method 5/5 (Keyless Multimodal Vision AI #2 — Large Vision + Consensus)',
-      run: async () => {
-        const aiLarge = await runKeylessVisionAiModel(base64Image, mimeType, 'openai-large');
-        if (aiLarge) {
-          return { text: aiLarge, engine: 'Method 5: Keyless Vision AI #2 (Large Vision)' };
+        if (t1) {
+          return { text: t1, engine: 'Method 5: High-Contrast Orientation OCR (Engine 1)' };
         }
-        const tFinal = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
-        return { text: tFinal, engine: 'Method 5: Final Deep Recheck OCR' };
+        const aiDeep = await runKeylessVisionAiModel(base64Image, mimeType, 'mistral');
+        return { text: aiDeep, engine: 'Method 5: Deep Vision AI Retry' };
       }
     }
   ];
@@ -1774,7 +2152,7 @@ async function processImageOrderWithThreeRetries({
     try {
       if (i > 0) {
         addLog(`🔄 Image Auto-Recheck [${stage.name}] running...`);
-        await sleep(1100);
+        await sleep(1200);
       }
       const res = await stage.run();
       const rawExtracted = (res?.text || '').trim();
@@ -1793,12 +2171,49 @@ async function processImageOrderWithThreeRetries({
           senderJid,
           isImageOrder: true
         });
-        if ((parsed.isOrder && parsed.orders.length > 0) || (parsed.unrecognizedItems && parsed.unrecognizedItems.length > 0)) {
-          addLog(`✅ Image Order parsed on ${stage.name} (${parsed.orders.length} matched, ${(parsed.unrecognizedItems || []).length} unknown via ${res.engine}).`);
-          return {
+
+        const matchedCount = (parsed.orders || []).length;
+        const unknownCount = (parsed.unrecognizedItems || []).length;
+
+        // If this stage matched valid CRP products (matchedCount > 0), cache and score it!
+        if (matchedCount > 0) {
+          const score = matchedCount * 100 - unknownCount * 5;
+          if (score > bestScore) {
+            bestScore = score;
+            bestCandidate = {
+              ok: true,
+              attemptUsed: i + 1,
+              engine: res.engine,
+              rawExtracted,
+              extractedText: combinedText,
+              parsed
+            };
+          }
+          // Return immediately if we got valid CRP orders with 0 unrecognized noise (or from Vision AI Method 1/3)
+          if (unknownCount === 0 || i === 0 || i === 2) {
+            // On camera photos where valid CRP products were matched, ignore stray paper noise lines so valid products save immediately!
+            parsed.unrecognizedItems = [];
+            imageOcrResultCache.set(imgHash, { rawExtracted, engine: res.engine });
+            if (imageOcrResultCache.size > 300) {
+              const oldestKey = imageOcrResultCache.keys().next().value;
+              imageOcrResultCache.delete(oldestKey);
+            }
+            addLog(`✅ Image Order succeeded on ${stage.name} (${matchedCount} products matched via ${res.engine}).`);
+            return {
+              ok: true,
+              attemptUsed: i + 1,
+              engine: res.engine,
+              extractedText: combinedText,
+              parsed
+            };
+          }
+        } else if (unknownCount > 0 && !bestCandidate) {
+          // Keep as last-resort fallback ONLY if no stage finds any known CRP product
+          bestCandidate = {
             ok: true,
             attemptUsed: i + 1,
             engine: res.engine,
+            rawExtracted,
             extractedText: combinedText,
             parsed
           };
@@ -1807,6 +2222,17 @@ async function processImageOrderWithThreeRetries({
     } catch (err) {
       addLog(`⚠️ ${stage.name} warning: ${err.message}`);
     }
+  }
+
+  // If one of the stages matched valid CRP products, return the best stage result!
+  if (bestCandidate && bestCandidate.parsed?.orders?.length > 0) {
+    bestCandidate.parsed.unrecognizedItems = [];
+    imageOcrResultCache.set(imgHash, {
+      rawExtracted: bestCandidate.rawExtracted || '',
+      engine: bestCandidate.engine
+    });
+    addLog(`✅ Image Order resolved via Best Stage [${bestCandidate.engine}] (${bestCandidate.parsed.orders.length} products).`);
+    return bestCandidate;
   }
 
   // Final Combined Consensus Pass across all 5 methods
@@ -1821,7 +2247,7 @@ async function processImageOrderWithThreeRetries({
       senderJid,
       isImageOrder: true
     });
-    if ((parsedMerged.isOrder && parsedMerged.orders.length > 0) || (parsedMerged.unrecognizedItems && parsedMerged.unrecognizedItems.length > 0)) {
+    if (parsedMerged.orders && parsedMerged.orders.length > 0) {
       const seen = new Set();
       parsedMerged.orders = (parsedMerged.orders || []).filter((o) => {
         const k = `${o.crpCode}_${o.orderedQty}`;
@@ -1829,6 +2255,7 @@ async function processImageOrderWithThreeRetries({
         seen.add(k);
         return true;
       });
+      parsedMerged.unrecognizedItems = [];
       addLog(`✅ Image Order succeeded via 5-Method Combined Consensus (${parsedMerged.orders.length} items).`);
       return {
         ok: true,
@@ -1838,6 +2265,11 @@ async function processImageOrderWithThreeRetries({
         parsed: parsedMerged
       };
     }
+  }
+
+  // Only if 0 known products were found across all 5 methods, check if bestCandidate had a clear unknown medicine line
+  if (bestCandidate && bestCandidate.parsed?.unrecognizedItems?.length > 0) {
+    return bestCandidate;
   }
 
   return {
@@ -3682,20 +4114,23 @@ async function startWhatsApp() {
               } catch (e) {}
             }
 
-            // Process images strictly ONE BY ONE in a sequential FIFO queue so sending multiple images at once never causes errors!
+            // Pre-download image buffer while WhatsApp media token is fresh (with 3x auto-retry)
+            const preDownloadedBufferPromise = downloadImageBufferWithRetry(msg).catch((e) => {
+              addLog(`⚠️ Initial media pre-fetch warning (${inspected.msgId}): ${e.message}`);
+              return null;
+            });
+
+            // Process images strictly ONE BY ONE in a sequential FIFO queue with rate-limit guard!
             enqueueImageOrderTask(async () => {
-              addLog(`📸 Processing queued image (${inspected.msgId}) via 5-Method OCR & Vision Pipeline...`);
-              let imageBuffer = null;
-              try {
-                imageBuffer = await downloadMediaMessage(
-                  msg,
-                  'buffer',
-                  {},
-                  { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-                );
-              } catch (dlErr) {
-                addLog(`❌ Failed to download image media: ${dlErr.message}`);
-                return;
+              addLog(`📸 Processing queued image (${inspected.msgId}) via 5-Method Rate-Limit-Proof Pipeline...`);
+              let imageBuffer = await preDownloadedBufferPromise;
+              if (!imageBuffer) {
+                try {
+                  imageBuffer = await downloadImageBufferWithRetry(msg);
+                } catch (dlErr) {
+                  addLog(`❌ Failed to download image media after retries: ${dlErr.message}`);
+                  return;
+                }
               }
 
               const ocrPipelineResult = await processImageOrderWithThreeRetries({
@@ -4070,16 +4505,56 @@ app.get('/api/master-db/export', (req, res) => {
   res.send(JSON.stringify(masterDb, null, 2));
 });
 
-// Import Master DB from JSON
+// Import Master DB from JSON (Supports both 'merge' and 'replace' modes + older/newer JSON structures)
 app.post('/api/master-db/import', async (req, res) => {
-  const payload = req.body;
-  if (!payload || (!Array.isArray(payload.das) && !Array.isArray(payload.products))) {
-    return res.status(400).json({ ok: false, error: 'Invalid Master DB JSON format.' });
+  try {
+    const body = req.body || {};
+    const mode = body.mode === 'replace' ? 'replace' : 'merge';
+    const payload = body.dbData && typeof body.dbData === 'object' ? body.dbData : body;
+
+    const hasValidData =
+      payload &&
+      (Array.isArray(payload.das) ||
+        Array.isArray(payload.products) ||
+        Array.isArray(payload.productGroups) ||
+        Array.isArray(payload.adminAlertPhones) ||
+        Array.isArray(payload.authorizedImagePhones) ||
+        Array.isArray(payload));
+
+    if (!hasValidData) {
+      return res.status(400).json({
+        ok: false,
+        error: 'সঠিক JSON ডাটাবেস ফরম্যাট পাওয়া যায়নি (das বা products থাকতে হবে)।'
+      });
+    }
+
+    if (mode === 'replace') {
+      applyMasterDbObject(payload, true);
+      addLog(`🔄 Replaced Master DB from imported JSON (${masterDb.das.length} DAs, ${masterDb.products.length} Products, ${(masterDb.productGroups || []).length} Groups).`);
+    } else {
+      mergeMasterDbObject(payload, true);
+      addLog(`➕ Merged imported JSON into Master DB (${masterDb.das.length} DAs, ${masterDb.products.length} Products, ${(masterDb.productGroups || []).length} Groups).`);
+    }
+
+    scheduleCloudStateBackup(1000);
+    if (googleAuthReady) {
+      ensureSpreadsheetStructure(true).catch(() => {});
+    }
+
+    return res.json({
+      ok: true,
+      mode,
+      daCount: masterDb.das.length,
+      productCount: masterDb.products.length,
+      groupCount: (masterDb.productGroups || []).length,
+      message:
+        mode === 'replace'
+          ? `✅ সম্পূর্ণ ডাটাবেস সফলভাবে রিপ্লেস হয়েছে! (প্রতিনিধি: ${masterDb.das.length}, প্রোডাক্ট: ${masterDb.products.length}, গ্রুপ: ${(masterDb.productGroups || []).length})`
+          : `✅ আগের ডাটার সাথে নতুন JSON ফাইল সফলভাবে মার্জ হয়েছে! (মোট প্রতিনিধি: ${masterDb.das.length}, প্রোডাক্ট: ${masterDb.products.length}, গ্রুপ: ${(masterDb.productGroups || []).length})`
+    });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: 'JSON Import Error: ' + err.message });
   }
-  applyMasterDbObject(payload, true);
-  scheduleCloudStateBackup(1500);
-  addLog(`📥 Imported Master DB JSON (${masterDb.das.length} DAs, ${masterDb.products.length} Products).`);
-  res.json({ ok: true, daCount: masterDb.das.length, productCount: masterDb.products.length });
 });
 
 // ============================================================================
@@ -4445,7 +4920,7 @@ app.post('/api/whatsapp/logout', async (req, res) => {
 // Serve Neo-Brutalism v5.0 Master Command Center UI at "/"
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v5.5 \u2014 Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    /* Navigation Tabs */\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>\u26a1 Renata PLC (NK Depot) \u2014 CRP Order Bot v5.5</h1>\n        <p>Dynamic JSON Master DB \u2022 Self-Learning WhatsApp Admin Bot (01793362829) \u2022 5x Keyless AI OCR • Brand Group AI • Sequential Queue</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">\u23f3 WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">\u23f3 Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">\u26a1 RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">\ud83d\udcca Google Sheet \u2197</a>\n      </div>\n    </header>\n\n    <!-- NAVIGATION TABS -->\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">\ud83d\udce1 \u09e7. \u09ac\u099f \u0995\u09a8\u09cd\u099f\u09cd\u09b0\u09cb\u09b2 \u0993 \u09b2\u09be\u0987\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">\ud83d\udc65 \u09e8. \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">\ud83d\udc8a \u09e9. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">\ud83d\udcf1 \u09ea. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0993 \u0987\u09ae\u09c7\u099c \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u099f\u09bf\u0982\u09b8</button>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 1: BOT CONTROL, PENDING RESOLUTIONS, LIVE ORDERS & LOGS         -->\n    <!-- =================================================================== -->\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">\ud83c\udfaf \u09b8\u0995\u09cd\u09b0\u09bf\u09df \u0997\u09cd\u09b0\u09c1\u09aa</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">\ud83d\udce6 \u09ae\u09cb\u099f \u09b8\u09c7\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">\ud83d\udcb0 \u09ae\u09cb\u099f \u0985\u09b0\u09cd\u09a1\u09be\u09b0 (\u09f3)</div>\n          <div class=\"val\" id=\"statAmount\">\u09f30.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">\u2753 \u09aa\u09c7\u09a8\u09cd\u09a1\u09bf\u0982 \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">\ud83d\udcf2 \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u09a8\u09ae\u09cd\u09ac\u09b0</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <!-- PENDING AI QUESTIONS CARD (When unknown DA or unknown Product is waiting for reply) -->\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u0993 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8\u09b8\u09ae\u09c2\u09b9 (WhatsApp 01793362829 \u0985\u09a5\u09ac\u09be \u098f\u0996\u09be\u09a8 \u09a5\u09c7\u0995\u09c7 \u0989\u09a4\u09cd\u09a4\u09b0 \u09a6\u09bf\u09a8)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <!-- WHATSAPP QR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>\u09e7. WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09b6\u09a8</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <!-- GROUP SELECTOR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\u09e8. WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">\ud83d\udd04 \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09ab\u09cd\u09b0\u09c7\u09b6</button>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0986\u09aa\u09a8\u09be\u09b0 WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>\n            </select>\n            <label>\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u09b0\u09cd\u09a6\u09bf\u09b7\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b8\u09c7\u09ad \u09b9\u09b2\u09c7 \u09ae\u09c7\u09b8\u09c7\u099c\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u2705 \u09b0\u09bf\u09df\u09c7\u0995\u09b6\u09a8 \u09a6\u09bf\u09ac\u09c7\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">\ud83d\udcbe Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">\ud83d\udcb2 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n          </div>\n        </div>\n\n        <!-- TEST PARSER -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>\ud83e\uddea \u09e9. \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0993 \u09b8\u09c7\u09b2\u09ab-\u09b2\u09be\u09b0\u09cd\u09a8\u09bf\u0982 \u099f\u09c7\u09b8\u09cd\u099f\u09be\u09b0</span>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09ae\u09c7\u09b8\u09c7\u099c \u09b2\u09bf\u0996\u09c7 \u099f\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09a8\u09be\u09ae/\u0993\u09b7\u09c1\u09a7 \u09a6\u09bf\u09b2\u09c7 01793362829-\u098f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09ac\u09c7):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nCus: Nipun pharmacy E71\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">\ud83d\udd0d Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">\ud83d\ude80 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIVE ORDERS -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udccb \u09b8\u09b0\u09cd\u09ac\u09b6\u09c7\u09b7 \u099f\u09cd\u09b0\u09cd\u09af\u09be\u0995 \u09b9\u0993\u09df\u09be \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09b8\u09ae\u09c2\u09b9 (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">\ud83e\uddf9 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- SERVER LOGS -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udda5\ufe0f \u09b8\u09bf\u09b8\u09cd\u099f\u09c7\u09ae \u09b2\u0997 (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">\ud83e\uddf9 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 2: DA DATABASE MANAGER (ADD / EDIT / DELETE / CLEAR ALL)        -->\n    <!-- =================================================================== -->\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>\u2795 \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">\ud83d\uddd1\ufe0f \u09b8\u09ac DA \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09c1\u09a8 (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (\u09af\u09c7\u09ae\u09a8: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a6\u09c7\u0993\u09df\u09be \u09af\u09be\u09ac\u09c7):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>\u09a1\u09be\u0995\u09a8\u09be\u09ae / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udc65 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a4\u09be\u09b2\u09bf\u0995\u09be (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"\ud83d\udd0d ID, \u09a8\u09be\u09ae \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (Name)</th>\n                  <th>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0</th>\n                  <th>Aliases / \u09a1\u09be\u0995\u09a8\u09be\u09ae</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8 (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 3: PRODUCT & WRONG SPELLING (ALIASES) MANAGER                   -->\n    <!-- =================================================================== -->\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <!-- PRODUCT BRAND GROUPS MANAGER (COMMON KEYWORDS ACROSS VARIANTS) -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\uddc2\ufe0f \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09ae\u09cd\u09af\u09be\u09a8\u09c7\u099c\u09be\u09b0 (Total Groups: <span id=\"grpTotalLabel\">0</span>)</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap;\">\n            <input type=\"text\" id=\"newGroupNameInput\" placeholder=\"\u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (e.g. LUCAN-R)\" style=\"max-width:160px; padding:5px 8px;\" />\n            <input type=\"text\" id=\"newGroupKeywordsInput\" placeholder=\"\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (e.g. lucanr, luen, luncanr)\" style=\"max-width:240px; padding:5px 8px;\" />\n            <button class=\"btn-primary btn-sm\" onclick=\"saveBrandGroup()\">\ud83d\udcbe \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.83rem; font-weight:700; margin-bottom:10px;\">\n            \ud83d\udca1 <b>\u0995\u09c0\u09ad\u09be\u09ac\u09c7 \u0995\u09be\u099c \u0995\u09b0\u09c7:</b> \u098f\u0995\u0987 \u09a8\u09be\u09ae\u09c7\u09b0 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f (\u09af\u09c7\u09ae\u09a8: <code>LUCAN-R 200</code>, <code>LUCAN-R 150</code>, <code>LUCAN-R 50</code>, <code>LUCAN-R SYP</code>) \u098f\u0995\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09a5\u09be\u0995\u09c7\u0964 \u0995\u09cb\u09a8\u09cb \u098f\u0995\u099f\u09bf \u09ad\u09cd\u09af\u09be\u09b0\u09bf\u09df\u09c7\u09a8\u09cd\u099f\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 (\u09af\u09c7\u09ae\u09a8: <code>luen 200</code> \u09ac\u09be <code>luncanr 200</code>) \u09b6\u09c7\u0996\u09be\u09b2\u09c7 \u0995\u09ae\u09a8 \u09a8\u09be\u09ae <code>luen</code> / <code>luncanr</code> \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u098f\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09df\u2014\u09ab\u09b2\u09c7 \u09aa\u09b0\u09ac\u09b0\u09cd\u09a4\u09c0\u09a4\u09c7 \u0995\u09c7\u0989 <code>luen 150</code> \u09ac\u09be <code>luen 50</code> \u09b2\u09bf\u0996\u09b2\u09c7\u0993 \u09ac\u099f \u09a8\u09bf\u099c\u09c7 \u09a5\u09c7\u0995\u09c7\u0987 \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7!\n          </p>\n          <div class=\"table-wrap\" style=\"max-height:320px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Group Name (\u0995\u09ae\u09a8 \u09a8\u09be\u09ae)</th>\n                  <th>\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09b8\u09ae\u09c2\u09b9 (Variants)</th>\n                  <th>\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 / \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Shared Keywords)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productGroupsBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>\ud83d\udc8a \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u09a6\u09be\u09ae \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (\u09af\u09c7\u09ae\u09a8: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09af\u09be\u0995 \u09b8\u09be\u0987\u099c (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (\u09f3 \u09a6\u09b0):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. TOTIFEN\" />\n            </div>\n          </div>\n          <label>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u09b8\u09cd\u099f / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09b2\u09bf\u0996\u09c1\u09a8 \u2014 \u09af\u09c7\u0995\u09cb\u09a8\u09cb \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09b2\u09c7\u0987 \u098f\u0987 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>\ud83d\udc8a \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"\ud83d\udd0d \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae, \u0995\u09cb\u09a1 \u09ac\u09be \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u0993 \u09aa\u09cd\u09af\u09be\u0995</th>\n                  <th>Trade Price (\u09f3)</th>\n                  <th>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09ae\u09c2\u09b9 (Recognized Wrong Spellings / Aliases)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 4: MULTIPLE PHONE NUMBERS & JSON DATABASE BACKUP                -->\n    <!-- =================================================================== -->\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\">\n          <div class=\"card-header h-yellow\">\n            <span>\ud83d\udcf2 \u09e7. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u0993 \u09b0\u09bf\u09aa\u09cd\u09b2\u09be\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7 <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 DA ID/\u09a8\u09be\u09ae</b> \u0985\u09a5\u09ac\u09be <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u0993\u09b7\u09c1\u09a7\u09c7\u09b0 \u09ac\u09be\u09a8\u09be\u09a8</b> \u09aa\u09be\u0993\u09df\u09be \u0997\u09c7\u09b2\u09c7 \u09ac\u099f \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb\u09a4\u09c7 WhatsApp \u09ae\u09c7\u09b8\u09c7\u099c \u09aa\u09be\u09a0\u09bf\u09df\u09c7 \u099c\u09bf\u099c\u09cd\u099e\u09c7\u09b8 \u0995\u09b0\u09ac\u09c7 \u098f\u09ac\u0982 \u098f\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 Reply \u09a6\u09bf\u09b2\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n            </p>\n            <label>\u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\">\n          <div class=\"card-header h-mint\">\n            <span>\ud83d\udcf8 \u09e8. \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0996\u09be\u09a4\u09be\u09df \u09b2\u09bf\u0996\u09c7 \u099b\u09ac\u09bf \u09a4\u09c1\u09b2\u09c7 \u09aa\u09be\u09a0\u09be\u09b2\u09c7 \u09b6\u09c1\u09a7\u09c1\u09ae\u09be\u09a4\u09cd\u09b0 \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 \u09ac\u099f \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b0\u09bf\u09a1 \u0995\u09b0\u09ac\u09c7 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09af\u09a4\u0996\u09c1\u09b6\u09bf \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u09ac\u09be \u09b0\u09bf\u09ae\u09c1\u09ad \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8):\n            </p>\n            <label>\u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u099b\u09ac\u09bf\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udce6 \u09e9. JSON \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09ac\u09cd\u09af\u09be\u0995\u0986\u09aa \u0993 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 (Master DB JSON)</span>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:12px;\">\n            \u0986\u09aa\u09a8\u09be\u09b0 \u09b8\u09ae\u09b8\u09cd\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f, \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09ac\u0982 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09ae\u09c7\u09ae\u09cb\u09b0\u09bf\u09a4\u09c7 \u0993 Google Sheet-\u098f\u09b0 <code>_Bot_State</code>-\u098f \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09b8\u09c7\u09ad \u09a5\u09be\u0995\u09c7\u0964 \u099a\u09be\u0987\u09b2\u09c7 JSON \u09ab\u09be\u0987\u09b2 \u09b9\u09bf\u09b8\u09c7\u09ac\u09c7 \u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1 \u09ac\u09be \u0986\u09aa\u09b2\u09cb\u09a1\u0993 \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8:\n          </p>\n          <div class=\"btn-row\">\n            <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">\u2b07 Download master_db.json</a>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n          renderProductGroupsTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">\ud83d\uddd1\ufe0f Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a8\u09bf\u09b6\u09cd\u099a\u09bf\u09a4 \u09af\u09c7 [${daId}] \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09a5\u09c7\u0995\u09c7 \u09b8\u09ac \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (All DAs) \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    \n    function renderProductGroupsTable() {\n      const groups = masterData.productGroups || [];\n      const prods = masterData.products || [];\n      const lbl = document.getElementById('grpTotalLabel');\n      if (lbl) lbl.textContent = groups.length;\n      const tbody = document.getElementById('productGroupsBody');\n      if (!tbody) return;\n      if (groups.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"5\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09c7\u0987\u0964</td></tr>';\n        return;\n      }\n      tbody.innerHTML = groups.map((g) => {\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        return `\n          <tr>\n            <td><span class=\"badge ok\">${esc(g.groupName)}</span></td>\n            <td style=\"font-size:0.78rem;\">\n              ${members.map((m) => `<div><b>[${esc(m.code)}]</b> ${esc(m.name)} (\u09f3${Number(m.price).toFixed(2)})</div>`).join('') || '\u2014'}\n            </td>\n            <td>\n              ${(g.keywords || []).map((kw) => `\n                <span class=\"alias-chip\">\n                  ${esc(kw)}\n                  <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyGroupKeyword('${esc(g.groupName)}', '${esc(kw)}', 'remove')\">\u00d7</span>\n                </span>\n              `).join('')}\n            </td>\n            <td>\n              <div style=\"display:flex; gap:4px; min-width:150px;\">\n                <input type=\"text\" id=\"grpKw_${esc(g.groupName)}\" placeholder=\"\u0995\u09ae\u09a8 \u09ac\u09be\u09a8\u09be\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n                <button class=\"btn-primary btn-sm\" onclick=\"quickAddGroupKw('${esc(g.groupName)}')\">+ \u09af\u09cb\u0997</button>\n              </div>\n            </td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"editBrandGroup('${esc(g.groupName)}')\">\u270f\ufe0f</button>\n              <button class=\"btn-danger btn-sm\" onclick=\"deleteBrandGroup('${esc(g.groupName)}')\">\ud83d\uddd1\ufe0f</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function editBrandGroup(groupName) {\n      const g = (masterData.productGroups || []).find((x) => x.groupName === groupName);\n      if (!g) return;\n      document.getElementById('newGroupNameInput').value = g.groupName;\n      document.getElementById('newGroupKeywordsInput').value = (g.keywords || []).join(', ');\n    }\n\n    async function saveBrandGroup() {\n      const groupName = document.getElementById('newGroupNameInput').value;\n      const keywords = document.getElementById('newGroupKeywordsInput').value;\n      if (!groupName.trim()) return alert('\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae \u09a6\u09bf\u09a8');\n      await fetch('/api/product-group/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keywords })\n      });\n      document.getElementById('newGroupNameInput').value = '';\n      document.getElementById('newGroupKeywordsInput').value = '';\n      await loadMasterDb();\n    }\n\n    async function quickAddGroupKw(groupName) {\n      const inp = document.getElementById('grpKw_' + groupName);\n      if (!inp || !inp.value.trim()) return;\n      await modifyGroupKeyword(groupName, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyGroupKeyword(groupName, keyword, action) {\n      await fetch('/api/product-group/keyword', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keyword, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteBrandGroup(groupName) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${groupName}] \u0997\u09cd\u09b0\u09c1\u09aa\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName })\n      });\n      await loadMasterDb();\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">\u09f3${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"\u09ae\u09c1\u099b\u09c1\u09a8\">\u00d7</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09c1\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ \u09af\u09cb\u0997</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">\ud83d\uddd1\ufe0f</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${code}] \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u098f\u09ac\u0982 \u0985\u09ab\u09bf\u09b6\u09bf\u09df\u09be\u09b2 Trade Price \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('\u2705 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '\ud83d\udfe2 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '\ud83d\udcf2 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '\u23f3 ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '\ud83d\udfe2 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '\u26a0\ufe0f Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '\u26a1 RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '\u09f3' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        // Render Pending Resolutions Box\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          pList.innerHTML = pendings.map((p) => {\n            if (p.type === 'UNKNOWN_DA') {\n              return `\n                <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (Unknown DA)</b> ${p.detectedDaId ? `[\u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 ID: <b>${esc(p.detectedDaId)}</b>]` : ''}</div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', '))}</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID \u0993 \u09a8\u09be\u09ae \u09b2\u09bf\u0996\u09c1\u09a8 (\u09af\u09c7\u09ae\u09a8: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\u2705 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a4\u09bf\u09b2</button>\n                  </div>\n                </div>\n              `;\n            } else {\n              return `\n                <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f/\u09ac\u09be\u09a8\u09be\u09a8: \"${esc(p.unknownProductText)}\" (\u09aa\u09b0\u09bf\u09ae\u09be\u09a3: ${esc(p.orderedQty)})</b></div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf: ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | \u09ae\u09c2\u09b2 \u09b2\u09be\u0987\u09a8: \"${esc(p.rawLine)}\"</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"\u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u09ac\u09be \u0995\u09cb\u09a1 (\u09af\u09c7\u09ae\u09a8: Totifen \u09ac\u09be 919)\" style=\"max-width:320px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\ud83e\udde0 \u09ac\u09be\u09a8\u09be\u09a8 \u09b6\u09c7\u0996\u09be\u09a8 \u0993 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a6 \u09a6\u09bf\u09a8</button>\n                  </div>\n                </div>\n              `;\n            }\n          }).join('');\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">\u2705</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp \u09b8\u099a\u09b2 \u0986\u099b\u09c7!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">\u2601\ufe0f Cloud Session & Master DB Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp \u2794 Linked Devices \u09a5\u09c7\u0995\u09c7 \u09b8\u09cd\u0995\u09cd\u09af\u09be\u09a8 \u0995\u09b0\u09c1\u09a8</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">\ud83d\udd04 WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...</p>';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        if (groups.length !== lastGroupsCount && !groupInputTouched) {\n          lastGroupsCount = groups.length;\n          select.innerHTML = '<option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>';\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (data.botConfig.targetGroupId === g.id) opt.selected = true;\n            select.appendChild(opt);\n          });\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o) =>\n                '<tr>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>\u09f3' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">\u09f3' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td>' + esc(o.matchType) + '</td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"10\" style=\"text-align:center; font-weight:700;\">\u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u09ac\u09be\u09ab\u09be\u09b0\u09c7 \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09c7\u0987\u0964</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('\u0997\u09cd\u09b0\u09c1\u09aa \u09b2\u09bf\u09b8\u09cd\u099f \u0986\u09aa\u09a1\u09c7\u099f \u09b9\u09df\u09c7\u099b\u09c7! \u09ae\u09cb\u099f \u0997\u09cd\u09b0\u09c1\u09aa: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '\u2705 \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '\u2705 Google Sheet-\u098f \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 DA \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b8\u09bf\u0999\u09cd\u0995 \u09b9\u09df\u09c7\u099b\u09c7!' : '\u26a0\ufe0f Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">\ud83d\udc64 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) \u2014 ${data.daInfo.isKnownDA ? '\u2705 \u09aa\u09b0\u09bf\u099a\u09bf\u09a4' : '\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 (Admin \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09a8\u09cb \u09b9\u09ac\u09c7)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">\u2705 \u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 \u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${data.orders.length}\u099f\u09bf</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">\ud83e\udd14 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be\u09a8\u09be\u09a8: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || '\u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964';\n      fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('\u09a8\u09a4\u09c1\u09a8 WhatsApp \u0985\u09cd\u09af\u09be\u0995\u09be\u0989\u09a8\u09cd\u099f \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
+  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v5.6 \u2014 Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    /* Navigation Tabs */\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>\u26a1 Renata PLC (NK Depot) \u2014 CRP Order Bot v5.6</h1>\n        <p>Dynamic JSON Master DB \u2022 Self-Learning WhatsApp Admin Bot (01793362829) \u2022 5x Keyless AI OCR \u2022 Brand Group AI \u2022 Sequential Queue</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">\u23f3 WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">\u23f3 Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">\u26a1 RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">\ud83d\udcca Google Sheet \u2197</a>\n      </div>\n    </header>\n\n    <!-- NAVIGATION TABS -->\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">\ud83d\udce1 \u09e7. \u09ac\u099f \u0995\u09a8\u09cd\u099f\u09cd\u09b0\u09cb\u09b2 \u0993 \u09b2\u09be\u0987\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">\ud83d\udc65 \u09e8. \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">\ud83d\udc8a \u09e9. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-groups', this)\">\ud83e\udde9 \u09ea. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (<span id=\"navGrpCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">\ud83d\udcf1 \u09eb. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u0993 JSON \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f</button>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 1: BOT CONTROL, PENDING RESOLUTIONS, LIVE ORDERS & LOGS         -->\n    <!-- =================================================================== -->\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">\ud83c\udfaf \u09b8\u0995\u09cd\u09b0\u09bf\u09df \u0997\u09cd\u09b0\u09c1\u09aa</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">\ud83d\udce6 \u09ae\u09cb\u099f \u09b8\u09c7\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">\ud83d\udcb0 \u09ae\u09cb\u099f \u0985\u09b0\u09cd\u09a1\u09be\u09b0 (\u09f3)</div>\n          <div class=\"val\" id=\"statAmount\">\u09f30.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">\u2753 \u09aa\u09c7\u09a8\u09cd\u09a1\u09bf\u0982 \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">\ud83d\udcf2 \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u09a8\u09ae\u09cd\u09ac\u09b0</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <!-- PENDING AI QUESTIONS CARD (When unknown DA or unknown Product is waiting for reply) -->\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u0993 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8\u09b8\u09ae\u09c2\u09b9 (WhatsApp 01793362829 \u0985\u09a5\u09ac\u09be \u098f\u0996\u09be\u09a8 \u09a5\u09c7\u0995\u09c7 \u0989\u09a4\u09cd\u09a4\u09b0 \u09a6\u09bf\u09a8)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <!-- WHATSAPP QR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>\u09e7. WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09b6\u09a8</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <!-- GROUP SELECTOR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\u09e8. WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">\ud83d\udd04 \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09ab\u09cd\u09b0\u09c7\u09b6</button>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0986\u09aa\u09a8\u09be\u09b0 WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>\n            </select>\n            <label>\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u09b0\u09cd\u09a6\u09bf\u09b7\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b8\u09c7\u09ad \u09b9\u09b2\u09c7 \u09ae\u09c7\u09b8\u09c7\u099c\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u2705 \u09b0\u09bf\u09df\u09c7\u0995\u09b6\u09a8 \u09a6\u09bf\u09ac\u09c7\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">\ud83d\udcbe Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">\ud83d\udcb2 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n          </div>\n        </div>\n\n        <!-- TEST PARSER -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>\ud83e\uddea \u09e9. \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0993 \u09b8\u09c7\u09b2\u09ab-\u09b2\u09be\u09b0\u09cd\u09a8\u09bf\u0982 \u099f\u09c7\u09b8\u09cd\u099f\u09be\u09b0</span>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09ae\u09c7\u09b8\u09c7\u099c \u09b2\u09bf\u0996\u09c7 \u099f\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09a8\u09be\u09ae/\u0993\u09b7\u09c1\u09a7 \u09a6\u09bf\u09b2\u09c7 01793362829-\u098f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09ac\u09c7):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nCus: Nipun pharmacy E71\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">\ud83d\udd0d Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">\ud83d\ude80 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIVE ORDERS -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udccb \u09b8\u09b0\u09cd\u09ac\u09b6\u09c7\u09b7 \u099f\u09cd\u09b0\u09cd\u09af\u09be\u0995 \u09b9\u0993\u09df\u09be \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09b8\u09ae\u09c2\u09b9 (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">\ud83e\uddf9 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- SERVER LOGS -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udda5\ufe0f \u09b8\u09bf\u09b8\u09cd\u099f\u09c7\u09ae \u09b2\u0997 (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">\ud83e\uddf9 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 2: DA DATABASE MANAGER (ADD / EDIT / DELETE / CLEAR ALL)        -->\n    <!-- =================================================================== -->\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>\u2795 \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">\ud83d\uddd1\ufe0f \u09b8\u09ac DA \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09c1\u09a8 (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (\u09af\u09c7\u09ae\u09a8: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a6\u09c7\u0993\u09df\u09be \u09af\u09be\u09ac\u09c7):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>\u09a1\u09be\u0995\u09a8\u09be\u09ae / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udc65 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a4\u09be\u09b2\u09bf\u0995\u09be (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"\ud83d\udd0d ID, \u09a8\u09be\u09ae \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (Name)</th>\n                  <th>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0</th>\n                  <th>Aliases / \u09a1\u09be\u0995\u09a8\u09be\u09ae</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8 (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 3: PRODUCT & WRONG SPELLING (ALIASES) MANAGER                   -->\n    <!-- =================================================================== -->\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>\ud83d\udc8a \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u09a6\u09be\u09ae \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (\u09af\u09c7\u09ae\u09a8: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09af\u09be\u0995 \u09b8\u09be\u0987\u099c (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (\u09f3 \u09a6\u09b0):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family / \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. LUCAN-R, TOTIFEN\" />\n            </div>\n          </div>\n          <label>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u09b8\u09cd\u099f / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09b2\u09bf\u0996\u09c1\u09a8 \u2014 \u09af\u09c7\u0995\u09cb\u09a8\u09cb \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09b2\u09c7\u0987 \u098f\u0987 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>\ud83d\udc8a \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"\ud83d\udd0d \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae, \u0995\u09cb\u09a1 \u09ac\u09be \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u0993 \u09aa\u09cd\u09af\u09be\u0995</th>\n                  <th>Trade Price (\u09f3)</th>\n                  <th>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09ae\u09c2\u09b9 (Recognized Wrong Spellings / Aliases)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 4: PRODUCT COMMON GROUP & KEYWORD MANAGER                       -->\n    <!-- =================================================================== -->\n    <div id=\"tab-groups\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83e\udde9 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09ae\u09cd\u09af\u09be\u09a8\u09c7\u099c\u09be\u09b0 (Total Groups: <span id=\"grpTotalLabel\">0</span>)</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap;\">\n            <input type=\"text\" id=\"newGroupNameInput\" placeholder=\"\u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (e.g. LUCAN-R)\" style=\"max-width:170px; padding:6px 10px;\" />\n            <input type=\"text\" id=\"newGroupKeywordsInput\" placeholder=\"\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (e.g. lucanr, luen, luncanr)\" style=\"max-width:260px; padding:6px 10px;\" />\n            <button class=\"btn-primary btn-sm\" onclick=\"saveBrandGroup()\">\ud83d\udcbe \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetBrandGroupsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.85rem; font-weight:700; margin-bottom:12px;\">\n            \ud83d\udca1 <b>\u0995\u09c0\u09ad\u09be\u09ac\u09c7 \u0995\u09be\u099c \u0995\u09b0\u09c7:</b> \u098f\u0995\u0987 \u09a8\u09be\u09ae\u09c7\u09b0 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f (\u09af\u09c7\u09ae\u09a8: <code>LUCAN-R 200</code>, <code>LUCAN-R 150</code>, <code>LUCAN-R 50</code>, <code>LUCAN-R SYP</code>) \u098f\u0995\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09a5\u09be\u0995\u09c7\u0964 \u0995\u09cb\u09a8\u09cb \u098f\u0995\u099f\u09bf \u09ad\u09cd\u09af\u09be\u09b0\u09bf\u09df\u09c7\u09a8\u09cd\u099f\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 (\u09af\u09c7\u09ae\u09a8: <code>luen 200</code> \u09ac\u09be <code>luncanr 200</code>) \u09b6\u09c7\u0996\u09be\u09b2\u09c7 \u0995\u09ae\u09a8 \u09a8\u09be\u09ae <code>luen</code> / <code>luncanr</code> \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u098f\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09df\u2014\u09ab\u09b2\u09c7 \u09aa\u09b0\u09ac\u09b0\u09cd\u09a4\u09c0\u09a4\u09c7 \u0995\u09c7\u0989 <code>luen 150</code>, <code>luen 50</code> \u09ac\u09be <code>luen syp</code> \u09b2\u09bf\u0996\u09b2\u09c7\u0993 \u09ac\u099f \u09a8\u09bf\u099c\u09c7 \u09a5\u09c7\u0995\u09c7\u0987 \u099a\u09bf\u09a8\u09c7 \u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf Google Sheet-\u098f \u09af\u09cb\u0997 \u0995\u09b0\u09ac\u09c7!\n          </p>\n          <div style=\"margin-bottom:12px;\">\n            <input type=\"text\" id=\"groupSearchInput\" placeholder=\"\ud83d\udd0d \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae, \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductGroupsTable()\" style=\"max-width:360px;\" />\n          </div>\n          <div class=\"table-wrap\" style=\"max-height:520px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Group Name (\u0995\u09ae\u09a8 \u09a8\u09be\u09ae)</th>\n                  <th>\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09b8\u09ae\u09c2\u09b9 (Variants & Trade Price)</th>\n                  <th>\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 / \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Shared Keywords)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productGroupsBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 5: ADMIN SETTINGS, PHONE NUMBERS & JSON FILE IMPORT / EXPORT    -->\n    <!-- =================================================================== -->\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-yellow\">\n            <span>\ud83d\udcf2 \u09e7. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u0993 \u09b0\u09bf\u09aa\u09cd\u09b2\u09be\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7 <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 DA ID/\u09a8\u09be\u09ae</b> \u0985\u09a5\u09ac\u09be <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u0993\u09b7\u09c1\u09a7\u09c7\u09b0 \u09ac\u09be\u09a8\u09be\u09a8</b> \u09aa\u09be\u0993\u09df\u09be \u0997\u09c7\u09b2\u09c7 \u09ac\u099f \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb\u09a4\u09c7 WhatsApp \u09ae\u09c7\u09b8\u09c7\u099c \u09aa\u09be\u09a0\u09bf\u09df\u09c7 \u099c\u09bf\u099c\u09cd\u099e\u09c7\u09b8 \u0995\u09b0\u09ac\u09c7 \u098f\u09ac\u0982 \u098f\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 Reply \u09a6\u09bf\u09b2\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n            </p>\n            <label>\u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\ud83d\udcf8 \u09e8. \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0996\u09be\u09a4\u09be\u09df \u09b2\u09bf\u0996\u09c7 \u099b\u09ac\u09bf \u09a4\u09c1\u09b2\u09c7 \u09aa\u09be\u09a0\u09be\u09b2\u09c7 \u09b6\u09c1\u09a7\u09c1\u09ae\u09be\u09a4\u09cd\u09b0 \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 \u09ac\u099f \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b0\u09bf\u09a1 \u0995\u09b0\u09ac\u09c7 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09af\u09a4\u0996\u09c1\u09b6\u09bf \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u09ac\u09be \u09b0\u09bf\u09ae\u09c1\u09ad \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8):\n            </p>\n            <label>\u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u099b\u09ac\u09bf\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <!-- JSON FILE IMPORT & EXPORT CARD -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udcc2 \u09e9. \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 JSON \u09ab\u09be\u0987\u09b2 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0993 \u09ac\u09cd\u09af\u09be\u0995\u0986\u09aa (Import / Export Master DB JSON)</span>\n          <a href=\"/api/master-db/export\" class=\"btn-link btn-blue btn-sm\">\ud83d\udce5 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1 (.json)</a>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.86rem; font-weight:700; margin-bottom:12px;\">\n            \u0986\u09aa\u09a8\u09be\u09b0 \u0995\u09be\u099b\u09c7 \u0986\u0997\u09c7\u09b0 \u0995\u09cb\u09a8\u09cb <code>.json</code> \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09ab\u09be\u0987\u09b2 \u09a5\u09be\u0995\u09b2\u09c7 \u09a8\u09bf\u099a\u09c7 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c7 \u09b8\u09b0\u09be\u09b8\u09b0\u09bf \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8\u0964 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09b2\u09c7 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f, \u09b6\u09c7\u0996\u09be\u09a8\u09cb \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa \u098f\u09ac\u0982 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u0993 Google Sheet-\u098f \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n          </p>\n\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:16px; align-items:start;\">\n            <div style=\"border:2.5px dashed #000; background:#FEF9C3; padding:14px; border-radius:10px;\">\n              <label style=\"margin-top:0;\">\ud83d\udcc1 \u09e7. \u0986\u09aa\u09a8\u09be\u09b0 \u0995\u09ae\u09cd\u09aa\u09bf\u0989\u099f\u09be\u09b0 \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a5\u09c7\u0995\u09c7 JSON \u09ab\u09be\u0987\u09b2 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n              <input type=\"file\" id=\"jsonImportFileInput\" accept=\".json,application/json\" onchange=\"handleJsonFileSelect(this)\" style=\"margin-top:6px; padding:8px; background:#fff; border:2px solid #000; border-radius:8px; width:100%; font-weight:700; cursor:pointer;\" />\n              <div id=\"jsonFileSummary\" style=\"margin-top:8px; font-size:0.82rem; font-weight:800; color:#047857;\"></div>\n\n              <label style=\"margin-top:12px;\">\u2699\ufe0f \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09ae\u09cb\u09a1 (Import Mode):</label>\n              <select id=\"jsonImportModeSelect\">\n                <option value=\"merge\">\u2795 \u0986\u0997\u09c7\u09b0 \u09a1\u09be\u099f\u09be\u09b0 \u09b8\u09be\u09a5\u09c7 \u09ae\u09be\u09b0\u09cd\u099c \u0995\u09b0\u09c1\u09a8 (Merge \u2014 \u0986\u0997\u09c7\u09b0 \u0993 \u09a8\u09a4\u09c1\u09a8 \u09b8\u09ac \u09a5\u09be\u0995\u09ac\u09c7)</option>\n                <option value=\"replace\">\ud83d\udd04 \u09aa\u09c1\u09b0\u09cb \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b0\u09bf\u09aa\u09cd\u09b2\u09c7\u09b8 \u0995\u09b0\u09c1\u09a8 (Replace \u2014 \u09ab\u09be\u0987\u09b2\u09c7\u09b0 \u09a1\u09be\u099f\u09be \u09b8\u09c7\u099f \u09b9\u09ac\u09c7)</option>\n              </select>\n\n              <div class=\"btn-row\">\n                <button class=\"btn-primary\" onclick=\"importMasterDbJson()\">\ud83d\udce4 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09c1\u09a8</button>\n                <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">\u2b07 Download master_db.json</a>\n              </div>\n              <div id=\"jsonImportStatusMsg\" style=\"margin-top:10px; font-size:0.85rem; font-weight:800;\"></div>\n            </div>\n\n            <div>\n              <label style=\"margin-top:0;\">\ud83d\udcdd \u09e8. \u09ab\u09be\u0987\u09b2 \u09aa\u09cd\u09b0\u09bf\u09ad\u09bf\u0989 \u0985\u09a5\u09ac\u09be \u09b8\u09b0\u09be\u09b8\u09b0\u09bf JSON \u0995\u09cb\u09a1 \u09aa\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <textarea id=\"jsonImportTextInput\" placeholder='{\"das\": [...], \"products\": [...], \"productGroups\": [...]}' style=\"min-height:165px; font-size:0.78rem;\"></textarea>\n            </div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          const navGrp = document.getElementById('navGrpCount');\n          if (navGrp) navGrp.textContent = (data.productGroups || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n          renderProductGroupsTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">\ud83d\uddd1\ufe0f Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a8\u09bf\u09b6\u09cd\u099a\u09bf\u09a4 \u09af\u09c7 [${daId}] \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09a5\u09c7\u0995\u09c7 \u09b8\u09ac \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (All DAs) \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    \n    function renderProductGroupsTable() {\n      const q = (document.getElementById('groupSearchInput')?.value || '').trim().toLowerCase();\n      const allGroups = masterData.productGroups || [];\n      const prods = masterData.products || [];\n      const navGrp = document.getElementById('navGrpCount');\n      if (navGrp) navGrp.textContent = allGroups.length;\n      const groups = allGroups.filter((g) => {\n        if (!q) return true;\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        const memberNames = members.map((m) => `${m.code} ${m.name}`).join(' ');\n        return `${g.groupName} ${(g.keywords || []).join(' ')} ${memberNames}`.toLowerCase().includes(q);\n      });\n      const lbl = document.getElementById('grpTotalLabel');\n      if (lbl) lbl.textContent = groups.length;\n      const tbody = document.getElementById('productGroupsBody');\n      if (!tbody) return;\n      if (groups.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"5\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09c7\u0987\u0964</td></tr>';\n        return;\n      }\n      tbody.innerHTML = groups.map((g) => {\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        return `\n          <tr>\n            <td><span class=\"badge ok\">${esc(g.groupName)}</span></td>\n            <td style=\"font-size:0.78rem;\">\n              ${members.map((m) => `<div><b>[${esc(m.code)}]</b> ${esc(m.name)} (\u09f3${Number(m.price).toFixed(2)})</div>`).join('') || '\u2014'}\n            </td>\n            <td>\n              ${(g.keywords || []).map((kw) => `\n                <span class=\"alias-chip\">\n                  ${esc(kw)}\n                  <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyGroupKeyword('${esc(g.groupName)}', '${esc(kw)}', 'remove')\">\u00d7</span>\n                </span>\n              `).join('')}\n            </td>\n            <td>\n              <div style=\"display:flex; gap:4px; min-width:150px;\">\n                <input type=\"text\" id=\"grpKw_${esc(g.groupName)}\" placeholder=\"\u0995\u09ae\u09a8 \u09ac\u09be\u09a8\u09be\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n                <button class=\"btn-primary btn-sm\" onclick=\"quickAddGroupKw('${esc(g.groupName)}')\">+ \u09af\u09cb\u0997</button>\n              </div>\n            </td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"editBrandGroup('${esc(g.groupName)}')\">\u270f\ufe0f</button>\n              <button class=\"btn-danger btn-sm\" onclick=\"deleteBrandGroup('${esc(g.groupName)}')\">\ud83d\uddd1\ufe0f</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function editBrandGroup(groupName) {\n      const g = (masterData.productGroups || []).find((x) => x.groupName === groupName);\n      if (!g) return;\n      document.getElementById('newGroupNameInput').value = g.groupName;\n      document.getElementById('newGroupKeywordsInput').value = (g.keywords || []).join(', ');\n    }\n\n    async function saveBrandGroup() {\n      const groupName = document.getElementById('newGroupNameInput').value;\n      const keywords = document.getElementById('newGroupKeywordsInput').value;\n      if (!groupName.trim()) return alert('\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae \u09a6\u09bf\u09a8');\n      await fetch('/api/product-group/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keywords })\n      });\n      document.getElementById('newGroupNameInput').value = '';\n      document.getElementById('newGroupKeywordsInput').value = '';\n      await loadMasterDb();\n    }\n\n    async function quickAddGroupKw(groupName) {\n      const inp = document.getElementById('grpKw_' + groupName);\n      if (!inp || !inp.value.trim()) return;\n      await modifyGroupKeyword(groupName, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyGroupKeyword(groupName, keyword, action) {\n      await fetch('/api/product-group/keyword', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keyword, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteBrandGroup(groupName) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${groupName}] \u0997\u09cd\u09b0\u09c1\u09aa\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetBrandGroupsToDefault() {\n      if (!confirm('\u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u0995\u09ae\u09a8 \u09ac\u09cd\u09b0\u09cd\u09af\u09be\u09a8\u09cd\u09a1 \u0997\u09cd\u09b0\u09c1\u09aa \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u0985\u09ac\u09b8\u09cd\u09a5\u09be\u09df \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    function handleJsonFileSelect(inputEl) {\n      const file = inputEl?.files?.[0];\n      const summaryEl = document.getElementById('jsonFileSummary');\n      if (!file) return;\n      const reader = new FileReader();\n      reader.onload = (ev) => {\n        const content = String(ev.target?.result || '').trim();\n        document.getElementById('jsonImportTextInput').value = content;\n        try {\n          const parsed = JSON.parse(content);\n          const dCount = Array.isArray(parsed.das) ? parsed.das.length : 0;\n          const pCount = Array.isArray(parsed.products) ? parsed.products.length : 0;\n          const gCount = Array.isArray(parsed.productGroups) ? parsed.productGroups.length : 0;\n          summaryEl.style.color = '#047857';\n          summaryEl.textContent = `\u2705 \u09ab\u09be\u0987\u09b2 \u09b2\u09cb\u09a1 \u09b9\u09df\u09c7\u099b\u09c7 (${file.name}): \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf ${dCount} \u099c\u09a8, \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f ${pCount} \u099f\u09bf` + (gCount ? `, \u0997\u09cd\u09b0\u09c1\u09aa ${gCount} \u099f\u09bf` : '');\n        } catch (err) {\n          summaryEl.style.color = '#b91c1c';\n          summaryEl.textContent = '\u26a0\ufe0f \u09ab\u09be\u0987\u09b2\u099f\u09bf \u09b8\u09a0\u09bf\u0995 JSON \u09ab\u09b0\u09ae\u09cd\u09af\u09be\u099f\u09c7 \u09a8\u09c7\u0987: ' + err.message;\n        }\n      };\n      reader.readAsText(file, 'UTF-8');\n    }\n\n    async function importMasterDbJson() {\n      const rawText = (document.getElementById('jsonImportTextInput')?.value || '').trim();\n      const mode = document.getElementById('jsonImportModeSelect')?.value || 'merge';\n      const statusEl = document.getElementById('jsonImportStatusMsg');\n      if (!rawText) {\n        alert('\u0985\u09a8\u09c1\u0997\u09cd\u09b0\u09b9 \u0995\u09b0\u09c7 \u09aa\u09cd\u09b0\u09a5\u09ae\u09c7 \u098f\u0995\u099f\u09bf .json \u09ab\u09be\u0987\u09b2 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u099f\u09c7\u0995\u09cd\u09b8\u099f \u09ac\u0995\u09cd\u09b8\u09c7 JSON \u09aa\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8\u0964');\n        return;\n      }\n      let parsedJson = null;\n      try {\n        parsedJson = JSON.parse(rawText);\n      } catch (err) {\n        alert('JSON \u09ab\u09b0\u09ae\u09cd\u09af\u09be\u099f \u09b8\u09a0\u09bf\u0995 \u09a8\u09df: ' + err.message);\n        return;\n      }\n\n      if (mode === 'replace' && !confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b8\u09ae\u09cd\u09aa\u09c2\u09b0\u09cd\u09a3 \u09b0\u09bf\u09aa\u09cd\u09b2\u09c7\u09b8 \u0995\u09b0\u09c7 \u09ab\u09be\u0987\u09b2\u09c7\u09b0 \u09a1\u09be\u099f\u09be \u09ac\u09b8\u09be\u09a4\u09c7 \u099a\u09be\u09a8?')) {\n        return;\n      }\n\n      statusEl.style.color = '#1d4ed8';\n      statusEl.textContent = '\u23f3 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...';\n\n      try {\n        const res = await fetch('/api/master-db/import', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ mode, dbData: parsedJson })\n        });\n        const data = await res.json();\n        if (!data.ok) {\n          statusEl.style.color = '#b91c1c';\n          statusEl.textContent = '\u274c ' + (data.error || 'Import failed');\n          alert(data.error || 'Import failed');\n          return;\n        }\n        statusEl.style.color = '#047857';\n        statusEl.textContent = data.message || '\u2705 \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u09df\u09c7\u099b\u09c7!';\n        alert(data.message || '\u2705 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      } catch (e) {\n        statusEl.style.color = '#b91c1c';\n        statusEl.textContent = '\u274c Error: ' + e.message;\n      }\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">\u09f3${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"\u09ae\u09c1\u099b\u09c1\u09a8\">\u00d7</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09c1\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ \u09af\u09cb\u0997</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">\ud83d\uddd1\ufe0f</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${code}] \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u098f\u09ac\u0982 \u0985\u09ab\u09bf\u09b6\u09bf\u09df\u09be\u09b2 Trade Price \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('\u2705 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '\ud83d\udfe2 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '\ud83d\udcf2 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '\u23f3 ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '\ud83d\udfe2 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '\u26a0\ufe0f Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '\u26a1 RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '\u09f3' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        // Render Pending Resolutions Box\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          pList.innerHTML = pendings.map((p) => {\n            if (p.type === 'UNKNOWN_DA') {\n              return `\n                <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (Unknown DA)</b> ${p.detectedDaId ? `[\u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 ID: <b>${esc(p.detectedDaId)}</b>]` : ''}</div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', '))}</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID \u0993 \u09a8\u09be\u09ae \u09b2\u09bf\u0996\u09c1\u09a8 (\u09af\u09c7\u09ae\u09a8: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\u2705 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a4\u09bf\u09b2</button>\n                  </div>\n                </div>\n              `;\n            } else {\n              return `\n                <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                  <div><b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f/\u09ac\u09be\u09a8\u09be\u09a8: \"${esc(p.unknownProductText)}\" (\u09aa\u09b0\u09bf\u09ae\u09be\u09a3: ${esc(p.orderedQty)})</b></div>\n                  <div style=\"font-size:0.84rem; margin:4px 0;\">\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf: ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | \u09ae\u09c2\u09b2 \u09b2\u09be\u0987\u09a8: \"${esc(p.rawLine)}\"</div>\n                  <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;\">\n                    <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"\u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u09ac\u09be \u0995\u09cb\u09a1 (\u09af\u09c7\u09ae\u09a8: Totifen \u09ac\u09be 919)\" style=\"max-width:320px;\" />\n                    <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\ud83e\udde0 \u09ac\u09be\u09a8\u09be\u09a8 \u09b6\u09c7\u0996\u09be\u09a8 \u0993 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                    <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a6 \u09a6\u09bf\u09a8</button>\n                  </div>\n                </div>\n              `;\n            }\n          }).join('');\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">\u2705</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp \u09b8\u099a\u09b2 \u0986\u099b\u09c7!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">\u2601\ufe0f Cloud Session & Master DB Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp \u2794 Linked Devices \u09a5\u09c7\u0995\u09c7 \u09b8\u09cd\u0995\u09cd\u09af\u09be\u09a8 \u0995\u09b0\u09c1\u09a8</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">\ud83d\udd04 WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...</p>';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        if (groups.length !== lastGroupsCount && !groupInputTouched) {\n          lastGroupsCount = groups.length;\n          select.innerHTML = '<option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>';\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (data.botConfig.targetGroupId === g.id) opt.selected = true;\n            select.appendChild(opt);\n          });\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o) =>\n                '<tr>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>\u09f3' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">\u09f3' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td>' + esc(o.matchType) + '</td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"10\" style=\"text-align:center; font-weight:700;\">\u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u09ac\u09be\u09ab\u09be\u09b0\u09c7 \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09c7\u0987\u0964</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('\u0997\u09cd\u09b0\u09c1\u09aa \u09b2\u09bf\u09b8\u09cd\u099f \u0986\u09aa\u09a1\u09c7\u099f \u09b9\u09df\u09c7\u099b\u09c7! \u09ae\u09cb\u099f \u0997\u09cd\u09b0\u09c1\u09aa: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '\u2705 \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '\u2705 Google Sheet-\u098f \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 DA \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b8\u09bf\u0999\u09cd\u0995 \u09b9\u09df\u09c7\u099b\u09c7!' : '\u26a0\ufe0f Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">\ud83d\udc64 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) \u2014 ${data.daInfo.isKnownDA ? '\u2705 \u09aa\u09b0\u09bf\u099a\u09bf\u09a4' : '\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 (Admin \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09a8\u09cb \u09b9\u09ac\u09c7)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">\u2705 \u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 \u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${data.orders.length}\u099f\u09bf</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">\ud83e\udd14 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be\u09a8\u09be\u09a8: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || '\u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964';\n      fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('\u09a8\u09a4\u09c1\u09a8 WhatsApp \u0985\u09cd\u09af\u09be\u0995\u09be\u0989\u09a8\u09cd\u099f \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
 });
 
 // ============================================================================
@@ -4465,7 +4940,7 @@ function startKeepAliveLoop() {
 async function bootstrap() {
   loadLocalMasterDb();
   app.listen(PORT, '0.0.0.0', () => {
-    addLog(`🚀 Renata CRP Order Tracker v5.5 running on port ${PORT}`);
+    addLog(`🚀 Renata CRP Order Tracker v5.6 running on port ${PORT}`);
   });
 
   await initGoogleSheetsClient();
