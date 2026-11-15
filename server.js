@@ -1,31 +1,33 @@
 /**
  * ============================================================================
- * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER (v5.9 PRO)
+ * RENATA PLC (NOAKHALI DEPOT) — WHATSAPP GROUP CRP ORDER TRACKER (v6.0 PRO)
  * DYNAMIC JSON MASTER DATABASE + SELF-LEARNING AI BOT + NEO-BRUTALISM UI
  * ============================================================================
- * What's New in v5.0:
- * 1. Fixed Image Order CF10145 Fallback Bug:
- *    - Removed admin phones (+8801793362829 / +8801732273944) from CF10145's phone
- *      list and disabled sender-phone/cache fallback on image/admin orders so an
- *      image without a written CF/RF/C ID NEVER wrongly saves as CF10145 (Moajjem)!
- * 2. Web-Manageable Dynamic JSON Master Database (master_db.json + _Bot_State GZIP):
- *    - Full Web CRUD for DAs (Add, Edit, Delete single, Remove All, Reset)
- *    - Full Web CRUD for Products (Add, Edit Code/Name/Price/Unit, Add/Edit Wrong
- *      Spellings/Aliases, Delete, Reset)
- *    - Multiple Admin Alert Numbers (default: +8801793362829) & Multiple Authorized
- *      Image Order Numbers (default: +8801732273944, +8801793362829) manageable from Web!
- *    - Zero extra RAM/CPU load: runs in-memory with instant local JSON + compressed
- *      cloud backup in Google Sheets (_Bot_State!MASTER_DB_GZIP).
- * 3. Self-Learning WhatsApp Interactive Resolution via 01793362829 (and Admin Numbers):
- *    - Unknown / Missing DA ID or Name (#DA...):
- *      * If a new ID + clear Name is written together, auto-adds to DA database!
- *      * If ID or Name is missing/unknown, holds the order and messages 01793362829.
- *        When Admin replies with ID/Name, auto-saves to DA DB and pushes order to Sheet!
- *    - Unknown Product / Unrecognized Spelling (#PR...):
- *      * If a group/image order line has a medicine + quantity that cannot be matched,
- *        holds that line and messages 01793362829 asking what product it is.
- *      * When Admin replies with the product name or code, auto-learns that wrong
- *        spelling into the product's aliases in the JSON DB and saves the order to Sheet!
+ * What's New in v6.0:
+ * 1. Fixed "⚠️ Cloud state backup warning: Your input contains more than the
+ *    maximum of 50000 characters in a single cell":
+ *    - Every value in _Bot_State (BOT_CONFIG, MASTER_DB_GZIP, WA_AUTH_GZIP) is
+ *      now automatically split into strict 30,000-character chunks (well below
+ *      Google Sheets' 50,000-character cell limit) and reassembled on restore!
+ *    - Excludes bulky full-text messageLogs from MASTER_DB_GZIP (since all
+ *      message logs are already saved in the All_Message_Logs worksheet tab
+ *      and local master_db.json) and prunes stale Baileys pre-keys/sender-keys.
+ *    - Universal safeSheetCell() guard caps every cell written across all tabs
+ *      to <= 45,000 characters so Google Sheets NEVER rejects any cell write.
+ * 2. Fixed PSO Code Parsing Bug ("Pso t-23", "PSO: E-71", "P.S.O - M-12"):
+ *    - Recognizes hyphenated/spaced PSO codes as Territory/PSO codes (T23, E71)
+ *      and NEVER treats them as unknown products.
+ * 3. Full Message & Sender Number in Pending Questions + Web Edit & Submit:
+ *    - Shows full message text and sender phone number whenever a new ID/Name
+ *      or unknown product is requested, plus a 1-click "✏️ মেসেজ এডিট ও সাবমিট"
+ *      editor modal on Pending Questions, All Message Logs, and Live Orders.
+ * 4. All_Message_Logs Tab + Live Auto-Updating Google Sheet Row Numbers:
+ *    - Shows ✅ (Saved) or ❌ (Not Saved) and exact Live_Orders Row Numbers
+ *      (Row X, Y), which automatically update whenever any row is deleted from
+ *      Google Sheets!
+ * 5. Baileys 20s Keep-Alive + Persistent Target Group + Last 5 Message IDs:
+ *    - Prevents 4-5s code 428/503 disconnects, locks Target Group in
+ *      master_db.json, and auto-recovers missed group orders on reconnect.
  * ============================================================================
  */
 
@@ -61,7 +63,6 @@ const MASTER_DB_PATH = path.join(__dirname, 'master_db.json');
 const DEFAULT_ADMIN_ALERT_PHONES = ['8801793362829'];
 const DEFAULT_AUTHORIZED_IMAGE_PHONES = ['8801732273944', '8801793362829'];
 
-// Pre-bound known WhatsApp Multi-Device @lid identifiers for +8801732273944 and +8801793362829
 const DEFAULT_AUTHORIZED_LIDS = [
   '259794032148540', // +8801732273944
   '51243288424651',  // +8801793362829
@@ -77,240 +78,1838 @@ const SHEET_TABS = {
   BOT_STATE: '_Bot_State'
 };
 
+// Strict cell-size limits to prevent Google Sheets "maximum of 50000 characters in a single cell" error
+const MAX_STATE_CHUNK_CHARS = 30000;
+const MAX_SHEET_CELL_CHARS = 45000;
+
+function safeSheetCell(val, maxLen = MAX_SHEET_CELL_CHARS) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number' || typeof val === 'boolean') return val;
+  const s = String(val);
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+}
+
 const DEFAULT_CRP_PRODUCTS = [
-  { code: '919', name: 'TOTIFEN SYRUP 100ML', unit: 'Bottle (100ml)', price: 47.23, family: 'TOTIFEN', aliases: ['totifen', 'totipen', 'totifin', 'totefen', 'totifen syp', 'totifen syr', 'totifen sry', 'totifen 100ml', 'totifen syrh'] },
-  { code: '81', name: "DOXICAP 100MG CAP 100'S", unit: "Box (100's)", price: 165.00, family: 'DOXICAP', aliases: ['doxicap', 'doxicup', 'doxycap', 'doxy cap', 'doxicap 100mg', 'doxicap cap', 'doxecap'] },
-  { code: '990', name: "DOMIREN SUSPENSION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 28.49, family: 'DOMIREN', aliases: ['domiren 100ml', 'domiren syp', 'domiren syr', 'domiren sry', 'domeren 100ml', 'domiren 100', 'domiren susp'] },
-  { code: '286', name: "DOMIREN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 26.24, family: 'DOMIREN', aliases: ['domiren 60ml', 'domeren 60ml', 'domiren 60', 'sy domira 60'] },
-  { code: '60', name: "DOMIREN FC TAB 10MG 100'S", unit: "Box (100's)", price: 151.00, family: 'DOMIREN', aliases: ['domiren tab', 'domeren tab', 'domiren fc tab', 'domiren 10mg', 'domiren tablet', 'domiren tb', 'domniren tab'] },
-  { code: '636', name: "DELTASONE ORAL SOLUTION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 44.98, family: 'DELTASONE', aliases: ['deltasone 50ml', 'deltason 50ml', 'daltasone 50ml', 'daltason 50ml', 'delta sone 50ml', 'delta som', 'dellthesun', 'deltasone syp', 'deltason syr', 'deltason sry', 'delterson 50ml', 'deltarson 50ml'] },
-  { code: '637', name: "DELTASONE ORAL SOLUTION 100ML 1X1'S", unit: 'Bottle (100ml)', price: 71.21, family: 'DELTASONE', aliases: ['deltasone 100ml', 'deltason 100ml', 'daltasone 100ml', 'delta sone 100ml', 'deltasone 100'] },
-  { code: 'CS7', name: "DELTASONE 5MG TAB 17X30'S", unit: "Box (17x30's)", price: 657.90, family: 'DELTASONE', aliases: ['deltasone tab', 'deltason tab', 'daltasone tap', 'deltasone 5mg', 'deltason 5mg', 'deltasonne tab', 'deltasone 17x30'] },
-  { code: '922', name: "PRAZOLE 20MG CAP 6X10'S", unit: "Box (6x10's)", price: 225.00, family: 'PRAZOLE', aliases: ['prazole', 'prazol', 'parzol', 'prajol', 'frazol', 'pazal', 'prazole 20mg', 'prazol cap'] },
-  { code: '271', name: 'ZITHRIN DRY SYRUP 35ML', unit: 'Bottle (35ml)', price: 104.95, family: 'ZITHRIN', aliases: ['zithrin 35ml', 'zitrin 35ml', 'zithrin 35', 'zitrin 35', 'zitthrin', 'zithren', 'zithrin dry syrup', 'zithrin syp', 'zithrin syr'] },
-  { code: '290', name: 'ZITHRIN DRY SYRUP 50ML', unit: 'Bottle (50ml)', price: 149.93, family: 'ZITHRIN', aliases: ['zithrin 50ml', 'zitrin 50ml', 'zithrin 50', 'zitrin 50', 'zrithrin 50ml'] },
-  { code: '270', name: 'ZITHRIN DRY SYRUP 20ML', unit: 'Bottle (20ml)', price: 74.96, family: 'ZITHRIN', aliases: ['zithrin 20ml', 'zitrin 20ml', 'zithirin 20ml', 'zithrin 20'] },
-  { code: '173', name: 'ZITHRIN DRY SYRUP 15ML', unit: 'Bottle (15ml)', price: 71.21, family: 'ZITHRIN', aliases: ['zithrin 15ml', 'ziyhrin 15ml', 'zithrin 15'] },
-  { code: '834', name: "ZITHRIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 103.45, family: 'ZITHRIN', aliases: ['zithrin 30ml', 'zitrin 30ml', 'zithrin 30'] },
-  { code: '278', name: "XAMIC 500MG CAP (2X10'S)", unit: "Box (2x10's)", price: 329.80, family: 'XAMIC', aliases: ['xamic', 'xamic cap', 'xamic 500mg', 'xamic capsule', 'xmaic', 'examic'] },
-  { code: '635', name: "RECOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 29.99, family: 'RECOF', aliases: ['recof', 'recop', 'recof syp', 'recof syr', 'recof sry', 'recof 100ml', 'recof syraf'] },
-  { code: '299', name: "TRULAX SYRUP 1MG/5ML 100ML 1'S", unit: 'Bottle (100ml)', price: 33.73, family: 'TRULAX', aliases: ['trulax', 'tulax', 'trulex', 'trulax syr', 'trulax syp', 'trulax sry', 'trulax 100ml'] },
-  { code: '112', name: 'LUCAN-R SUSP. 35ML', unit: 'Bottle (35ml)', price: 58.70, family: 'LUCAN-R', aliases: ['lucan r 35ml', 'lucan-r 35ml', 'locan r sry', 'lucan r syp', 'lucan r syr', 'lukan r syp', 'luknar syraf', 'lokanar', 'lucon r syp', 'lucanar syp', 'lucar sry', 'luna r'] },
-  { code: '876', name: "LUCAN-R 50MG CAP 4x10'S", unit: "Box (4x10's)", price: 240.80, family: 'LUCAN-R', aliases: ['lucan r 50mg', 'locan r 50mg', 'lucan-r 50mg', 'lukan r 50', 'lacan r 50mg', 'lucan r 50'] },
-  { code: '605', name: 'LUCAN-R 150MG CAPS 2X6', unit: "Box (2x6's)", price: 198.60, family: 'LUCAN-R', aliases: ['lucan r 150mg', 'locan r 150mg', 'lucan-r 150mg', 'lucan r 150', 'locan r 150', 'luknar 150', 'lucon r 150', 'lunch 150'] },
-  { code: '621', name: 'LUCAN-R 200MG CAPS 2X6', unit: "Box (2x6's)", price: 224.88, family: 'LUCAN-R', aliases: ['lucan r 200mg', 'locan r 200mg', 'lucan-r 200mg', 'lucan r 200', 'locan r 200', 'lucanar 200'] },
-  { code: '96', name: "FLONTIN 500MG TAB 3X10'S", unit: "Box (3x10's)", price: 337.20, family: 'FLONTIN', aliases: ['flontin tab', 'flontin 500mg', 'flontine tab', 'foltin', 'flotin tab', 'falntin', 'flonten tab'] },
-  { code: '226', name: "FLONTIN SUSPENSION 60ML 1'S", unit: 'Bottle (60ml)', price: 74.96, family: 'FLONTIN', aliases: ['flontin syp', 'flontin syr', 'flontin sry', 'flontin sryp', 'flontin syrp', 'flontin 60ml', 'flotin sry', 'flontin susp'] },
-  { code: '179', name: "NORMANAL 500MG FC TAB (3X10'S)", unit: "Box (3x10's)", price: 202.50, family: 'NORMANAL', aliases: ['normanal', 'normal', 'normanol', 'normonal', 'narmonal', 'nomanal', 'normanal 500mg', 'normanal tab'] },
-  { code: '102', name: "FUROCEF FC SUSPENSION 70ML 1X1'S", unit: 'Bottle (70ml)', price: 168.67, family: 'FUROCEF', aliases: ['furocef 70ml', 'feurocef 70ml', 'furosef 70ml', 'furocef sry', 'furocef syrp', 'furoccfe 70ml', 'reocef'] },
-  { code: 'S72', name: "FUROCEF DS SUSPENSION 50ML 1X1'S", unit: 'Bottle (50ml)', price: 187.41, family: 'FUROCEF', aliases: ['furocef ds', 'feurocef ds', 'furosef ds', 'furocef 50ml', 'furocef ds sry'] },
-  { code: 'S16', name: "VITA D3 40000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 262.40, family: 'VITA', aliases: ['vita d3 40000', 'vita 40000', 'vita d3', 'vita d', 'bita d3'] },
-  { code: 'S15', name: "VITA D3 20000 IU CAP 2X5'S", unit: "Box (2x5's)", price: 149.90, family: 'VITA', aliases: ['vita d3 20000', 'vita 20000', 'bita d3 20000'] },
-  { code: 'SA4', name: "NEXDEX 30MG CAP 6X10'S", unit: "Box (6x10's)", price: 450.00, family: 'NEXDEX', aliases: ['nexdex 30mg', 'nexdex 30', 'nexdex'] },
-  { code: 'SA1', name: "NEXDEX 60MG CAP 5X6'S", unit: "Box (5x6's)", price: 404.70, family: 'NEXDEX', aliases: ['nexdex 60mg', 'nexdex 60'] },
-  { code: 'C2Z', name: "PCAB FC 20MG TAB 3X10'S", unit: "Box (3x10's)", price: 225.00, family: 'PCAB', aliases: ['pcab 20mg', 'pcab 20', 'p cab 20', 'pcab', 'p cab', 'pacb', 'pcap', 'picap 20', 'p-cap'] },
-  { code: 'C2Y', name: "PCAB FC 10MG TAB 3X10'S", unit: "Box (3x10's)", price: 157.50, family: 'PCAB', aliases: ['pcab 10mg', 'pcab 10', 'p cab 10', 'pcap 10'] },
-  { code: 'C25', name: "FERIX-V CAP 6X10'S", unit: "Box (6x10's)", price: 202.20, family: 'FERIX-V', aliases: ['ferix v', 'ferix-v', 'farix v', 'frix v', 'ferix v cap'] },
-  { code: '959', name: "DESOLON TAB 1X21'S", unit: "Pack (1x21's)", price: 90.51, family: 'DESOLON', aliases: ['desolon', 'desolone', 'deselon', 'desolan', 'dasalon', 'deslon', 'deslor', 'desolon tab'] },
-  { code: '633', name: "EMCON-1 1X1'S", unit: "Pack (1x1's)", price: 60.34, family: 'EMCON-1', aliases: ['emcon', 'emcon-1', 'emcon 1', 'emcon tab', 'emon', 'incone', 'em con'] },
-  { code: '67', name: 'CONASYD CREAM 10MG', unit: 'Tube (10g)', price: 47.23, family: 'CONASYD', aliases: ['conasyd', 'conasid', 'conased', 'conacid', 'conasyd cream', 'conasid creem', 'conased crem'] },
-  { code: 'SA3', name: "REDUCOF 100ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 74.96, family: 'REDUCOF', aliases: ['reducof', 'redicof', 'rducof', 'reducop', 'reducof syr', 'reducof syp'] },
-  { code: '961', name: "GESTRENOL TAB 5MG 3X10'S", unit: "Box (3x10's)", price: 180.60, family: 'GESTRENOL', aliases: ['gestrenol', 'gestronal', 'gestonal', 'gestrnol', 'gestanol', 'gestnol', 'gestronol', 'gastronal', 'gestrennol'] },
-  { code: 'SM1', name: "EXICOF 100ML SYRUP 1X1'S", unit: 'Bottle (100ml)', price: 59.97, family: 'EXICOF', aliases: ['exicof', 'exicop', 'exicap', 'exicof syp', 'exicof syr'] },
-  { code: 'SY1', name: "RENASONE 10G CREAM 1X1'S", unit: 'Tube (10g)', price: 38.98, family: 'RENASONE', aliases: ['renasone', 'renason', 'renasol', 'renasone cream', 'renason crem', 'renason creem', 'renasone crm', 'renasone crime'] },
-  { code: '34', name: "BECONEX SYRUP 200ML 1'S", unit: 'Bottle (200ml)', price: 46.48, family: 'BECONEX', aliases: ['beconex 200ml', 'biconex 200ml', 'beconex 200', 'beconex syp', 'biconex', 'beconez'] },
-  { code: '33', name: "BECONEX SYRUP 100ML 1'S", unit: 'Bottle (100ml)', price: 26.24, family: 'BECONEX', aliases: ['beconex 100ml', 'biconex 100ml', 'beconex 100', 'beconix 100'] },
-  { code: '233', name: 'BECONEX ZI SYRUP 100ML', unit: 'Bottle (100ml)', price: 43.48, family: 'BECONEX', aliases: ['beconex zi', 'be conex zi', 'becoxnex zi', 'biconex zi'] },
-  { code: 'C82', name: "STARK 60ML ORAL SOLUTION 1X1'S", unit: 'Bottle (60ml)', price: 56.22, family: 'STARK', aliases: ['stark', 'strak', 'stark syp', 'stark syr', 'stark sry', 'stark 60ml'] },
-  { code: '267', name: "PROTONIL EC 40MG TAB 3X10'S", unit: "Box (3x10's)", price: 202.50, family: 'PROTONIL', aliases: ['protonil 40mg', 'protonil 40'] },
-  { code: '266', name: "PROTONIL EC 20MG TAB 5X10'S", unit: "Box (5x10's)", price: 225.00, family: 'PROTONIL', aliases: ['protonil 20mg', 'protonil 20', 'protonil'] },
-  { code: '138', name: 'POLYCEF SYRUP 100ML', unit: 'Bottle (100ml)', price: 67.47, family: 'POLYCEF', aliases: ['polycef', 'policef', 'polycef syp', 'policef sry'] },
-  { code: '875', name: "BREDICON TAB 28'S", unit: "Pack (28's)", price: 52.08, family: 'BREDICON', aliases: ['bredicon', 'bedicon', 'bredecon', 'bredcon', 'baredicon', 'badicon', 'bredicon tab'] },
-  { code: 'S34', name: "PANGESIC TAB 5X6'S", unit: "Box (5x6's)", price: 180.00, family: 'PANGESIC', aliases: ['pangesic', 'pengesic', 'pangisic', 'pangasic', 'pengecic', 'pengasice', 'pangesic tab'] },
-  { code: '934', name: "CALCIN-D TAB 6X10'S", unit: "Box (6x10's)", price: 360.00, family: 'CALCIN-D', aliases: ['calcin d', 'calcin-d', 'calcind', 'calcin d tab'] },
-  { code: '607', name: "FLUSTAR 500MG CAP 7X4'S", unit: "Box (7x4's)", price: 210.00, family: 'FLUSTAR', aliases: ['flustar 500mg', 'flustar cap', 'fluster cap', 'fullstar cap', 'fulustar cap', 'flustar 500'] },
-  { code: 'N33', name: "FLUSTAR 100ML DRY SYS 1X1'S", unit: 'Bottle (100ml)', price: 44.98, family: 'FLUSTAR', aliases: ['flustar syp', 'flustar syr', 'fullstar syr', 'fulustar syrup', 'fluster syp', 'flustar 100ml'] },
-  { code: '282', name: "NORRY 3MG TAB 5X10'S", unit: "Box (5x10's)", price: 262.50, family: 'NORRY', aliases: ['norry', 'nory', 'norry 3mg', 'norry tab'] },
-  { code: 'CO6', name: "ZODEF 60ML SUSP 1X1'S", unit: 'Bottle (60ml)', price: 149.93, family: 'ZODEF', aliases: ['zodef', 'zodef sy', 'zodef sry', 'zodef syp', 'zodef 60ml'] },
-  { code: '902', name: "SALINE-R 20'S", unit: "Box (20's)", price: 90.00, family: 'SALINE-R', aliases: ['saline r', 'saline-r', 'slain r', 'salaine r', 'seline r', 'salin r'] },
-  { code: '232', name: 'HONYCOL LINCTUS 100ML', unit: 'Bottle (100ml)', price: 29.99, family: 'HONYCOL', aliases: ['honycol', 'hunycol', 'hanycol', 'hanicol', 'honeycol', 'honycal', 'hanicon', 'honycol syp'] },
-  { code: '955', name: "THYROX 50MCG 3X30'S", unit: "Box (3x30's)", price: 148.50, family: 'THYROX', aliases: ['thyrox', 'thyrox 50mcg', 'thyrox 50'] },
-  { code: 'T28', name: "NUTRILINA 500MG VEG CAP 5X6'S", unit: "Box (5x6's)", price: 310.35, family: 'NUTRILINA', aliases: ['nutrilina', 'neutilina', 'nutinila', 'nutrilina 500mg'] },
-  { code: 'N49', name: "RECOX FC 120MG TAB 2X10'S", unit: "Box (2x10's)", price: 209.80, family: 'RECOX', aliases: ['recox 120mg', 'recox 120'] },
-  { code: 'N47', name: "RECOX FC 90MG TAB 2X10'S", unit: "Box (2x10's)", price: 180.00, family: 'RECOX', aliases: ['recox 90mg', 'recox 90', 'recox'] },
-  { code: 'SZ5', name: "COPNAT N OINTMENT 15GM 1'S", unit: 'Tube (15g)', price: 52.47, family: 'COPNAT', aliases: ['copnat n ointment', 'copnet n ointment', 'copnet n oientment', 'copnat n olntment', 'copnat n', 'copnet n'] },
-  { code: 'SZ4', name: "COPNAT N CREAM 15GM 1'S", unit: 'Tube (15g)', price: 52.47, family: 'COPNAT', aliases: ['copnat n cream', 'copnat n crem', 'cophnet-n cream', 'copnet n cream', 'copmate n creem'] },
-  { code: 'SI1', name: "FUROCLAV 70ML DRY PWD SUSP 1X1'S", unit: 'Bottle (70ml)', price: 198.65, family: 'FUROCLAV', aliases: ['furoclav', 'feuroclav', 'furoclav 70ml'] },
-  { code: 'H39', name: 'MOODS ALL-NIGHT', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods all night', 'moods all-night', 'ps-moods all night'] },
-  { code: 'H37', name: 'MOODS DOTTED', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods dotted', 'mood dotted'] },
-  { code: 'H89', name: "MOODS GOLD 1500 DOTS 3'S", unit: "Pack (3's)", price: 65.00, family: 'MOODS', aliases: ['moods gold 1500', 'moods gold', 'moods gola'] },
-  { code: 'H88', name: "MOODS GOLD ELECTRIFY 3'S", unit: "Pack (3's)", price: 65.00, family: 'MOODS', aliases: ['moods gold electrify', 'moods gold electrifry', 'moods electrify'] },
-  { code: 'H34', name: 'MOODS ULTA-THIN', unit: "Pack (3's)", price: 50.00, family: 'MOODS', aliases: ['moods ulta thin', 'moods ulta-thin', 'moods ultra thin'] },
-  { code: 'CY7', name: "HYDROGEST DS 2ML (500MG/2ML) INJ 1X1'S", unit: "Ampoule (1x1's)", price: 487.26, family: 'HYDROGEST', aliases: ['hydrogest ds', 'hydrogenst ds', 'hydrogest'] },
-  { code: '73', name: "DELENTIN SUSPENSION 10ML 1'S", unit: 'Bottle (10ml)', price: 12.03, family: 'DELENTIN', aliases: ['delentin', 'dilentin', 'delentin 10ml'] },
-  { code: '933', name: 'FENADIN SUSPENSION 50ML', unit: 'Bottle (50ml)', price: 41.23, family: 'FENADIN', aliases: ['fenadin 50ml', 'fenadin syr', 'fenadin sry', 'fenadin'] },
-  { code: '69', name: "FENADIN 30ML SUSPENSION 1'S", unit: 'Bottle (30ml)', price: 26.24, family: 'FENADIN', aliases: ['fenadin 30ml', 'fenadin sry small', 'fenadin sry smal', 'fenadin small'] },
-  { code: 'N45', name: "NOVELON LITE FC TAB 1X24'S", unit: "Pack (1x24's)", price: 366.38, family: 'NOVELON', aliases: ['novelon lite', 'novelon'] },
-  { code: '840', name: "EMEREN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 22.49, family: 'EMEREN', aliases: ['emeren', 'emiren', 'emiren syr', 'emeren 50ml'] },
-  { code: '989', name: "ALGIN SYRP 100ML 1X1'S", unit: 'Bottle (100ml)', price: 67.47, family: 'ALGIN', aliases: ['algin 100ml', 'algin syrp', 'algin syr'] },
-  { code: 'C62', name: "ALGIN 50ML SYRP 1X1'S", unit: 'Bottle (50ml)', price: 41.23, family: 'ALGIN', aliases: ['algin 50ml', 'algin 50'] },
-  { code: '16', name: "MAZIC JR 100ML 4.05MG/5ML SYRP 1X1'S", unit: 'Bottle (100ml)', price: 28.49, family: 'MAZIC', aliases: ['mazic jr', 'mazic jr sy', 'magic jr'] },
-  { code: '18', name: "MAZIC 10MG/5ML 100ML 1X1'S", unit: 'Bottle (100ml)', price: 26.24, family: 'MAZIC', aliases: ['mazic 100ml', 'mazic', 'magic syp'] },
-  { code: 'DF4', name: 'ALLUREN 100G PWD', unit: 'Pack (100g)', price: 262.37, family: 'ALLUREN', aliases: ['alluren', 'aluren', 'alluren 100g'] }
+  {
+    "code": "919",
+    "name": "TOTIFEN SYRUP 100ML",
+    "unit": "Bottle (100ml)",
+    "price": 47.23,
+    "family": "TOTIFEN",
+    "aliases": [
+      "totifen",
+      "totipen",
+      "totifin",
+      "totefen",
+      "totifan",
+      "totifen syp",
+      "totifen syr",
+      "totifen sry",
+      "totifen 100ml",
+      "totifen syrh",
+      "totifan syp",
+      "totifen sy",
+      "totifan 100  ml sy",
+      "totifan 100 ml",
+      "totifan 100 ml sy",
+      "totifen 100 ml",
+      "totifen sy  100ml",
+      "totifen sy 100ml",
+      "totifen syrup",
+      "totifen.",
+      "totifen100ml",
+      "totifin syp"
+    ]
+  },
+  {
+    "code": "81",
+    "name": "DOXICAP 100MG CAP 100'S",
+    "unit": "Box (100's)",
+    "price": 165.0,
+    "family": "DOXICAP",
+    "aliases": [
+      "doxicap",
+      "doxicup",
+      "doxycap",
+      "doxy cap",
+      "doxicap 100mg",
+      "doxicap cap",
+      "doxecap",
+      "doxcicap",
+      "doxicap100cap"
+    ]
+  },
+  {
+    "code": "990",
+    "name": "DOMIREN SUSPENSION 100ML 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 28.49,
+    "family": "DOMIREN",
+    "aliases": [
+      "domiren 100ml",
+      "domiren syp",
+      "domiren syr",
+      "domiren sry",
+      "domeren 100ml",
+      "domiren 100",
+      "domiren susp",
+      "domiren100ml"
+    ]
+  },
+  {
+    "code": "286",
+    "name": "DOMIREN SUSPENSION 60ML 1'S",
+    "unit": "Bottle (60ml)",
+    "price": 26.24,
+    "family": "DOMIREN",
+    "aliases": [
+      "domiren 60ml",
+      "domeren 60ml",
+      "domiren 60",
+      "sy domira 60"
+    ]
+  },
+  {
+    "code": "60",
+    "name": "DOMIREN FC TAB 10MG 100'S",
+    "unit": "Box (100's)",
+    "price": 151.0,
+    "family": "DOMIREN",
+    "aliases": [
+      "domiren tab",
+      "domeren tab",
+      "domiren fc tab",
+      "domiren 10mg",
+      "domiren tablet",
+      "domiren tb",
+      "domniren tab"
+    ]
+  },
+  {
+    "code": "636",
+    "name": "DELTASONE ORAL SOLUTION 50ML 1X1'S",
+    "unit": "Bottle (50ml)",
+    "price": 44.98,
+    "family": "DELTASONE",
+    "aliases": [
+      "deltasone 50ml",
+      "deltason 50ml",
+      "daltasone 50ml",
+      "daltason 50ml",
+      "delta sone 50ml",
+      "delta som",
+      "dellthesun",
+      "deltasone syp",
+      "deltason syr",
+      "deltason sry",
+      "delterson 50ml",
+      "deltarson 50ml",
+      "deltasone 50 ml",
+      "deltason 50 ml",
+      "deltason5 17/30 box",
+      "deltason50 syp ml",
+      "deltasone 50 ml sy",
+      "deltasone 50 ml syp",
+      "deltasone 50 ml syr",
+      "deltasone 50ml syr",
+      "deltasone syp 50ml"
+    ]
+  },
+  {
+    "code": "637",
+    "name": "DELTASONE ORAL SOLUTION 100ML 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 71.21,
+    "family": "DELTASONE",
+    "aliases": [
+      "deltasone 100ml",
+      "deltason 100ml",
+      "daltasone 100ml",
+      "daltason 100ml",
+      "delta sone 100ml",
+      "deltasone 100"
+    ]
+  },
+  {
+    "code": "CS7",
+    "name": "DELTASONE 5MG TAB 17X30'S",
+    "unit": "Box (17x30's)",
+    "price": 657.9,
+    "family": "DELTASONE",
+    "aliases": [
+      "deltasone tab",
+      "deltason tab",
+      "daltasone tap",
+      "deltasone 5mg",
+      "deltason 5mg",
+      "deltasonne tab",
+      "deltasone 17x30",
+      "deltason tab 17/30"
+    ]
+  },
+  {
+    "code": "922",
+    "name": "PRAZOLE 20MG CAP 6X10'S",
+    "unit": "Box (6x10's)",
+    "price": 225.0,
+    "family": "PRAZOLE",
+    "aliases": [
+      "prazole",
+      "prazol",
+      "parzol",
+      "prajol",
+      "frazol",
+      "pazal",
+      "prazole 20mg",
+      "prazol cap",
+      "parzole 20cap",
+      "prazal 20 cap",
+      "prazzole",
+      "prazole 20 cap",
+      "prazole 20 mg",
+      "prazole 20 mg cap",
+      "prazole 20cap",
+      "prazole20 mg",
+      "prazole20cap"
+    ]
+  },
+  {
+    "code": "271",
+    "name": "ZITHRIN DRY SYRUP 35ML",
+    "unit": "Bottle (35ml)",
+    "price": 104.95,
+    "family": "ZITHRIN",
+    "aliases": [
+      "zithrin 35ml",
+      "zitrin 35ml",
+      "zithrin 35",
+      "zitrin 35",
+      "zitthrin",
+      "zithren",
+      "zithrin dry syrup",
+      "zithrin syp",
+      "zithrin syr",
+      "zithren 35ml",
+      "zithrin 35 ml",
+      "zithrin 35 ml syp",
+      "zithrin 35 ml syr",
+      "zithrin 35ml syp",
+      "zithrin 35ml syr",
+      "zithrin.   35ml",
+      "zitrhin 35 ml",
+      "zitrtin 35 ml",
+      "zitrtin 35 sryp",
+      "zitrtin 35 syrp",
+      "zrithrin 35 ml"
+    ]
+  },
+  {
+    "code": "290",
+    "name": "ZITHRIN DRY SYRUP 50ML",
+    "unit": "Bottle (50ml)",
+    "price": 149.93,
+    "family": "ZITHRIN",
+    "aliases": [
+      "zithrin 50ml",
+      "zitrin 50ml",
+      "zithrin 50",
+      "zitrin 50",
+      "zrithrin 50ml",
+      "zithrin 50 ml",
+      "zithrin 50 ml syp",
+      "zithrin 50ml :",
+      "zithrin.   50ml"
+    ]
+  },
+  {
+    "code": "270",
+    "name": "ZITHRIN DRY SYRUP 20ML",
+    "unit": "Bottle (20ml)",
+    "price": 74.96,
+    "family": "ZITHRIN",
+    "aliases": [
+      "zithrin 20ml",
+      "zitrin 20ml",
+      "zithirin 20ml",
+      "zithrin 20",
+      "zithrin 20 ml",
+      "zithrin 20ml syr",
+      "zithrin 35ml",
+      "zitrin 35 ml"
+    ]
+  },
+  {
+    "code": "173",
+    "name": "ZITHRIN DRY SYRUP 15ML",
+    "unit": "Bottle (15ml)",
+    "price": 71.21,
+    "family": "ZITHRIN",
+    "aliases": [
+      "zithrin 15ml",
+      "ziyhrin 15ml",
+      "zithrin 15"
+    ]
+  },
+  {
+    "code": "834",
+    "name": "ZITHRIN 30ML SUSPENSION 1'S",
+    "unit": "Bottle (30ml)",
+    "price": 103.45,
+    "family": "ZITHRIN",
+    "aliases": [
+      "zithrin 30ml",
+      "zitrin 30ml",
+      "zithrin 30"
+    ]
+  },
+  {
+    "code": "278",
+    "name": "XAMIC 500MG CAP (2X10'S)",
+    "unit": "Box (2x10's)",
+    "price": 329.8,
+    "family": "XAMIC",
+    "aliases": [
+      "xamic",
+      "xamic cap",
+      "xamic 500mg",
+      "xamic capsule",
+      "xmaic",
+      "examic"
+    ]
+  },
+  {
+    "code": "635",
+    "name": "RECOF 100ML SYRUP 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 29.99,
+    "family": "RECOF",
+    "aliases": [
+      "recof",
+      "recop",
+      "recof syp",
+      "recof syr",
+      "recof sry",
+      "recof 100ml",
+      "recof syraf",
+      "recofe 100 ml",
+      "recof  syp",
+      "recof 100 ml",
+      "recof sy",
+      "recof syrp",
+      "recof. sy",
+      "rocof"
+    ]
+  },
+  {
+    "code": "299",
+    "name": "TRULAX SYRUP 1MG/5ML 100ML 1'S",
+    "unit": "Bottle (100ml)",
+    "price": 33.73,
+    "family": "TRULAX",
+    "aliases": [
+      "trulax",
+      "tulax",
+      "trulex",
+      "trulax syr",
+      "trulax syp",
+      "trulax sry",
+      "trulax 100ml",
+      "trulux syp",
+      "trulax sy",
+      "trulax100ml",
+      "tulax syrup"
+    ]
+  },
+  {
+    "code": "112",
+    "name": "LUCAN-R SUSP. 35ML",
+    "unit": "Bottle (35ml)",
+    "price": 58.7,
+    "family": "LUCAN-R",
+    "aliases": [
+      "lucan r 35ml",
+      "lucan-r 35ml",
+      "locan r sry",
+      "lucan r syp",
+      "lucan r syr",
+      "lukan r syp",
+      "luknar syraf",
+      "lokanar",
+      "lucon r syp",
+      "lucanar syp",
+      "lucar sry",
+      "luna r",
+      "lucanr syp",
+      "luknar sy",
+      "lunch -r 35ml syp",
+      "lucan r",
+      "lucan r 35 ml",
+      "lucan r 35 ml sy",
+      "lucan r 35 sy",
+      "lucan r 35ml syp",
+      "lucan r sry",
+      "lucan r syrp",
+      "lucan- r 35ml syp",
+      "lucan-r sup",
+      "lucan-r syp",
+      "lunch -r sup"
+    ]
+  },
+  {
+    "code": "876",
+    "name": "LUCAN-R 50MG CAP 4x10'S",
+    "unit": "Box (4x10's)",
+    "price": 240.8,
+    "family": "LUCAN-R",
+    "aliases": [
+      "lucan r 50mg",
+      "locan r 50mg",
+      "lucan-r 50mg",
+      "lukan r 50",
+      "lacan r 50mg",
+      "lucan r 50",
+      "lucan r50",
+      "lucan",
+      "lucan r",
+      "lucan r 50 cap",
+      "lucan r 50 mg",
+      "lucan r50mg",
+      "lucan-r",
+      "lucanr"
+    ]
+  },
+  {
+    "code": "605",
+    "name": "LUCAN-R 150MG CAPS 2X6",
+    "unit": "Box (2x6's)",
+    "price": 198.6,
+    "family": "LUCAN-R",
+    "aliases": [
+      "lucan r 150mg",
+      "locan r 150mg",
+      "lucan-r 150mg",
+      "lucan r 150",
+      "locan r 150",
+      "luknar 150",
+      "lucon r 150",
+      "lunch 150",
+      "luconar 150 mg",
+      "luknar150",
+      "lucan",
+      "lucan r",
+      "lucan r 150 mg",
+      "lucan r150 mg cap",
+      "lucan r150mg",
+      "lucan-r",
+      "lucanar",
+      "lucanr",
+      "lukan r 150mg",
+      "luknar"
+    ]
+  },
+  {
+    "code": "621",
+    "name": "LUCAN-R 200MG CAPS 2X6",
+    "unit": "Box (2x6's)",
+    "price": 224.88,
+    "family": "LUCAN-R",
+    "aliases": [
+      "lucan r 200mg",
+      "locan r 200mg",
+      "lucan-r 200mg",
+      "lucan r 200",
+      "locan r 200",
+      "lucanar 200",
+      "luknar 200tb",
+      "lucan r",
+      "lucan r 200 mg",
+      "lucan-r"
+    ]
+  },
+  {
+    "code": "96",
+    "name": "FLONTIN 500MG TAB 3X10'S",
+    "unit": "Box (3x10's)",
+    "price": 337.2,
+    "family": "FLONTIN",
+    "aliases": [
+      "flontin 500",
+      "flontin tab",
+      "flontin 500mg",
+      "flotin 500",
+      "foltin 500",
+      "foltin tab",
+      "flonten 500 mg cap",
+      "flontin",
+      "flontin 500 tab",
+      "flontin500",
+      "flontine",
+      "flotin",
+      "flotin 500 tab",
+      "foltin"
+    ]
+  },
+  {
+    "code": "226",
+    "name": "FLONTIN SUSPENSION 60ML 1'S",
+    "unit": "Bottle (60ml)",
+    "price": 74.96,
+    "family": "FLONTIN",
+    "aliases": [
+      "flontin 60ml",
+      "flontin syp",
+      "flontin syr",
+      "flontin susp",
+      "flotin syp"
+    ]
+  },
+  {
+    "code": "179",
+    "name": "NORMANAL 500MG FC TAB (3X10'S)",
+    "unit": "Box (3x10's)",
+    "price": 202.5,
+    "family": "NORMANAL",
+    "aliases": [
+      "normanal",
+      "normanal 500",
+      "normanal tab",
+      "normanol 500 tab",
+      "normal 500",
+      "narmonal",
+      "normal",
+      "normanal 500 mg",
+      "normanal 500 mg cap"
+    ]
+  },
+  {
+    "code": "102",
+    "name": "FUROCEF FC SUSPENSION 70ML 1X1'S",
+    "unit": "Bottle (70ml)",
+    "price": 168.67,
+    "family": "FUROCEF",
+    "aliases": [
+      "furocef 70ml",
+      "furocef 70 ml",
+      "furocef syp",
+      "furocef susp",
+      "fourocef 70 ml",
+      "furochef 70ml",
+      "furosef 70ml",
+      "furcif sy",
+      "fucocef 70ml",
+      "furocef 70 ml syp",
+      "furocef 70ml syp",
+      "furocef d's",
+      "furucef 70 ml syp",
+      "spr: furocef 70 ml"
+    ]
+  },
+  {
+    "code": "S72",
+    "name": "FUROCEF DS SUSPENSION 50ML 1X1'S",
+    "unit": "Bottle (50ml)",
+    "price": 187.41,
+    "family": "FUROCEF",
+    "aliases": [
+      "furocef ds",
+      "furocef 50ml",
+      "furocef ds 50ml",
+      "furocef ds 50 ml"
+    ]
+  },
+  {
+    "code": "S16",
+    "name": "VITA D3 40000 IU CAP 2X5'S",
+    "unit": "Box (2x5's)",
+    "price": 262.4,
+    "family": "VITA",
+    "aliases": [
+      "vita d3 40000",
+      "vita d3 40000 iu",
+      "vita d3",
+      "vita 40000 cap",
+      "vitad3 40000",
+      "vita d",
+      "vita d3 40;000",
+      "vita d340000",
+      "vitad"
+    ]
+  },
+  {
+    "code": "S15",
+    "name": "VITA D3 20000 IU CAP 2X5'S",
+    "unit": "Box (2x5's)",
+    "price": 149.9,
+    "family": "VITA",
+    "aliases": [
+      "vita d3 20000",
+      "vita d3 20000 iu",
+      "vita d3 20000 cap",
+      "vitad-20000",
+      "vitad3 20000 cap",
+      "vita d3"
+    ]
+  },
+  {
+    "code": "SA4",
+    "name": "NEXDEX 30MG CAP 6X10'S",
+    "unit": "Box (6x10's)",
+    "price": 450.0,
+    "family": "NEXDEX",
+    "aliases": [
+      "nexdex 30",
+      "nexdex 30mg",
+      "nexdex",
+      "nexdex 30 mg",
+      "nexdex 30 cao"
+    ]
+  },
+  {
+    "code": "SA1",
+    "name": "NEXDEX 60MG CAP 5X6'S",
+    "unit": "Box (5x6's)",
+    "price": 404.7,
+    "family": "NEXDEX",
+    "aliases": [
+      "nexdex 60",
+      "nexdex 60mg",
+      "nexdex 60 mg"
+    ]
+  },
+  {
+    "code": "C2Z",
+    "name": "PCAB FC 20MG TAB 3X10'S",
+    "unit": "Box (3x10's)",
+    "price": 225.0,
+    "family": "PCAB",
+    "aliases": [
+      "pcab 20",
+      "pcab 20mg",
+      "pcab",
+      "p cab 20"
+    ]
+  },
+  {
+    "code": "C2Y",
+    "name": "PCAB FC 10MG TAB 3X10'S",
+    "unit": "Box (3x10's)",
+    "price": 157.5,
+    "family": "PCAB",
+    "aliases": [
+      "pcab 10",
+      "pcab 10mg",
+      "p cab 10"
+    ]
+  },
+  {
+    "code": "C25",
+    "name": "FERIX-V CAP 6X10'S",
+    "unit": "Box (6x10's)",
+    "price": 202.2,
+    "family": "FERIX-V",
+    "aliases": [
+      "ferix v",
+      "ferix-v",
+      "ferix v cap",
+      "frix v"
+    ]
+  },
+  {
+    "code": "959",
+    "name": "DESOLON TAB 1X21'S",
+    "unit": "Pack (1x21's)",
+    "price": 90.51,
+    "family": "DESOLON",
+    "aliases": [
+      "desolon",
+      "desolon tab",
+      "desalon",
+      "deslon",
+      "dasalon"
+    ]
+  },
+  {
+    "code": "633",
+    "name": "EMCON-1 1X1'S",
+    "unit": "Pack (1x1's)",
+    "price": 60.34,
+    "family": "EMCON-1",
+    "aliases": [
+      "emcon",
+      "emcon 1",
+      "emcon-1",
+      "em con"
+    ]
+  },
+  {
+    "code": "67",
+    "name": "CONASYD CREAM 10MG",
+    "unit": "Tube (10g)",
+    "price": 47.23,
+    "family": "CONASYD",
+    "aliases": [
+      "conasyd",
+      "conasyd cream",
+      "conased",
+      "conased cream",
+      "conasid creem",
+      "conased crime",
+      "conasyd."
+    ]
+  },
+  {
+    "code": "SA3",
+    "name": "REDUCOF 100ML SYRP 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 74.96,
+    "family": "REDUCOF",
+    "aliases": [
+      "reducof",
+      "reducof syp",
+      "reducof syr",
+      "reducof 100ml",
+      "redocof sy",
+      "riducofe 100 ml",
+      "reducof sry",
+      "reducof.syp",
+      "reducof:100mi"
+    ]
+  },
+  {
+    "code": "961",
+    "name": "GESTRENOL TAB 5MG 3X10'S",
+    "unit": "Box (3x10's)",
+    "price": 180.6,
+    "family": "GESTRENOL",
+    "aliases": [
+      "gestrenol",
+      "gestrenol tab",
+      "gestonal",
+      "gestanol"
+    ]
+  },
+  {
+    "code": "SM1",
+    "name": "EXICOF 100ML SYRUP 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 59.97,
+    "family": "EXICOF",
+    "aliases": [
+      "exicof",
+      "exicof syp",
+      "exicof syr",
+      "exicof 100ml",
+      "exicof sry",
+      "exicof  100 ml sy",
+      "exicof 100 ml",
+      "exicof:100mi"
+    ]
+  },
+  {
+    "code": "SY1",
+    "name": "RENASONE 10G CREAM 1X1'S",
+    "unit": "Tube (10g)",
+    "price": 38.98,
+    "family": "RENASONE",
+    "aliases": [
+      "renasone",
+      "renasone cream",
+      "renason cream",
+      "renasone crem",
+      "reason cream",
+      "reasone",
+      "renason",
+      "renason creem",
+      "renasone cream.",
+      "renasone crim"
+    ]
+  },
+  {
+    "code": "34",
+    "name": "BECONEX SYRUP 200ML 1'S",
+    "unit": "Bottle (200ml)",
+    "price": 46.48,
+    "family": "BECONEX",
+    "aliases": [
+      "beconex 200ml",
+      "beconex 200 ml",
+      "beconex 200",
+      "biconex 200 ml",
+      "beconex 200ml syp",
+      "beconex zi",
+      "beconex200ml"
+    ]
+  },
+  {
+    "code": "33",
+    "name": "BECONEX SYRUP 100ML 1'S",
+    "unit": "Bottle (100ml)",
+    "price": 26.24,
+    "family": "BECONEX",
+    "aliases": [
+      "beconex 100ml",
+      "beconex 100 ml",
+      "beconex 100",
+      "beconex syp",
+      "beconix 100 ml sy",
+      "beconex.100ml"
+    ]
+  },
+  {
+    "code": "233",
+    "name": "BECONEX ZI SYRUP 100ML",
+    "unit": "Bottle (100ml)",
+    "price": 43.48,
+    "family": "BECONEX",
+    "aliases": [
+      "beconex zi",
+      "beconex zi 100ml",
+      "beconex zi syp"
+    ]
+  },
+  {
+    "code": "C82",
+    "name": "STARK 60ML ORAL SOLUTION 1X1'S",
+    "unit": "Bottle (60ml)",
+    "price": 56.22,
+    "family": "STARK",
+    "aliases": [
+      "stark",
+      "stark 60ml",
+      "stark syp",
+      "stark syr",
+      "strak sy",
+      "stack 60ml",
+      "stack 60ml syr",
+      "stark 60 ml",
+      "stark 60 ml sy",
+      "stark srp",
+      "stark sy"
+    ]
+  },
+  {
+    "code": "267",
+    "name": "PROTONIL EC 40MG TAB 3X10'S",
+    "unit": "Box (3x10's)",
+    "price": 202.5,
+    "family": "PROTONIL",
+    "aliases": [
+      "protonil 40",
+      "protonil 40mg",
+      "potonil 40"
+    ]
+  },
+  {
+    "code": "266",
+    "name": "PROTONIL EC 20MG TAB 5X10'S",
+    "unit": "Box (5x10's)",
+    "price": 225.0,
+    "family": "PROTONIL",
+    "aliases": [
+      "protonil 20",
+      "protonil 20mg",
+      "protonil",
+      "potonil 20"
+    ]
+  },
+  {
+    "code": "138",
+    "name": "POLYCEF SYRUP 100ML",
+    "unit": "Bottle (100ml)",
+    "price": 67.47,
+    "family": "POLYCEF",
+    "aliases": [
+      "polycef",
+      "polycef 100ml",
+      "polycef syp"
+    ]
+  },
+  {
+    "code": "875",
+    "name": "BREDICON TAB 28'S",
+    "unit": "Pack (28's)",
+    "price": 52.08,
+    "family": "BREDICON",
+    "aliases": [
+      "bredicon",
+      "bredicon tab",
+      "bedicon",
+      "badecon tab"
+    ]
+  },
+  {
+    "code": "S34",
+    "name": "PANGESIC TAB 5X6'S",
+    "unit": "Box (5x6's)",
+    "price": 180.0,
+    "family": "PANGESIC",
+    "aliases": [
+      "pangesic",
+      "pangesic tab"
+    ]
+  },
+  {
+    "code": "934",
+    "name": "CALCIN-D TAB 6X10'S",
+    "unit": "Box (6x10's)",
+    "price": 360.0,
+    "family": "CALCIN-D",
+    "aliases": [
+      "calcin d",
+      "calcin-d",
+      "calcin d tab",
+      "calcin d 60mg"
+    ]
+  },
+  {
+    "code": "607",
+    "name": "FLUSTAR 500MG CAP 7X4'S",
+    "unit": "Box (7x4's)",
+    "price": 210.0,
+    "family": "FLUSTAR",
+    "aliases": [
+      "flustar 500",
+      "flustar cap",
+      "flustar 500mg",
+      "flustar"
+    ]
+  },
+  {
+    "code": "N33",
+    "name": "FLUSTAR 100ML DRY SYS 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 44.98,
+    "family": "FLUSTAR",
+    "aliases": [
+      "flustar 100ml",
+      "flustar syp",
+      "flustar dry syp"
+    ]
+  },
+  {
+    "code": "282",
+    "name": "NORRY 3MG TAB 5X10'S",
+    "unit": "Box (5x10's)",
+    "price": 262.5,
+    "family": "NORRY",
+    "aliases": [
+      "norry",
+      "norry 3mg",
+      "norry tab"
+    ]
+  },
+  {
+    "code": "CO6",
+    "name": "ZODEF 60ML SUSP 1X1'S",
+    "unit": "Bottle (60ml)",
+    "price": 149.93,
+    "family": "ZODEF",
+    "aliases": [
+      "zodef",
+      "zodef 60ml",
+      "zodef syp",
+      "jodef"
+    ]
+  },
+  {
+    "code": "902",
+    "name": "SALINE-R 20'S",
+    "unit": "Box (20's)",
+    "price": 90.0,
+    "family": "SALINE-R",
+    "aliases": [
+      "saline r",
+      "saline-r",
+      "salin r"
+    ]
+  },
+  {
+    "code": "232",
+    "name": "HONYCOL LINCTUS 100ML",
+    "unit": "Bottle (100ml)",
+    "price": 29.99,
+    "family": "HONYCOL",
+    "aliases": [
+      "honycol",
+      "honycol 100ml",
+      "honycol syp"
+    ]
+  },
+  {
+    "code": "955",
+    "name": "THYROX 50MCG 3X30'S",
+    "unit": "Box (3x30's)",
+    "price": 148.5,
+    "family": "THYROX",
+    "aliases": [
+      "thyrox",
+      "thyrox 50",
+      "thyrox 50mcg"
+    ]
+  },
+  {
+    "code": "T28",
+    "name": "NUTRILINA 500MG VEG CAP 5X6'S",
+    "unit": "Box (5x6's)",
+    "price": 310.35,
+    "family": "NUTRILINA",
+    "aliases": [
+      "nutrilina",
+      "nutrilina 500",
+      "nutrilina cap"
+    ]
+  },
+  {
+    "code": "N49",
+    "name": "RECOX FC 120MG TAB 2X10'S",
+    "unit": "Box (2x10's)",
+    "price": 209.8,
+    "family": "RECOX",
+    "aliases": [
+      "recox 120",
+      "recox 120mg",
+      "recox"
+    ]
+  },
+  {
+    "code": "N47",
+    "name": "RECOX FC 90MG TAB 2X10'S",
+    "unit": "Box (2x10's)",
+    "price": 180.0,
+    "family": "RECOX",
+    "aliases": [
+      "recox 90",
+      "recox 90mg"
+    ]
+  },
+  {
+    "code": "SZ5",
+    "name": "COPNAT N OINTMENT 15GM 1'S",
+    "unit": "Tube (15g)",
+    "price": 52.47,
+    "family": "COPNAT",
+    "aliases": [
+      "copnat n ointment",
+      "copnat ointment",
+      "copnat oint"
+    ]
+  },
+  {
+    "code": "SZ4",
+    "name": "COPNAT N CREAM 15GM 1'S",
+    "unit": "Tube (15g)",
+    "price": 52.47,
+    "family": "COPNAT",
+    "aliases": [
+      "copnat n cream",
+      "copnat cream",
+      "copnat"
+    ]
+  },
+  {
+    "code": "SI1",
+    "name": "FUROCLAV 70ML DRY PWD SUSP 1X1'S",
+    "unit": "Bottle (70ml)",
+    "price": 198.65,
+    "family": "FUROCLAV",
+    "aliases": [
+      "furoclav",
+      "furoclav 70ml",
+      "furoclav syp"
+    ]
+  },
+  {
+    "code": "H39",
+    "name": "MOODS ALL-NIGHT",
+    "unit": "Pack (3's)",
+    "price": 50.0,
+    "family": "MOODS",
+    "aliases": [
+      "moods all night",
+      "moods all-night"
+    ]
+  },
+  {
+    "code": "H37",
+    "name": "MOODS DOTTED",
+    "unit": "Pack (3's)",
+    "price": 50.0,
+    "family": "MOODS",
+    "aliases": [
+      "moods dotted",
+      "moods"
+    ]
+  },
+  {
+    "code": "H89",
+    "name": "MOODS GOLD 1500 DOTS 3'S",
+    "unit": "Pack (3's)",
+    "price": 65.0,
+    "family": "MOODS",
+    "aliases": [
+      "moods gold 1500",
+      "moods 1500 dots",
+      "moods gold"
+    ]
+  },
+  {
+    "code": "H88",
+    "name": "MOODS GOLD ELECTRIFY 3'S",
+    "unit": "Pack (3's)",
+    "price": 65.0,
+    "family": "MOODS",
+    "aliases": [
+      "moods electrify",
+      "moods gold electrify"
+    ]
+  },
+  {
+    "code": "H34",
+    "name": "MOODS ULTA-THIN",
+    "unit": "Pack (3's)",
+    "price": 50.0,
+    "family": "MOODS",
+    "aliases": [
+      "moods ultra thin",
+      "moods ulta-thin"
+    ]
+  },
+  {
+    "code": "CY7",
+    "name": "HYDROGEST DS 2ML (500MG/2ML) INJ 1X1'S",
+    "unit": "Ampoule (1x1's)",
+    "price": 487.26,
+    "family": "HYDROGEST",
+    "aliases": [
+      "hydrogest",
+      "hydrogest ds",
+      "hydrogest inj"
+    ]
+  },
+  {
+    "code": "73",
+    "name": "DELENTIN SUSPENSION 10ML 1'S",
+    "unit": "Bottle (10ml)",
+    "price": 12.03,
+    "family": "DELENTIN",
+    "aliases": [
+      "delentin",
+      "delentin 10ml",
+      "delentine"
+    ]
+  },
+  {
+    "code": "933",
+    "name": "FENADIN SUSPENSION 50ML",
+    "unit": "Bottle (50ml)",
+    "price": 41.23,
+    "family": "FENADIN",
+    "aliases": [
+      "fenadin 50ml",
+      "fenadin syp",
+      "fenadin 50"
+    ]
+  },
+  {
+    "code": "69",
+    "name": "FENADIN 30ML SUSPENSION 1'S",
+    "unit": "Bottle (30ml)",
+    "price": 26.24,
+    "family": "FENADIN",
+    "aliases": [
+      "fenadin 30ml",
+      "fenadin 30"
+    ]
+  },
+  {
+    "code": "N45",
+    "name": "NOVELON LITE FC TAB 1X24'S",
+    "unit": "Pack (1x24's)",
+    "price": 366.38,
+    "family": "NOVELON",
+    "aliases": [
+      "novelon",
+      "novelon lite",
+      "novelon tab"
+    ]
+  },
+  {
+    "code": "840",
+    "name": "EMEREN 50ML SYRP 1X1'S",
+    "unit": "Bottle (50ml)",
+    "price": 22.49,
+    "family": "EMEREN",
+    "aliases": [
+      "emeren",
+      "emeren 50ml",
+      "emeren syp"
+    ]
+  },
+  {
+    "code": "989",
+    "name": "ALGIN SYRP 100ML 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 67.47,
+    "family": "ALGIN",
+    "aliases": [
+      "algin 100ml",
+      "algin syp",
+      "algin 100"
+    ]
+  },
+  {
+    "code": "C62",
+    "name": "ALGIN 50ML SYRP 1X1'S",
+    "unit": "Bottle (50ml)",
+    "price": 41.23,
+    "family": "ALGIN",
+    "aliases": [
+      "algin 50ml",
+      "algin 50"
+    ]
+  },
+  {
+    "code": "16",
+    "name": "MAZIC JR 100ML 4.05MG/5ML SYRP 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 28.49,
+    "family": "MAZIC",
+    "aliases": [
+      "mazic jr",
+      "mazic jr 100ml",
+      "mazic jr sy"
+    ]
+  },
+  {
+    "code": "18",
+    "name": "MAZIC 10MG/5ML 100ML 1X1'S",
+    "unit": "Bottle (100ml)",
+    "price": 26.24,
+    "family": "MAZIC",
+    "aliases": [
+      "mazic 100ml",
+      "mazic syp",
+      "mazic"
+    ]
+  },
+  {
+    "code": "DF4",
+    "name": "ALLUREN 100G PWD",
+    "unit": "Pack (100g)",
+    "price": 262.37,
+    "family": "ALLUREN",
+    "aliases": [
+      "alluren",
+      "alluren 100g",
+      "alluren pwd"
+    ]
+  }
 ];
 
 const DEFAULT_DA_MASTER = [
-  { daId: 'CF9054', altId: '', name: 'Md Rakib Hossain', phones: ['8801602791043'], aliases: ['mehedi hasan rakib1 da nk', 'rakib hossain', 'mehedihasanrakib515'] },
-  { daId: 'RF20363', altId: '', name: 'Ikbal Hossain (Sharif)', phones: ['8801839551851'], aliases: ['ikbal hossan sharif da nk', 'ikbal hossain', 'sharif'] },
-  { daId: 'CF10593', altId: 'C122227', name: 'Abdul Alim', phones: [], aliases: ['abdul alim da', 'abdul alim'] },
-  { daId: 'RF20360', altId: '', name: 'Dawdul Islam Sobuj', phones: ['8801805481935', '8801838675803'], aliases: ['dawdul islam sobuj', 'dawdul islam'] },
-  { daId: 'CF8970', altId: '', name: 'Abdullah Al Mamun', phones: ['8801878160083'], aliases: ['abdullah al mamun'] },
-  { daId: 'CF9012', altId: '', name: 'Abdur Rahim Saikat', phones: [], aliases: ['_saikat_khan_', 'saikat', 'abdur rahim saikat'] },
-  { daId: 'C122210', altId: '', name: 'Jahid Mondol', phones: ['8801854272016', '8801804892343'], aliases: ['jahid mondol'] },
-  { daId: 'C210015', altId: '', name: 'Daud Ul Islam', phones: [], aliases: ['daudmahmud5829', 'daudmahmud1', 'daud ul islam'] },
-  { daId: 'CF8971', altId: '', name: 'Mehedi Hassan', phones: ['8801805481946', '8801617729981'], aliases: ['mehedi hassan'] },
-  { daId: 'CF4526', altId: '', name: 'Seraj', phones: ['8801864482005'], aliases: ['seraj', 'seragul islam'] },
-  { daId: 'C210012', altId: '', name: 'Arfin Rasel (Rasel Hossain 2)', phones: [], aliases: ['arfin rasel da nk', 'arfin rasel'] },
-  { daId: 'CF9011', altId: '', name: 'Robiul Hossain (Robiul 1)', phones: ['8801845540077'], aliases: ['robiul 1 da', 'robiul hossain'] },
-  { daId: 'C210006', altId: '', name: 'Md Sajib Uddin (Hatiya)', phones: [], aliases: ['sojib nk depot hatiya', 'sajib__hatiya', 'sajib uddin'] },
-  { daId: 'C122184', altId: '', name: 'Rezaul Haque', phones: ['8801856006064', '8801782563961'], aliases: ['rezaul haque', 'rejaul hoque'] },
-  { daId: 'CF10592', altId: 'C122225', name: 'Md Robiul', phones: ['8801805481962', '8801650287369'], aliases: ['md robiul', 'robiul matubar'] },
-  { daId: 'CF9067', altId: '', name: 'Md Ajgor Hossen', phones: ['8801815499442'], aliases: ['ajgor hossen da nk', 'md ajgor hossen', 'ajgor hossen'] },
-  { daId: 'C122229', altId: '', name: 'Md Abubakkar', phones: ['8801615197377'], aliases: ['abubakkar da nk', 'md abubakkar'] },
-  { daId: 'C210004', altId: '', name: 'Sahadat Hossain', phones: ['8801850323315'], aliases: ['sahadat hossin da nk', 'sahadat hossain', 'md sahadat'] },
-  { daId: 'CF10589', altId: 'C122197', name: 'DA ID CF10589 / C122197', phones: ['8801641195494'], aliases: ['c122197', 'cf10589'] },
-  { daId: 'CF4706', altId: '', name: 'Md Sumon Miah', phones: ['8801805481944'], aliases: ['md sumon miah', 'afran sumon'] },
-  { daId: 'C122231', altId: '', name: 'Md Rakib Molla', phones: ['8801805481966', '8801637011890'], aliases: ['md rakib molla', 'md rakibb molla'] },
-  { daId: 'C210021', altId: '', name: 'Md Mahbubul Haque', phones: [], aliases: ['mdmahbubulhaque765', 'md mahbubul haque'] },
-  { daId: 'C210025', altId: '', name: 'Mosharef Hossin', phones: ['8801865472523'], aliases: ['mosharef hossin'] },
-  { daId: 'RF20359', altId: '', name: 'Mamunur Rashid', phones: ['8801805481934', '8801852118166'], aliases: ['mamunur rashid20359', 'mamunur rashid'] },
-  { daId: 'CF10588', altId: 'C122185', name: 'Md Mamun Hossain', phones: [], aliases: ['mamun da nk depot ren', 'md mamun hossain'] },
-  { daId: 'CF10590', altId: 'C122211', name: 'Md Rasel Hossen', phones: ['8801311821108'], aliases: ['md rasel hossen', 'md rasel'] },
-  { daId: 'C210017', altId: '', name: 'Md Jihad', phones: ['8801887762770', '8801805481940'], aliases: ['md jihad'] },
-  { daId: 'CF10587', altId: 'C122187', name: 'Tajul Islam (Sheikh Apon)', phones: ['8801999660289'], aliases: ['sheikhapon1', 'tajul islam', 'sheikh apon'] },
-  { daId: 'CF3881', altId: '', name: 'Sorowar Hossain', phones: ['8801805481941', '8801837203147'], aliases: ['sorowar hossain'] },
-  { daId: 'C122199', altId: '', name: 'Sojib (C122199)', phones: ['8801872496540'], aliases: ['sojib'] },
-  { daId: 'C210022', altId: '', name: 'Rofiqul Islam', phones: ['8801823263485'], aliases: ['rofiqul islam'] },
-  { daId: 'CF8987', altId: '', name: 'Md Saiful Islam', phones: ['8801890681777'], aliases: ['saiful da nk ren', 'saiful6045bd', 'md saiful islam'] },
-  { daId: 'CF10591', altId: 'C122223', name: 'Amran Hossain', phones: ['8801805481961', '8801310735205'], aliases: ['amran hossain', 'emran hossain'] },
-  { daId: 'CF9041', altId: '', name: 'Md Zihad', phones: [], aliases: ['md zihad nk depot ren', 'md zihad'] },
-  { daId: 'C055167', altId: '', name: 'Rakib 2', phones: ['8801805481953'], aliases: ['rakib 2', 'mrmrakib6'] },
-  { daId: 'C210016', altId: '', name: 'Md Roki Uddin', phones: ['8801805481973'], aliases: ['roki nk depot', 'md roki uddin'] },
-  { daId: 'RF5709', altId: '', name: 'Shimul Dey', phones: [], aliases: ['shimul dey renata nk depot', 'shimul dey', 'shimuldey'] },
-  { daId: 'CF4525', altId: '', name: 'Neymot Ullah', phones: ['8801841693411'], aliases: ['neymot da nk ren', 'neymot ullah', 'neymotullah56'] },
-  { daId: 'C210011', altId: '', name: 'DA ID C210011', phones: ['8801915403253'], aliases: ['c210011'] },
-  { daId: 'CF1568', altId: '', name: 'Mizanur Rahaman', phones: [], aliases: ['mizanur rahaman da nk', 'mizanur rahaman', 'mizan'] },
-  { daId: 'C210018', altId: '', name: 'Safayat Hossen', phones: ['8801636190755'], aliases: ['safayat hossen'] },
-  { daId: 'CF1603', altId: '', name: 'Ruhul Amin', phones: ['8801916682332'], aliases: ['ruhul amin'] },
-  { daId: 'C210024', altId: '', name: 'Ilias Hossain', phones: ['8801621668496'], aliases: ['ilias hossain'] },
-  { daId: 'C210028', altId: '', name: 'Abdur Rahman', phones: [], aliases: ['abdur rahman nk depot ren', 'abdur rahman'] },
-  { daId: 'C122230', altId: '', name: 'DA ID C122230', phones: ['8801777824386'], aliases: ['c122230'] },
-  { daId: 'CF10145', altId: '', name: 'Moajjem', phones: [], aliases: ['moajjem', 'cf10145', 'moazzem'] },
-  { daId: 'RF9084', altId: '', name: 'Tofayel Ahmed', phones: [], aliases: ['tofayel ahmed', 'rf9084', 'tofayel'] }
+  {
+    "daId": "CF9054",
+    "altId": "",
+    "name": "Md Rakib Hossain",
+    "phones": [
+      "8801602791043"
+    ],
+    "aliases": [
+      "md rakib hossain",
+      "cf9054"
+    ]
+  },
+  {
+    "daId": "RF20363",
+    "altId": "",
+    "name": "Ikbal Hossain (Sharif)",
+    "phones": [
+      "8801839551851"
+    ],
+    "aliases": [
+      "ikbal hossain (sharif)",
+      "rf20363"
+    ]
+  },
+  {
+    "daId": "CF10593",
+    "altId": "C122227",
+    "name": "Abdul Alim",
+    "phones": [],
+    "aliases": [
+      "abdul alim",
+      "cf10593",
+      "c122227",
+      "abdul alim da"
+    ]
+  },
+  {
+    "daId": "RF20360",
+    "altId": "",
+    "name": "Dawdul Islam Sobuj",
+    "phones": [
+      "8801805481935",
+      "8801838675803"
+    ],
+    "aliases": [
+      "dawdul islam sobuj",
+      "rf20360"
+    ]
+  },
+  {
+    "daId": "CF8970",
+    "altId": "",
+    "name": "Abdullah Al Mamun",
+    "phones": [
+      "8801878160083"
+    ],
+    "aliases": [
+      "abdullah al mamun",
+      "cf8970"
+    ]
+  },
+  {
+    "daId": "CF9012",
+    "altId": "",
+    "name": "Abdur Rahim Saikat",
+    "phones": [],
+    "aliases": [
+      "abdur rahim saikat",
+      "cf9012",
+      "_saikat_khan_"
+    ]
+  },
+  {
+    "daId": "C122210",
+    "altId": "",
+    "name": "Jahid Mondol",
+    "phones": [
+      "8801854272016",
+      "8801804892343"
+    ],
+    "aliases": [
+      "jahid mondol",
+      "c122210"
+    ]
+  },
+  {
+    "daId": "C210015",
+    "altId": "",
+    "name": "Daud Ul Islam",
+    "phones": [],
+    "aliases": [
+      "daud ul islam",
+      "c210015",
+      "daudmahmud5829"
+    ]
+  },
+  {
+    "daId": "CF8971",
+    "altId": "",
+    "name": "Mehedi Hassan",
+    "phones": [
+      "8801805481946",
+      "8801617729981"
+    ],
+    "aliases": [
+      "mehedi hassan",
+      "cf8971"
+    ]
+  },
+  {
+    "daId": "CF4526",
+    "altId": "",
+    "name": "Seraj",
+    "phones": [
+      "8801864482005"
+    ],
+    "aliases": [
+      "seraj",
+      "cf4526"
+    ]
+  },
+  {
+    "daId": "C210012",
+    "altId": "",
+    "name": "Arfin Rasel (Rasel Hossain 2)",
+    "phones": [],
+    "aliases": [
+      "arfin rasel (rasel hossain 2)",
+      "c210012",
+      "arfin rasel da nk"
+    ]
+  },
+  {
+    "daId": "CF9011",
+    "altId": "",
+    "name": "Robiul Hossain (Robiul 1)",
+    "phones": [
+      "8801845540077"
+    ],
+    "aliases": [
+      "robiul hossain (robiul 1)",
+      "cf9011"
+    ]
+  },
+  {
+    "daId": "C210006",
+    "altId": "",
+    "name": "Md Sajib Uddin (Hatiya)",
+    "phones": [],
+    "aliases": [
+      "md sajib uddin (hatiya)",
+      "c210006",
+      "sojib nk depot hatiya"
+    ]
+  },
+  {
+    "daId": "C122184",
+    "altId": "",
+    "name": "Rezaul Haque",
+    "phones": [
+      "8801856006064",
+      "8801782563961"
+    ],
+    "aliases": [
+      "rezaul haque",
+      "c122184"
+    ]
+  },
+  {
+    "daId": "CF10592",
+    "altId": "C122225",
+    "name": "Md Robiul",
+    "phones": [
+      "8801805481962",
+      "8801650287369"
+    ],
+    "aliases": [
+      "md robiul",
+      "cf10592",
+      "c122225"
+    ]
+  },
+  {
+    "daId": "CF9067",
+    "altId": "",
+    "name": "Md Ajgor Hossen",
+    "phones": [
+      "8801815499442"
+    ],
+    "aliases": [
+      "md ajgor hossen",
+      "cf9067"
+    ]
+  },
+  {
+    "daId": "C122229",
+    "altId": "",
+    "name": "Md Abubakkar",
+    "phones": [
+      "8801615197377"
+    ],
+    "aliases": [
+      "md abubakkar",
+      "c122229"
+    ]
+  },
+  {
+    "daId": "C210004",
+    "altId": "",
+    "name": "Sahadat Hossain",
+    "phones": [
+      "8801850323315"
+    ],
+    "aliases": [
+      "sahadat hossain",
+      "c210004"
+    ]
+  },
+  {
+    "daId": "CF10589",
+    "altId": "C122197",
+    "name": "DA ID CF10589 / C122197",
+    "phones": [
+      "8801641195494"
+    ],
+    "aliases": [
+      "da id cf10589 / c122197",
+      "cf10589",
+      "c122197"
+    ]
+  },
+  {
+    "daId": "CF4706",
+    "altId": "",
+    "name": "Md Sumon Miah",
+    "phones": [
+      "8801805481944"
+    ],
+    "aliases": [
+      "md sumon miah",
+      "cf4706"
+    ]
+  },
+  {
+    "daId": "C122231",
+    "altId": "",
+    "name": "Md Rakib Molla",
+    "phones": [
+      "8801805481966",
+      "8801637011890"
+    ],
+    "aliases": [
+      "md rakib molla",
+      "c122231"
+    ]
+  },
+  {
+    "daId": "C210021",
+    "altId": "",
+    "name": "Md Mahbubul Haque",
+    "phones": [],
+    "aliases": [
+      "md mahbubul haque",
+      "c210021",
+      "mdmahbubulhaque765"
+    ]
+  },
+  {
+    "daId": "C210025",
+    "altId": "",
+    "name": "Mosharef Hossin",
+    "phones": [
+      "8801865472523"
+    ],
+    "aliases": [
+      "mosharef hossin",
+      "c210025"
+    ]
+  },
+  {
+    "daId": "RF20359",
+    "altId": "",
+    "name": "Mamunur Rashid",
+    "phones": [
+      "8801805481934",
+      "8801852118166"
+    ],
+    "aliases": [
+      "mamunur rashid",
+      "rf20359"
+    ]
+  },
+  {
+    "daId": "CF10588",
+    "altId": "C122185",
+    "name": "Md Mamun Hossain",
+    "phones": [],
+    "aliases": [
+      "md mamun hossain",
+      "cf10588",
+      "c122185",
+      "mamun da nk depot ren"
+    ]
+  },
+  {
+    "daId": "CF10590",
+    "altId": "C122211",
+    "name": "Md Rasel Hossen",
+    "phones": [
+      "8801311821108"
+    ],
+    "aliases": [
+      "md rasel hossen",
+      "cf10590",
+      "c122211"
+    ]
+  },
+  {
+    "daId": "C210017",
+    "altId": "",
+    "name": "Md Jihad",
+    "phones": [
+      "8801887762770",
+      "8801805481940"
+    ],
+    "aliases": [
+      "md jihad",
+      "c210017"
+    ]
+  },
+  {
+    "daId": "CF10587",
+    "altId": "C122187",
+    "name": "Tajul Islam (Sheikh Apon)",
+    "phones": [
+      "8801999660289"
+    ],
+    "aliases": [
+      "tajul islam (sheikh apon)",
+      "cf10587",
+      "c122187"
+    ]
+  },
+  {
+    "daId": "CF3881",
+    "altId": "",
+    "name": "Sorowar Hossain",
+    "phones": [
+      "8801805481941",
+      "8801837203147"
+    ],
+    "aliases": [
+      "sorowar hossain",
+      "cf3881"
+    ]
+  },
+  {
+    "daId": "C122199",
+    "altId": "",
+    "name": "Sojib (C122199)",
+    "phones": [
+      "8801872496540"
+    ],
+    "aliases": [
+      "sojib (c122199)",
+      "c122199"
+    ]
+  },
+  {
+    "daId": "C210022",
+    "altId": "",
+    "name": "Rofiqul Islam",
+    "phones": [
+      "8801823263485"
+    ],
+    "aliases": [
+      "rofiqul islam",
+      "c210022"
+    ]
+  },
+  {
+    "daId": "CF8987",
+    "altId": "",
+    "name": "Md Saiful Islam",
+    "phones": [
+      "8801890681777"
+    ],
+    "aliases": [
+      "md saiful islam",
+      "cf8987"
+    ]
+  },
+  {
+    "daId": "CF10591",
+    "altId": "C122223",
+    "name": "Amran Hossain",
+    "phones": [
+      "8801805481961",
+      "8801310735205"
+    ],
+    "aliases": [
+      "amran hossain",
+      "cf10591",
+      "c122223"
+    ]
+  },
+  {
+    "daId": "CF9041",
+    "altId": "",
+    "name": "Md Zihad",
+    "phones": [],
+    "aliases": [
+      "md zihad",
+      "cf9041",
+      "md zihad nk depot ren"
+    ]
+  },
+  {
+    "daId": "C055167",
+    "altId": "",
+    "name": "Rakib 2",
+    "phones": [
+      "8801805481953"
+    ],
+    "aliases": [
+      "rakib 2",
+      "c055167"
+    ]
+  },
+  {
+    "daId": "C210016",
+    "altId": "",
+    "name": "Md Roki Uddin",
+    "phones": [
+      "8801805481973"
+    ],
+    "aliases": [
+      "md roki uddin",
+      "c210016"
+    ]
+  },
+  {
+    "daId": "RF5709",
+    "altId": "",
+    "name": "Shimul Dey",
+    "phones": [],
+    "aliases": [
+      "shimul dey",
+      "rf5709",
+      "shimul dey renata nk depot"
+    ]
+  },
+  {
+    "daId": "CF4525",
+    "altId": "",
+    "name": "Neymot Ullah",
+    "phones": [
+      "8801841693411"
+    ],
+    "aliases": [
+      "neymot ullah",
+      "cf4525"
+    ]
+  },
+  {
+    "daId": "C210011",
+    "altId": "",
+    "name": "DA ID C210011",
+    "phones": [
+      "8801915403253"
+    ],
+    "aliases": [
+      "da id c210011",
+      "c210011"
+    ]
+  },
+  {
+    "daId": "CF1568",
+    "altId": "",
+    "name": "Mizanur Rahaman",
+    "phones": [],
+    "aliases": [
+      "mizanur rahaman",
+      "cf1568",
+      "mizanur rahaman da nk"
+    ]
+  },
+  {
+    "daId": "C210018",
+    "altId": "",
+    "name": "Safayat Hossen",
+    "phones": [
+      "8801636190755"
+    ],
+    "aliases": [
+      "safayat hossen",
+      "c210018"
+    ]
+  },
+  {
+    "daId": "CF1603",
+    "altId": "",
+    "name": "Ruhul Amin",
+    "phones": [
+      "8801916682332"
+    ],
+    "aliases": [
+      "ruhul amin",
+      "cf1603"
+    ]
+  },
+  {
+    "daId": "C210024",
+    "altId": "",
+    "name": "Ilias Hossain",
+    "phones": [
+      "8801621668496"
+    ],
+    "aliases": [
+      "ilias hossain",
+      "c210024"
+    ]
+  },
+  {
+    "daId": "C210028",
+    "altId": "",
+    "name": "Abdur Rahman",
+    "phones": [],
+    "aliases": [
+      "abdur rahman",
+      "c210028",
+      "abdur rahman nk depot ren"
+    ]
+  },
+  {
+    "daId": "C122230",
+    "altId": "",
+    "name": "DA ID C122230",
+    "phones": [
+      "8801777824386"
+    ],
+    "aliases": [
+      "da id c122230",
+      "c122230"
+    ]
+  },
+  {
+    "daId": "CF10145",
+    "altId": "",
+    "name": "Moajjem",
+    "phones": [],
+    "aliases": [
+      "moajjem",
+      "cf10145"
+    ]
+  }
 ];
 
-// ============================================================================
-// 3B. DYNAMIC JSON MASTER DATABASE ENGINE + PRODUCT BRAND GROUPS
-// ============================================================================
+const DA_MASTER = DEFAULT_DA_MASTER;
 
-const VARIANT_STOP_TOKENS = new Set([
-  '500', '200', '150', '120', '100', '90', '70', '60', '50', '40', '35', '30', '28', '24', '21', '20', '15', '10', '6', '5', '4', '3', '2', '1',
-  '40000', '20000', '1500', 'ml', 'mg', 'mcg', 'gm', 'g', 'iu', 'syp', 'syr', 'sry', 'sryp', 'syrp', 'srp', 'syrup', 'syrap', 'syraf', 'sy',
-  'susp', 'suspension', 'tab', 'tap', 'tb', 'tablet', 'cap', 'caps', 'capsule', 'cream', 'crem', 'creem', 'crm', 'ointment', 'oientment', 'olntment',
-  'fc', 'ec', 'ds', 'jr', 'lite', 'dry', 'pwd', 'oral', 'solution', 'linctus', 'veg', 'inj', 'dots', 'all', 'night', 'dotted', 'gold', 'electrify',
-  'ulta', 'ultra', 'thin', 'small', 'smal', 'ta', 'tah', 'pes', 'pcs', 'pc', 'ps', 'pic', 'p', 'box', 'bx', 'b', 'bot', 'bt', 'bottle', 'pack', 'pkt'
-]);
-
-/**
- * Extracts the common brand name / stem from any alias or product name:
- * e.g. "luen 200" -> "luen", "luncanr 150mg" -> "luncanr", "lucan r 50" -> "lucan r", "domirn 60ml" -> "domirn"
- */
 function extractCommonBrandStem(rawText) {
   if (!rawText) return '';
-  const spaced = String(rawText)
-    .replace(/([a-zA-Z])(\d)/g, '$1 $2')
-    .replace(/(\d)([a-zA-Z])/g, '$1 $2')
+  const cleaned = String(rawText)
     .toLowerCase()
+    .replace(/([a-z])(\d)/gi, '$1 $2')
+    .replace(/(\d)([a-z])/gi, '$1 $2')
     .replace(/[^a-z0-9\s\-]/g, ' ')
+    .replace(/\b(syp|syr|sry|srp|syrup|syrap|syraf|sy|susp|suspension|tab|tap|tb|tablet|cap|caps|capsule|cream|crem|creem|crm|ointment|oint|pwd|powder|inj|oral|solution|linctus|veg|fc|ec|ds|jr|lite|gold|dotted|all|night|electrify|ulta|ultra|thin|dots|iu|mg|ml|mcg|gm|g|ta|tah|ti|pes|pcs|pc|pic|pis|box|bx|bot|bottle|pack|pkt)\b/gi, ' ')
+    .replace(/\b\d+\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-
-  const words = spaced.split(' ').filter((w) => {
-    const cleanW = w.replace(/\-/g, '');
-    if (!cleanW) return false;
-    if (/^\d+$/.test(cleanW)) return false;
-    if (/^\d+x\d+$/i.test(cleanW)) return false;
-    if (VARIANT_STOP_TOKENS.has(cleanW)) return false;
-    return true;
-  });
-
-  const stem = words.join(' ').replace(/\s+/g, ' ').trim();
-  return stem.length >= 3 ? stem : '';
+  const words = cleaned.split(' ').filter((w) => w.length >= 2);
+  if (words.length === 0) return '';
+  if (words.length >= 2 && words[1].length <= 2) {
+    return `${words[0]} ${words[1]}`.trim();
+  }
+  return words[0];
 }
 
-/**
- * Builds the default Product Brand Groups from DEFAULT_CRP_PRODUCTS
- * Groups products that share a common brand name (e.g. LUCAN-R, DOMIREN, DELTASONE, ZITHRIN, BECONEX, etc.)
- */
-function buildDefaultProductGroups(productsList) {
+function buildDefaultProductGroups(productsArray) {
   const groupsMap = new Map();
-  for (const p of productsList || DEFAULT_CRP_PRODUCTS) {
-    const grpName = String(p.family || String(p.name || '').split(/\s+/)[0] || 'GENERAL').trim().toUpperCase();
-    if (!groupsMap.has(grpName)) {
-      groupsMap.set(grpName, {
-        groupName: grpName,
-        keywords: new Set([
-          grpName.toLowerCase(),
-          grpName.toLowerCase().replace(/\-/g, ' '),
-          grpName.toLowerCase().replace(/\-/g, '')
-        ])
-      });
+  for (const p of productsArray || []) {
+    const gName = String(p.family || String(p.name || '').split(/\s+/)[0] || 'GENERAL').trim().toUpperCase();
+    if (!groupsMap.has(gName)) {
+      groupsMap.set(gName, new Set([
+        gName.toLowerCase(),
+        gName.toLowerCase().replace(/\-/g, ' '),
+        gName.toLowerCase().replace(/\-/g, '')
+      ]));
     }
-    const g = groupsMap.get(grpName);
-    const nameStem = extractCommonBrandStem(p.name.split(/\s+/)[0]);
-    if (nameStem) g.keywords.add(nameStem);
-
+    const kwSet = groupsMap.get(gName);
     for (const al of p.aliases || []) {
       const stem = extractCommonBrandStem(al);
       if (stem && stem.length >= 3) {
-        g.keywords.add(stem);
-        const noSpace = stem.replace(/[\s\-]+/g, '');
-        if (noSpace.length >= 4) g.keywords.add(noSpace);
+        kwSet.add(stem);
+        const compact = stem.replace(/[\s\-]+/g, '');
+        if (compact.length >= 4) kwSet.add(compact);
       }
     }
   }
-
-  // Ensure common handwritten/OCR variations for multi-variant groups are pre-populated
-  const extraGroupKeywords = {
-    'LUCAN-R': ['lucan r', 'lucan-r', 'lucanr', 'luncanr', 'luncan r', 'locan r', 'locanr', 'lukan r', 'lukanr', 'lokanar', 'luknar', 'lucon r', 'lucanar', 'luen r', 'luen', 'lucar', 'luna r', 'lacan r'],
-    'DOMIREN': ['domiren', 'domeren', 'domirn', 'domniren', 'domira', 'dumiren', 'dmiren'],
-    'DELTASONE': ['deltasone', 'deltason', 'daltasone', 'daltason', 'delta sone', 'delta som', 'dellthesun', 'delterson', 'deltarson', 'deltasonne'],
-    'ZITHRIN': ['zithrin', 'zitrin', 'zitthrin', 'zithren', 'zrithrin', 'zithirin', 'ziyhrin'],
-    'BECONEX': ['beconex', 'biconex', 'beconez', 'beconix', 'be conex', 'becoxnex'],
-    'FLONTIN': ['flontin', 'flontine', 'foltin', 'flotin', 'falntin', 'flonten'],
-    'FUROCEF': ['furocef', 'feurocef', 'furosef', 'furoccfe', 'reocef'],
-    'FLUSTAR': ['flustar', 'fluster', 'fullstar', 'fulustar'],
-    'PROTONIL': ['protonil', 'protonel'],
-    'PCAB': ['pcab', 'p cab', 'p-cab', 'pacb', 'pcap', 'p-cap', 'picap'],
-    'COPNAT': ['copnat n', 'copnet n', 'cophnet n', 'copmate n', 'copnat'],
-    'FENADIN': ['fenadin', 'fanadin'],
-    'ALGIN': ['algin', 'algine'],
-    'MAZIC': ['mazic', 'magic'],
-    'RECOX': ['recox', 'ricox'],
-    'NEXDEX': ['nexdex', 'nex dex'],
-    'VITA': ['vita d3', 'vita d', 'bita d3', 'vita']
-  };
-
-  for (const [gName, kwList] of Object.entries(extraGroupKeywords)) {
-    if (groupsMap.has(gName)) {
-      const g = groupsMap.get(gName);
-      for (const kw of kwList) g.keywords.add(kw.toLowerCase());
-    }
-  }
-
-  return Array.from(groupsMap.values()).map((g) => ({
-    groupName: g.groupName,
-    keywords: Array.from(g.keywords).filter(Boolean)
+  return Array.from(groupsMap.entries()).map(([groupName, kwSet]) => ({
+    groupName,
+    keywords: Array.from(kwSet).filter(Boolean)
   }));
 }
 
@@ -333,7 +1932,6 @@ let masterDb = {
   updatedAt: new Date().toISOString()
 };
 
-// Pointers used by fast matching functions
 let activeProducts = masterDb.products;
 let activeDAs = masterDb.das;
 let activeProductGroups = masterDb.productGroups;
@@ -349,10 +1947,14 @@ function rebuildMasterLookupCaches() {
   TRADE_PRICE_MAP = new Map(activeProducts.map((p) => [String(p.code), Number(p.price)]));
 }
 
-/**
- * Automatically finds an existing Product Group for a product or creates one if none exists,
- * and adds any common brand stem from new aliases into that group's shared keywords!
- */
+function isAccidentalPsoAlias(aliasStr) {
+  if (!aliasStr) return true;
+  const s = String(aliasStr).trim().toLowerCase();
+  if (/^p\.?s\.?o\b/i.test(s)) return true;
+  if (/^[a-z]{1,2}\s*[\-:=]\s*\d{1,3}$/i.test(s)) return true;
+  return false;
+}
+
 function syncProductWithBrandGroup(prod, newAliasText = '') {
   if (!prod) return null;
   if (!Array.isArray(masterDb.productGroups)) {
@@ -363,7 +1965,6 @@ function syncProductWithBrandGroup(prod, newAliasText = '') {
     .trim()
     .toUpperCase();
 
-  // Check if an existing group matches familyCandidate or the product's brand prefix
   let group = masterDb.productGroups.find(
     (g) =>
       g.groupName.toUpperCase() === familyCandidate ||
@@ -393,15 +1994,15 @@ function syncProductWithBrandGroup(prod, newAliasText = '') {
     prod.family = group.groupName;
   }
 
-  // Extract common brand stem from newAliasText and all prod.aliases and add to group.keywords!
   const candidateAliases = [
     ...(prod.aliases || []),
     ...(newAliasText ? [newAliasText] : [])
   ];
 
   for (const al of candidateAliases) {
+    if (isAccidentalPsoAlias(al)) continue;
     const stem = extractCommonBrandStem(al);
-    if (stem && stem.length >= 3) {
+    if (stem && stem.length >= 3 && !isAccidentalPsoAlias(stem)) {
       if (!group.keywords.includes(stem)) {
         group.keywords.push(stem);
       }
@@ -427,6 +2028,13 @@ function getAdminAlertPhones() {
     ? masterDb.adminAlertPhones
     : DEFAULT_ADMIN_ALERT_PHONES;
   return Array.from(new Set(list.map((p) => normalizeBdPhone(p)).filter(Boolean)));
+}
+
+function saveLocalMasterDb() {
+  try {
+    masterDb.updatedAt = new Date().toISOString();
+    fs.writeFileSync(MASTER_DB_PATH, JSON.stringify(masterDb, null, 2), 'utf8');
+  } catch (e) {}
 }
 
 function loadLocalMasterDb() {
@@ -457,7 +2065,7 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
       price: Number(parseFloat(p.price) || 0),
       family: String(p.family || String(p.name || '').split(/\s+/)[0] || '').trim().toUpperCase(),
       aliases: Array.isArray(p.aliases)
-        ? Array.from(new Set(p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean)))
+        ? Array.from(new Set(p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter((a) => a && !isAccidentalPsoAlias(a))))
         : []
     })).filter((p) => p.code && p.name);
   }
@@ -465,13 +2073,12 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
     masterDb.productGroups = raw.productGroups.map((g) => ({
       groupName: String(g.groupName || '').trim().toUpperCase(),
       keywords: Array.isArray(g.keywords)
-        ? Array.from(new Set(g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)))
+        ? Array.from(new Set(g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter((k) => k && !isAccidentalPsoAlias(k))))
         : []
     })).filter((g) => g.groupName);
   } else {
     masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
   }
-  // Ensure all products are synced with their brand groups
   for (const p of masterDb.products) {
     syncProductWithBrandGroup(p);
   }
@@ -513,8 +2120,15 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
   if (typeof raw.lastProcessedMsgTimestamp === 'number' && raw.lastProcessedMsgTimestamp > 0) {
     masterDb.lastProcessedMsgTimestamp = raw.lastProcessedMsgTimestamp;
   }
-  if (Array.isArray(raw.messageLogs)) {
-    masterDb.messageLogs = raw.messageLogs.slice(0, 250);
+  if (Array.isArray(raw.messageLogs) && raw.messageLogs.length > 0) {
+    const mergedLogs = [...raw.messageLogs, ...(masterDb.messageLogs || [])];
+    const uniqueById = new Map();
+    for (const l of mergedLogs) {
+      if (l && l.whatsappMsgId && !uniqueById.has(l.whatsappMsgId)) {
+        uniqueById.set(l.whatsappMsgId, l);
+      }
+    }
+    masterDb.messageLogs = Array.from(uniqueById.values()).slice(0, 250);
   }
   masterDb.updatedAt = raw.updatedAt || new Date().toISOString();
   rebuildMasterLookupCaches();
@@ -526,19 +2140,12 @@ function applyMasterDbObject(raw, shouldSaveLocal = true) {
   }
 }
 
-/**
- * Merges an imported JSON object (from older or newer master_db.json backups) into current masterDb
- * without losing any existing DAs, Products, learned Aliases, Groups, or Phone numbers!
- */
 function mergeMasterDbObject(raw, shouldSaveLocal = true) {
   if (!raw || typeof raw !== 'object') return;
-
-  // Support raw array imports too (e.g. if user uploads an array of DAs or Products)
   const incomingDas = Array.isArray(raw.das) ? raw.das : (Array.isArray(raw) && raw[0]?.daId ? raw : []);
   const incomingProds = Array.isArray(raw.products) ? raw.products : (Array.isArray(raw) && raw[0]?.code ? raw : []);
   const incomingGroups = Array.isArray(raw.productGroups) ? raw.productGroups : [];
 
-  // 1. Merge DAs
   for (const d of incomingDas) {
     const cleanId = String(d.daId || '').trim().toUpperCase();
     const cleanAlt = String(d.altId || '').trim().toUpperCase();
@@ -571,14 +2178,13 @@ function mergeMasterDbObject(raw, shouldSaveLocal = true) {
     }
   }
 
-  // 2. Merge Products & Aliases
   for (const p of incomingProds) {
     const cleanCode = String(p.code || '').trim().toUpperCase();
     const cleanName = String(p.name || '').trim().toUpperCase();
     if (!cleanCode || !cleanName) continue;
 
     const cleanAliases = Array.isArray(p.aliases)
-      ? p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean)
+      ? p.aliases.map((a) => String(a || '').trim().toLowerCase()).filter((a) => a && !isAccidentalPsoAlias(a))
       : [];
     const existingProd = masterDb.products.find((x) => String(x.code).toUpperCase() === cleanCode);
     if (existingProd) {
@@ -601,44 +2207,33 @@ function mergeMasterDbObject(raw, shouldSaveLocal = true) {
     }
   }
 
-  // 3. Merge Product Groups
   if (!Array.isArray(masterDb.productGroups) || masterDb.productGroups.length === 0) {
     masterDb.productGroups = buildDefaultProductGroups(masterDb.products);
   }
   for (const g of incomingGroups) {
     const gName = String(g.groupName || '').trim().toUpperCase();
     if (!gName) continue;
-    const kwList = Array.isArray(g.keywords)
-      ? g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+    const gKws = Array.isArray(g.keywords)
+      ? g.keywords.map((k) => String(k || '').trim().toLowerCase()).filter((k) => k && !isAccidentalPsoAlias(k))
       : [];
     const existingGrp = masterDb.productGroups.find((x) => x.groupName.toUpperCase() === gName);
     if (existingGrp) {
-      existingGrp.keywords = Array.from(new Set([...(existingGrp.keywords || []), ...kwList]));
+      existingGrp.keywords = Array.from(new Set([...(existingGrp.keywords || []), ...gKws]));
     } else {
-      masterDb.productGroups.push({
-        groupName: gName,
-        keywords: Array.from(new Set([gName.toLowerCase(), ...kwList]))
-      });
+      masterDb.productGroups.push({ groupName: gName, keywords: Array.from(new Set([gName.toLowerCase(), ...gKws])) });
     }
   }
 
-  // Ensure every product's aliases are synced with its Brand Group
-  for (const p of masterDb.products) {
-    syncProductWithBrandGroup(p);
-  }
-
-  // 4. Merge Phones
-  if (Array.isArray(raw.adminAlertPhones)) {
+  if (Array.isArray(raw.adminAlertPhones) && raw.adminAlertPhones.length > 0) {
     masterDb.adminAlertPhones = Array.from(
       new Set([...(masterDb.adminAlertPhones || []), ...raw.adminAlertPhones.map((p) => normalizeBdPhone(p)).filter(Boolean)])
     );
   }
-  if (Array.isArray(raw.authorizedImagePhones)) {
+  if (Array.isArray(raw.authorizedImagePhones) && raw.authorizedImagePhones.length > 0) {
     masterDb.authorizedImagePhones = Array.from(
       new Set([...(masterDb.authorizedImagePhones || []), ...raw.authorizedImagePhones.map((p) => normalizeBdPhone(p)).filter(Boolean)])
     );
   }
-
   if (raw.targetGroup && typeof raw.targetGroup === 'object') {
     const tgId = String(raw.targetGroup.targetGroupId || '').trim();
     const tgName = String(raw.targetGroup.targetGroupName || '').trim();
@@ -678,234 +2273,164 @@ function mergeMasterDbObject(raw, shouldSaveLocal = true) {
   }
 }
 
-function saveLocalMasterDb() {
-  try {
-    masterDb.updatedAt = new Date().toISOString();
-    rebuildMasterLookupCaches();
-    fs.writeFileSync(MASTER_DB_PATH, JSON.stringify(masterDb, null, 2), 'utf8');
-  } catch (e) {}
-}
-
 // ============================================================================
-// 4. FUZZY SPELL-CHECKING, GROUP KEYWORDS & VARIANT DISAMBIGUATION ENGINE
+// 4. FUZZY PRODUCT & BRAND GROUP VARIANT MATCHING ENGINE
 // ============================================================================
-
-function levenshtein(a, b) {
-  if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-  const v0 = new Int32Array(b.length + 1);
-  const v1 = new Int32Array(b.length + 1);
-  for (let i = 0; i <= b.length; i++) v0[i] = i;
-  for (let i = 0; i < a.length; i++) {
-    v1[0] = i + 1;
-    for (let j = 0; j < b.length; j++) {
-      const cost = a[i] === b[j] ? 0 : 1;
-      v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
+function levenshteinDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
     }
-    for (let j = 0; j <= b.length; j++) v0[j] = v1[j];
   }
-  return v1[b.length];
+  return dp[m][n];
 }
 
-function stringSimilarity(s1, s2) {
-  const longer = s1.length >= s2.length ? s1 : s2;
-  const shorter = s1.length >= s2.length ? s2 : s1;
-  if (longer.length === 0) return 1.0;
-  if (shorter.length === 0) return 0.0;
-  return (longer.length - levenshtein(longer, shorter)) / longer.length;
+function stringSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return (maxLen - levenshteinDistance(a, b)) / maxLen;
 }
 
-/**
- * Carefully resolves the exact product variant inside a Brand Group (e.g. LUCAN-R 200 vs 150 vs 50 vs 35ml)
- * Supports both built-in rules AND dynamic variant matching for newly added products in any group!
- */
-function resolveBrandFamilyVariant(family, rawTextLower) {
-  const byCode = (c) => activeProducts.find((p) => String(p.code).toUpperCase() === String(c).toUpperCase());
-  const familyUpper = String(family || '').trim().toUpperCase();
-  const groupProducts = activeProducts.filter((p) => String(p.family || '').toUpperCase() === familyUpper);
-  const rawInput = String(rawTextLower || '');
+function findProductByCode(code) {
+  return activeProducts.find((p) => String(p.code).toUpperCase() === String(code).toUpperCase()) || null;
+}
 
-  // Check explicit pack-size distinguishers before stripping pack sizes (e.g. "deltasone 17x30")
-  if (familyUpper === 'DELTASONE' && /\b17\s*[\*x]\s*30\b/i.test(rawInput)) {
-    return byCode('CS7');
-  }
+function resolveBrandFamilyVariant(family, normLine) {
+  const f = String(family || '').toUpperCase().trim();
+  const s = ` ${String(normLine || '').toLowerCase()} `;
+  const hasSypWord = /\b(syp|syr|sry|srp|syrup|syrap|syraf|sy|susp|suspension|oral|sol|drop|bottle|bot|ml)\b/i.test(s);
+  const hasTabCapWord = /\b(tab|tap|tb|tablet|cap|caps|capsule)\b/i.test(s);
 
-  // Strip pack sizes like "100's", "4x10's", "2x6's", "1x1's" FIRST so "100's" never turns into "100 s" (mistaken for 100ml)!
-  const rawWithoutPack = rawInput
-    .replace(/\b\d+\s*[\*x]\s*\d+(?:'s|s)?\b/gi, ' ')
-    .replace(/\b\d+\s*'\s*s\b/gi, ' ');
+  switch (f) {
+    case 'DOMIREN':
+      if (/\b60\b/.test(s)) return findProductByCode('286');
+      if (/\b100\b/.test(s) || hasSypWord) return findProductByCode('990');
+      if (/\b10\s*mg\b/.test(s) || hasTabCapWord) return findProductByCode('60');
+      return findProductByCode('990');
 
-  const text = rawWithoutPack
-    .replace(/([a-zA-Z])(\d)/g, '$1 $2')
-    .replace(/(\d)([a-zA-Z])/g, '$1 $2')
-    .replace(/\s+/g, ' ')
-    .trim();
+    case 'DELTASONE':
+      if (/\b100\b/.test(s) && (hasSypWord || /100\s*ml/.test(s))) return findProductByCode('637');
+      if (/\b(17\s*[x*\/]\s*30|5\s*mg)\b/.test(s) || hasTabCapWord) return findProductByCode('CS7');
+      if (/\b100\s*ml\b/.test(s)) return findProductByCode('637');
+      return findProductByCode('636');
 
-  // Strip the trailing order quantity at the end of the line so " = 20", " = 50", " = 60", " = 100"
-  // is NEVER mistaken for 20ml, 50mg, 60ml, or 100ml!
-  const UNIT_PAT = '(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)';
-  let textBeforeQty = text;
-  const sepQtyRe = new RegExp(`[\\-:=]+\\s*\\d+(?:\\s*\\+\\s*\\d+)?\\s*${UNIT_PAT}?\\.?\\s*$`, 'i');
-  const unitQtyRe = new RegExp(`\\s+\\d+(?:\\s*\\+\\s*\\d+)?\\s*${UNIT_PAT}\\.?\\s*$`, 'i');
-  const bareTrailingQtyRe = /\s+\d+(?:\s*\+\s*\d+)?\s*$/;
+    case 'ZITHRIN':
+      if (/\b50\b/.test(s)) return findProductByCode('290');
+      if (/\b20\b/.test(s)) return findProductByCode('270');
+      if (/\b15\b/.test(s)) return findProductByCode('173');
+      if (/\b30\b/.test(s)) return findProductByCode('834');
+      return findProductByCode('271');
 
-  if (sepQtyRe.test(textBeforeQty)) {
-    textBeforeQty = textBeforeQty.replace(sepQtyRe, ' ').trim();
-  } else if (unitQtyRe.test(textBeforeQty)) {
-    textBeforeQty = textBeforeQty.replace(unitQtyRe, ' ').trim();
-  } else if (bareTrailingQtyRe.test(textBeforeQty)) {
-    textBeforeQty = textBeforeQty.replace(bareTrailingQtyRe, ' ').trim();
-  }
+    case 'LUCAN-R':
+    case 'LUCAN':
+      if (/\b200\b/.test(s)) return findProductByCode('621');
+      if (/\b150\b/.test(s)) return findProductByCode('605');
+      if (/\b50\b/.test(s)) return findProductByCode('876');
+      if (/\b35\b/.test(s) || hasSypWord) return findProductByCode('112');
+      return findProductByCode('605');
 
-  switch (familyUpper) {
-    case 'DOMIREN': {
-      if (/\b(tab|tap|tb|tablet|fc|10\s*mg)\b/i.test(textBeforeQty)) return byCode('60');
-      if (/\b60\s*(ml)?\b/i.test(textBeforeQty) && !/\b100\s*ml\b/i.test(textBeforeQty)) return byCode('286');
-      if (/\b100\s*(ml)?\b/i.test(textBeforeQty)) return byCode('990');
-      break;
-    }
-    case 'DELTASONE': {
-      if (/\b(tab|tap|tb|tablet|5\s*mg)\b/i.test(textBeforeQty)) return byCode('CS7');
-      if (/\b100\s*(ml)?\b/i.test(textBeforeQty) && !/\b50\s*ml\b/i.test(textBeforeQty)) return byCode('637');
-      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('636');
-      break;
-    }
-    case 'ZITHRIN': {
-      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('290');
-      if (/\b20\s*(ml)?\b/i.test(textBeforeQty)) return byCode('270');
-      if (/\b15\s*(ml)?\b/i.test(textBeforeQty)) return byCode('173');
-      if (/\b30\s*(ml)?\b/i.test(textBeforeQty)) return byCode('834');
-      if (/\b35\s*(ml)?\b/i.test(textBeforeQty)) return byCode('271');
-      break;
-    }
-    case 'LUCAN-R': {
-      if (/\b200\s*(mg)?\b/i.test(textBeforeQty)) return byCode('621');
-      if (/\b150\s*(mg)?\b/i.test(textBeforeQty)) return byCode('605');
-      if (/\b50\s*(mg)?\b/i.test(textBeforeQty)) return byCode('876');
-      if (/\b(cap|caps|capsule)\b/i.test(textBeforeQty) && !/\b(syp|syr|sry|susp|35)\b/i.test(textBeforeQty)) {
-        return byCode('876');
-      }
-      if (/\b(35\s*(ml)?|syp|syr|sry|susp)\b/i.test(textBeforeQty)) return byCode('112');
-      break;
-    }
-    case 'FLONTIN': {
-      if (/\b(syp|syr|sry|sryp|syrp|srp|susp|60\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('226');
-      break;
-    }
-    case 'FUROCEF': {
-      if (/\b(ds|50\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('S72');
-      break;
-    }
-    case 'VITA': {
-      if (/\b(20000|20\s*k)\b/i.test(textBeforeQty)) return byCode('S15');
-      break;
-    }
-    case 'NEXDEX': {
-      if (/\b60\s*(mg)?\b/i.test(textBeforeQty)) return byCode('SA1');
-      break;
-    }
-    case 'PCAB': {
-      if (/\b10\s*(mg)?\b/i.test(textBeforeQty)) return byCode('C2Y');
-      break;
-    }
-    case 'BECONEX': {
-      if (/\b(zi|z\s*i)\b/i.test(textBeforeQty)) return byCode('233');
-      if (/\b100\s*(ml)?\b/i.test(textBeforeQty) && !/\b200\s*ml\b/i.test(textBeforeQty)) return byCode('33');
-      break;
-    }
-    case 'PROTONIL': {
-      if (/\b40\s*(mg)?\b/i.test(textBeforeQty)) return byCode('267');
-      break;
-    }
-    case 'FLUSTAR': {
-      if (/\b(syp|syr|sry|syrup|sys|dry|100\s*(ml)?)\b/i.test(textBeforeQty)) return byCode('N33');
-      break;
-    }
-    case 'RECOX': {
-      if (/\b120\s*(mg)?\b/i.test(textBeforeQty)) return byCode('N49');
-      break;
-    }
-    case 'COPNAT': {
-      if (/\b(cream|crem|creem|crm)\b/i.test(textBeforeQty)) return byCode('SZ4');
-      if (/\b(ointment|oientment|olntment|oint)\b/i.test(textBeforeQty)) return byCode('SZ5');
-      break;
-    }
-    case 'MOODS': {
-      if (/\b(electrify|electrifry)\b/i.test(textBeforeQty)) return byCode('H88');
-      if (/\b(gold|gola|1500)\b/i.test(textBeforeQty)) return byCode('H89');
-      if (/\b(dotted|dot)\b/i.test(textBeforeQty)) return byCode('H37');
-      if (/\b(ulta|ultra|thin)\b/i.test(textBeforeQty)) return byCode('H34');
-      break;
-    }
-    case 'FENADIN': {
-      if (/\b(30\s*(ml)?|small|smal)\b/i.test(textBeforeQty)) return byCode('69');
-      break;
-    }
-    case 'ALGIN': {
-      if (/\b50\s*(ml)?\b/i.test(textBeforeQty)) return byCode('C62');
-      break;
-    }
-    case 'MAZIC': {
-      if (/\b(jr|4\.05|4\s*05)\b/i.test(textBeforeQty)) return byCode('16');
-      break;
-    }
-  }
+    case 'FLONTIN':
+      if (/\b60\b/.test(s) || hasSypWord) return findProductByCode('226');
+      return findProductByCode('96');
 
-  // Dynamic fallback for newly added custom variants in groupProducts
-  if (groupProducts.length > 1) {
-    for (const gp of groupProducts) {
-      const nameClean = gp.name.replace(/\b\d+\s*[\*x]\s*\d+(?:'s|s)?\b/gi, ' ').replace(/\b\d+'s\b/gi, ' ');
-      const strengthMatches = [...nameClean.matchAll(/\b(40000|20000|1500|500|250|200|150|120|75|60|40|35|25|15)\s*(ml|mg|mcg|gm|g|iu)?\b/gi)];
-      for (const sm of strengthMatches) {
-        const numStr = sm[1];
-        if (new RegExp(`\\b${numStr}\\b`, 'i').test(textBeforeQty)) {
-          return gp;
+    case 'FUROCEF':
+      if (/\b(ds|50)\b/.test(s)) return findProductByCode('S72');
+      return findProductByCode('102');
+
+    case 'VITA':
+    case 'VITA D3':
+      if (/\b(20000|20\s*k)\b/.test(s)) return findProductByCode('S15');
+      return findProductByCode('S16');
+
+    case 'NEXDEX':
+      if (/\b60\b/.test(s)) return findProductByCode('SA1');
+      return findProductByCode('SA4');
+
+    case 'PCAB':
+      if (/\b10\b/.test(s) && /\b10\s*mg\b/.test(s)) return findProductByCode('C2Y');
+      if (/\bpcab\s*10\b/.test(s)) return findProductByCode('C2Y');
+      return findProductByCode('C2Z');
+
+    case 'BECONEX':
+      if (/\bzi\b/.test(s)) return findProductByCode('233');
+      if (/\b200\b/.test(s)) return findProductByCode('34');
+      return findProductByCode('33');
+
+    case 'PROTONIL':
+      if (/\b40\b/.test(s)) return findProductByCode('267');
+      return findProductByCode('266');
+
+    case 'FLUSTAR':
+      if (/\b100\b/.test(s) || hasSypWord) return findProductByCode('N33');
+      return findProductByCode('607');
+
+    case 'RECOX':
+      if (/\b90\b/.test(s)) return findProductByCode('N47');
+      return findProductByCode('N49');
+
+    case 'COPNAT':
+      if (/\b(oint|ointment)\b/.test(s)) return findProductByCode('SZ5');
+      return findProductByCode('SZ4');
+
+    case 'MOODS':
+      if (/\b(1500|gold\s*1500)\b/.test(s)) return findProductByCode('H89');
+      if (/\b(electrify)\b/.test(s)) return findProductByCode('H88');
+      if (/\b(all\s*night)\b/.test(s)) return findProductByCode('H39');
+      if (/\b(ultra|ulta|thin)\b/.test(s)) return findProductByCode('H34');
+      return findProductByCode('H37');
+
+    case 'FENADIN':
+      if (/\b30\b/.test(s)) return findProductByCode('69');
+      return findProductByCode('933');
+
+    case 'ALGIN':
+      if (/\b50\b/.test(s)) return findProductByCode('C62');
+      return findProductByCode('989');
+
+    case 'MAZIC':
+      if (/\bjr\b/.test(s)) return findProductByCode('16');
+      return findProductByCode('18');
+
+    default: {
+      const famMembers = activeProducts.filter(
+        (p) => String(p.family || '').toUpperCase() === f || p.name.toUpperCase().startsWith(f)
+      );
+      if (famMembers.length === 1) return famMembers[0];
+      if (famMembers.length > 1) {
+        for (const m of famMembers) {
+          const numMatch = m.name.match(/\b(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10)\s*(MG|ML|MCG|GM|G)\b/i);
+          if (numMatch && new RegExp(`\\b${numMatch[1]}\\b`).test(s)) {
+            return m;
+          }
         }
+        return famMembers[0];
       }
+      return null;
     }
   }
-
-  const defaults = {
-    'DOMIREN': '990',
-    'DELTASONE': '636',
-    'ZITHRIN': '271',
-    'LUCAN-R': '112',
-    'FLONTIN': '96',
-    'FUROCEF': '102',
-    'VITA': 'S16',
-    'NEXDEX': 'SA4',
-    'PCAB': 'C2Z',
-    'BECONEX': '34',
-    'PROTONIL': '266',
-    'FLUSTAR': '607',
-    'RECOX': 'N47',
-    'COPNAT': 'SZ5',
-    'MOODS': 'H39',
-    'FENADIN': '933',
-    'ALGIN': '989',
-    'MAZIC': '18'
-  };
-  if (defaults[familyUpper] && byCode(defaults[familyUpper])) {
-    return byCode(defaults[familyUpper]);
-  }
-  return groupProducts[0] || activeProducts.find((p) => p.family === familyUpper) || null;
 }
 
 const BRAND_FAMILY_PATTERNS = [
-  { family: 'TOTIFEN', regex: /\b(tot[iey]?f[ei]?n|totipen|toti\s*fen|totifen)\b/i },
-  { family: 'DOXICAP', regex: /\b(dox[iy]?c[auo]p|doxy\s*cap|doxecap)\b/i },
-  { family: 'DOMIREN', regex: /\b(dom[iey]?r[ea]n|domniren|domira|dumiren|dmiren)\b/i },
-  { family: 'DELTASONE', regex: /\b(d[ea]ltas[oa]ne?|d[ea]lt[ea]r?s[oa]n|delta\s*s[oa][mn]e?|dell?thesun|deltasonne)\b/i },
-  { family: 'PRAZOLE', regex: /\b(pr?a[zj]ole?|parzol|frazol|pazal)\b/i },
-  { family: 'ZITHRIN', regex: /\b(z[ri]?th?r[ie]n|zitrin|zitthrin|ziyhrin|zithirin)\b/i },
-  { family: 'XAMIC', regex: /\b(xamic|xmaic|examic|zamic)\b/i },
-  { family: 'RECOF', regex: /\b(recof|recop|rekof)\b/i },
-  { family: 'TRULAX', regex: /\b(trul[ae]x|tulax|trulux)\b/i },
-  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luncan\s*[\-_]?r?|luen\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*150)\b/i },
+  { family: 'TOTIFEN', regex: /\b(tot[iey]?[fp][ea]n|totifin)\b/i },
+  { family: 'DOXICAP', regex: /\b(dox[iy]?c?[cu]p|dox[iye]c?ap)\b/i },
+  { family: 'DOMIREN', regex: /\b(dom[iey]?r[ea]n|domniren|domira)\b/i },
+  { family: 'DELTASONE', regex: /\b(d[ea]lt[ae]r?s[oa]n[ne]?|delta\s*s[oa]m|dellthesun)\b/i },
+  { family: 'PRAZOLE', regex: /\b(p[ar]?a[zj]z?[oa]l[le]?|frazol|pazal)\b/i },
+  { family: 'ZITHRIN', regex: /\b(z[ri]?i?t+h?i?r[ie]n)\b/i },
+  { family: 'XAMIC', regex: /\b(e?x[am]{2}ic)\b/i },
+  { family: 'RECOF', regex: /\b(rec[oa][fp]e?)\b/i },
+  { family: 'TRULAX', regex: /\b(tr?ul[aeu]x)\b/i },
+  { family: 'LUCAN-R', regex: /\b(l[ou]c?[ak]a?n\s*[\-_]?r?|luncan\s*[\-_]?r?|luen\s*[\-_]?r?|luknar|lokanar|lucar|luna\s*r|lunch\s*(?:[\-_]?r|150))\b/i },
   { family: 'FLONTIN', regex: /\b(fl?ont[ie]ne?|foltin|flotin|falntin)\b/i },
   { family: 'NORMANAL', regex: /\b(norm[ao]n[ao]l|narmonal|nomanal|normal\s*500|normal(?=\s*[\-:=]?\s*\d))\b/i },
-  { family: 'FUROCEF', regex: /\b(fe?uroc[ce]fe?|furosef|reocef)\b/i },
+  { family: 'FUROCEF', regex: /\b(fe?ou?r[ou]c?h?[ce]fe?|furosef|furcif|reocef)\b/i },
   { family: 'VITA', regex: /\b([vb]ita\s*d\s*3?|[vb]ita\s*(40000|20000))\b/i },
   { family: 'NEXDEX', regex: /\b(nexdex|nex\s*dex)\b/i },
   { family: 'PCAB', regex: /\b(p[\s\-_]?ca[bp]|pacb|picap)\b/i },
@@ -913,15 +2438,15 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'DESOLON', regex: /\b(d[ea]s[eo]l[oa]ne?|dasalon|deslon|deslor)\b/i },
   { family: 'EMCON-1', regex: /\b(em\s*con(\s*[\-_]?\s*1)?|incone|emon(?=\s*[\-:=]?\s*\d))\b/i },
   { family: 'CONASYD', regex: /\b(conas[yi]d|conased|conacid)\b/i },
-  { family: 'REDUCOF', regex: /\b(red[ui]cof|rducof|reducop)\b/i },
+  { family: 'REDUCOF', regex: /\b(r[ei]d[uoi]c[oa][fp]e?|rducof)\b/i },
   { family: 'GESTRENOL', regex: /\b(g[ea]st[re]*n[oa]l|gestonal|gestanol|gestnol)\b/i },
   { family: 'EXICOF', regex: /\b(exic[oa][fp])\b/i },
-  { family: 'RENASONE', regex: /\b(renas[oa][nl]e?)\b/i },
-  { family: 'BECONEX', regex: /\b(b[ei]c?ox?ne[xz]|be\s*conex)\b/i },
-  { family: 'STARK', regex: /\b(stark|strak)\b/i },
-  { family: 'PROTONIL', regex: /\b(proton[ie]l)\b/i },
+  { family: 'RENASONE', regex: /\b(r[ea]n?as[oa][nl]e?)\b/i },
+  { family: 'BECONEX', regex: /\b(b[ei]c?ox?n[ei][xz]|be\s*conex)\b/i },
+  { family: 'STARK', regex: /\b(stark|strak|stack(?=\s*60))\b/i },
+  { family: 'PROTONIL', regex: /\b(pr?oton[ie]l)\b/i },
   { family: 'POLYCEF', regex: /\b(pol[yi]cef)\b/i },
-  { family: 'BREDICON', regex: /\b(b[ar]?e?d[ei]con|badicon)\b/i },
+  { family: 'BREDICON', regex: /\b(b[ar]?[ea]?d[ei]con|badicon)\b/i },
   { family: 'PANGESIC', regex: /\b(p[ae]ng[eia][sc]i?ce?)\b/i },
   { family: 'CALCIN-D', regex: /\b(calcin\s*[\-_]?d)\b/i },
   { family: 'FLUSTAR', regex: /\b(f[ul]+u?st[ae]r)\b/i },
@@ -936,7 +2461,7 @@ const BRAND_FAMILY_PATTERNS = [
   { family: 'FUROCLAV', regex: /\b(fe?uroclav)\b/i },
   { family: 'MOODS', regex: /\b(moods?)\b/i },
   { family: 'HYDROGEST', regex: /\b(hydroge?n?st)\b/i },
-  { family: 'DELENTIN', regex: /\b(d[ei]lentin)\b/i },
+  { family: 'DELENTIN', regex: /\b(d[ei]lentine?)\b/i },
   { family: 'FENADIN', regex: /\b(fenadin)\b/i },
   { family: 'NOVELON', regex: /\b(novelon)\b/i },
   { family: 'EMEREN', regex: /\b(em[ei]ren)\b/i },
@@ -956,6 +2481,11 @@ function matchCRPProduct(rawLine) {
     return null;
   }
 
+  // Never match a standalone PSO / Territory line as a product
+  if (/^\s*p\.?s\.?o\.?\b/i.test(rawLine.trim()) && extractPSOCode(rawLine)) {
+    return null;
+  }
+
   const cleanNormSpace = ` ${normalized.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()} `;
 
   // 1. Check Custom / Learned Aliases in activeProducts first
@@ -964,6 +2494,7 @@ function matchCRPProduct(rawLine) {
 
   for (const prod of activeProducts) {
     for (const rawAlias of prod.aliases || []) {
+      if (isAccidentalPsoAlias(rawAlias)) continue;
       const cleanAlias = String(rawAlias || '')
         .replace(/([a-zA-Z])(\d)/g, '$1 $2')
         .replace(/(\d)([a-zA-Z])/g, '$1 $2')
@@ -982,18 +2513,16 @@ function matchCRPProduct(rawLine) {
   }
 
   if (bestAliasProd) {
-    // Always pass through resolveBrandFamilyVariant so if a group sibling has a different strength (e.g. "luen 150" vs "luen 200"), the exact variant is selected!
     const resolved = resolveBrandFamilyVariant(bestAliasProd.family, normalized) || bestAliasProd;
     return { product: resolved, matchType: 'Alias/Learned', confidence: 0.99 };
   }
 
   // 2. Check Product Brand Groups (masterDb.productGroups) Shared Keywords!
-  //    If ANY keyword in a Product Group (e.g. "luen" or "luncanr" in LUCAN-R group) appears in the line,
-  //    resolve the exact variant (200mg vs 150mg vs 50mg vs 35ml) from that group!
   let bestGroup = null;
   let bestGroupKwLen = 0;
   for (const grp of activeProductGroups || []) {
     for (const kw of grp.keywords || []) {
+      if (isAccidentalPsoAlias(kw)) continue;
       const cleanKw = String(kw || '')
         .replace(/([a-zA-Z])(\d)/g, '$1 $2')
         .replace(/(\d)([a-zA-Z])/g, '$1 $2')
@@ -1046,7 +2575,7 @@ function matchCRPProduct(rawLine) {
     'medecal', 'hall', 'hal', 'mh', 'bazar', 'bazer', 'bz', 'market', 'road', 'hat', 'new', 'al', 'ma',
     'maa', 'jannat', 'janani', 'popular', 'model', 'unique', 'laxmipur', 'ramgonj', 'raipur', 'hatiya',
     'chowmuhani', 'noakhali', 'mandari', 'hasnabad', 'chatkhil', 'sonapur', 'kabirhat', 'company', 'dr',
-    'cus', 'name', 'customer', 'party', 'pharmey'
+    'cus', 'name', 'customer', 'party', 'pharmey', 'address'
   ]);
 
   const tokens = normalized
@@ -1060,7 +2589,6 @@ function matchCRPProduct(rawLine) {
   let bestScore = 0;
 
   for (const token of tokens) {
-    // Check similarity against Product Group keywords too
     for (const grp of activeProductGroups || []) {
       for (const kw of grp.keywords || []) {
         const kwWord = kw.split(/\s+/)[0].toLowerCase();
@@ -1107,7 +2635,6 @@ function matchCRPProduct(rawLine) {
 // ============================================================================
 // 5. QUANTITY EXTRACTOR, OCR PRE-NORMALIZER & UNRECOGNIZED PRODUCT DETECTOR
 // ============================================================================
-
 function fixOcrDigitLookalikes(str) {
   if (!str) return '';
   return str
@@ -1131,7 +2658,6 @@ function extractOrderQuantity(rawLine, matchedProduct) {
   s = s.replace(/\bemcon\s*[\-_]?\s*1\b/gi, 'emcon ');
   s = s.replace(/\b(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5|3)\s*(ml|mg|mcg|gm|g)\b/gi, ' ');
 
-  // Strip any strength/volume number (500, 200, 150, 100, 60, 50, 35, 30, 20, 15, 10, 5) after a product word when followed by the actual order quantity number!
   s = s.replace(/\b([a-z]{3,}(?:\s+[a-z]{1,4})?)\s*(?:syp|syr|sry|srp|sarape|tab|tap|cap|caps|susp)?\s*[\-_:=.]*\s*(500|200|150|120|100|90|70|60|50|40|35|30|20|15|10|5)\b(?=.*?\b\d+)/gi, '$1 ');
 
   const plusMatch = s.match(/(\d+)\s*\+\s*(\d+)/);
@@ -1148,22 +2674,16 @@ function extractOrderQuantity(rawLine, matchedProduct) {
   return null;
 }
 
-/**
- * Detects if a line that failed matchCRPProduct is actually an unrecognized medicine order line
- * (e.g. "Toti syp - 20", "Napa extra 50 pcs", "Domirn 100ml = 30")
- */
 function detectUnrecognizedProductLine(seg, isImageOrder = false) {
   if (!seg || typeof seg !== 'string') return null;
   const trimmed = fixOcrDigitLookalikes(seg.trim());
   if (trimmed.length < 4 || trimmed.length > 90) return null;
 
-  // Ignore DA ID lines, PSO lines, Pharmacy lines, phone numbers, dates, invoice headers, or casual chat
   if (/\b(cf|rf|c)\s*[\-_.]?\s*\d{4,6}\b/i.test(trimmed)) return null;
   if (/\b(2100\d{2}|122\d{3}|055167)\b/.test(trimmed)) return null;
   if (extractPSOCode(trimmed)) return null;
-  // Never treat any PSO / P.S.O / Territory / Route / Code line (e.g. "Pso t-23", "PSO: E-71") as an unknown product!
   if (/\bp\.?s\.?o\b/i.test(trimmed)) return null;
-  if (/^(?:p\.?s\.?o|territory|ter\b|route|beat|market|code\b|id\b|da\b|cus\b|customer|party)/i.test(trimmed)) return null;
+  if (/^(?:p\.?s\.?o|territory|ter\b|route|beat|market|code\b|id\b|da\b|cus\b|customer|party|address)/i.test(trimmed)) return null;
   if (/^[a-z]{1,2}\s*[\-:=]\s*\d{1,3}$/i.test(trimmed)) return null;
   if (isPharmacyCandidateLine(trimmed)) return null;
   if (/\b01[3-9]\d{8}\b/.test(trimmed)) return null;
@@ -1175,7 +2695,6 @@ function detectUnrecognizedProductLine(seg, isImageOrder = false) {
     return null;
   }
 
-  // Check if any known DA name or alias matches this line
   const lower = trimmed.toLowerCase();
   for (const da of activeDAs) {
     if (da.name && lower.includes(da.name.toLowerCase())) return null;
@@ -1184,9 +2703,7 @@ function detectUnrecognizedProductLine(seg, isImageOrder = false) {
     }
   }
 
-  const UNIT_PAT = '(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|b|bot|bt|pack|pkt|s)';
-  // On camera images, require an explicit "=" / "-" / ":" separator OR explicit unit (pcs, box, ta, 40P)
-  // so random paper header/address fragments with a bare number never trigger false unknown product holds!
+  const UNIT_PAT = '(?:ta|tah|ti|t|pes|pcs|pc|ps|pic|pis|p|box|bx|b|bot|bt|pack|pkt|s)';
   const hasExplicitSepOrUnit =
     new RegExp(`([a-zA-Z]{3,}.*?[\\-:=]+\\s*\\d+\\s*${UNIT_PAT}?\\.?$)`, 'i').test(trimmed) ||
     new RegExp(`([a-zA-Z]{3,}.*?\\s+\\d+\\s*${UNIT_PAT}\\.?$)`, 'i').test(trimmed);
@@ -1211,6 +2728,7 @@ function detectUnrecognizedProductLine(seg, isImageOrder = false) {
 
   if (!unknownName || unknownName.length < 3 || /^\d+$/.test(unknownName)) return null;
   if (!/[a-zA-Z]{3,}/.test(unknownName)) return null;
+  if (isAccidentalPsoAlias(unknownName)) return null;
 
   return {
     rawLine: trimmed,
@@ -1304,7 +2822,6 @@ function expandLineSegments(line) {
 // ============================================================================
 // 6. DA (DELIVERY ASSISTANT), PHONE/LID, PSO CODE & PHARMACY RESOLVER
 // ============================================================================
-
 const senderContextCache = new Map();
 const lidToPhoneMap = new Map([
   ['259794032148540', '8801732273944'],
@@ -1435,9 +2952,6 @@ function isAdminAlertSender(msg, resolvedPhone) {
   return false;
 }
 
-/**
- * Extracts a person name written right next to a new DA ID (e.g. "CF9988 Karim Uddin" or "ID: RF3012 - Rahim")
- */
 function extractInlineNameNextToDaId(fullText, candidateId) {
   if (!fullText || !candidateId) return '';
   const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -1455,10 +2969,6 @@ function extractInlineNameNextToDaId(fullText, candidateId) {
   return '';
 }
 
-/**
- * Resolves DA from message text and sender info using dynamic masterDb.das!
- * NEVER falls back to CF10145 or senderContextCache on Image Orders!
- */
 function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, senderJid, options = {}) {
   const { isImageOrder = false } = options;
   const cleanText = (fullText || '').toUpperCase();
@@ -1466,7 +2976,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
   const cleanPush = (senderPushName || '').toLowerCase().trim();
   const isSenderAdmin = getAuthorizedImagePhones().includes(cleanPhone) || getAdminAlertPhones().includes(cleanPhone);
 
-  // 1. Check Explicit CF / RF / C ID written in the message/image text
   const explicitMatch = cleanText.match(/\b(CF|RF|C)\s*[\-_.]?\s*(\d{4,6})\b/);
   if (explicitMatch) {
     const candidateId = `${explicitMatch[1]}${explicitMatch[2]}`;
@@ -1480,7 +2989,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
       return { ...foundByCode, isKnownDA: true, resolutionState: 'KNOWN' };
     }
 
-    // New/Unknown ID written in the message! Check if a clear name was written right next to the ID:
     const inlineName = extractInlineNameNextToDaId(fullText, candidateId);
     if (inlineName) {
       const autoCreatedDA = {
@@ -1501,7 +3009,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
       };
     }
 
-    // ID was found (e.g. CF9988) but Name is NOT in database and not written next to it -> Ask Admin 01793362829!
     return {
       daId: candidateId,
       altId: '',
@@ -1513,7 +3020,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     };
   }
 
-  // 2. Check Bare 6-digit C-IDs (e.g. 210022, 122210)
   const bareMatch = cleanText.match(/\b(2100\d{2}|122\d{3}|055167)\b/);
   if (bareMatch) {
     const candidateId = `C${bareMatch[1]}`;
@@ -1537,7 +3043,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     };
   }
 
-  // 3. Check if DA Name or Alias is explicitly written inside the message text
   const textLower = (fullText || '').toLowerCase();
   for (const da of activeDAs) {
     const nameCandidate = (da.name || '').toLowerCase().split('(')[0].trim();
@@ -1551,8 +3056,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // CRITICAL FIX: If this is an Image Order (or sent by an Admin phone), NEVER fall back to senderPhone or senderContextCache!
-  // Otherwise, any image without a written ID sent by +8801793362829 would falsely save as CF10145 (Moajjem)!
   if (isImageOrder || isSenderAdmin) {
     return {
       daId: 'UNRESOLVED',
@@ -1565,7 +3068,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     };
   }
 
-  // 4. For regular group text messages from DAs, check senderPhone in activeDAs
   if (cleanPhone.length >= 10) {
     const last10 = cleanPhone.slice(-10);
     const foundByPhone = activeDAs.find(
@@ -1577,7 +3079,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     }
   }
 
-  // 5. Check senderPushName against activeDAs aliases for regular group text messages
   for (const da of activeDAs) {
     for (const alias of da.aliases || []) {
       if (alias.length >= 4 && cleanPush.includes(alias.toLowerCase())) {
@@ -1591,7 +3092,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
     return { ...senderContextCache.get(senderJid), isKnownDA: true, resolutionState: 'KNOWN' };
   }
 
-  // Unknown sender in group with no ID/Name -> Needs Admin confirmation!
   return {
     daId: cleanPhone ? `WA-${cleanPhone.slice(-6)}` : 'UNRESOLVED',
     altId: '',
@@ -1605,7 +3105,6 @@ function resolveDAFromMessageAndSender(fullText, senderPhone, senderPushName, se
 
 function extractPSOCode(line) {
   if (!line) return null;
-  // Matches "Pso t-23", "PSO: E-71", "P.S.O - M-12", "pso code t-23", "pso 345", etc.
   const psoExplicit = line.match(
     /\bp\.?s\.?o\.?\s*(?:code|id|no)?\s*[\-:=_.]*\s*([A-Z]{1,2}\s*[\-:=_.]*\s*\d{1,4}|\d{2,4})\b/i
   );
@@ -1631,12 +3130,12 @@ function extractPSOCode(line) {
 function isPharmacyCandidateLine(line) {
   const clean = line.trim();
   if (!clean || clean.length < 3) return false;
-  if (/^(pso|cf|rf|c[\-_]?\d|assalamu|salam|hi|hello|crp\b)/i.test(clean)) return false;
+  if (/^(p\.?s\.?o|cf|rf|c[\-_]?\d|assalamu|salam|hi|hello|crp\b)/i.test(clean)) return false;
   if (/^(cus|customer|party)\s*(?:name)?\s*[\-:=]/i.test(clean)) return true;
   if (/^(md\s+|ikbal\s+hossain|robiul\s+hossain|dawdul\s+islam|jahid\s+mondol|rezaul\s+haque|rejaul\s+hoque|mizan\b|sharif\b|rakib\b)/i.test(clean) && !/\b(pharmacy|pharmey|pharma|phy|p\/h|medical|med|hall|mh|m\.h|drug|clinic|hospital|store|corner|center|centre)\b/i.test(clean)) {
     return false;
   }
-  if (/\b(pharmacy|pharmechy|pharmecy|pharmicy|pharmey|pharma|phy|p\/h|medical|medecal|med\s+hall|hall|hal|m\.?h\b|drug|clinic|hospital|medicine|medicen|corner|cornar|center|centre|store|point|paint|nikaton|ph\b)/i.test(clean)) {
+  if (/\b(pharmacy|pharmechy|pharmecy|pharmicy|pharmey|pharma|phy|p\/h|medical|medecal|med\s+hall|hall|hal|m\.?h\b|drug|clinic|hospital|medicine|medicen|corner|cornar|center|centre|store|point|paint|nikaton|ph\b|pmy\b)/i.test(clean)) {
     return true;
   }
   return false;
@@ -1736,7 +3235,6 @@ function parseWhatsAppOrderMessage({
         continue;
       }
 
-      // Check if this segment is an unrecognized product order line (has medicine-like text + quantity)
       const unknownCandidate = detectUnrecognizedProductLine(seg, isImageOrder);
       if (unknownCandidate) {
         unrecognizedItems.push({
@@ -1751,7 +3249,7 @@ function parseWhatsAppOrderMessage({
         !potentialPartyHeader &&
         seg.length >= 3 &&
         seg.length <= 45 &&
-        !/^(cf|rf|c[\-_]?\d|pso\b|\d+$)/i.test(seg) &&
+        !/^(cf|rf|c[\-_]?\d|p\.?s\.?o\b|\d+$)/i.test(seg) &&
         !/[=:]\s*\d+/i.test(seg) &&
         !/\b\d+\s*(?:ta|tah|t|pes|pcs|pc|ps|pic|p|box|bx|bot|pack)\b/i.test(seg)
       ) {
@@ -1830,10 +3328,8 @@ function parseWhatsAppOrderMessage({
 }
 
 // ============================================================================
-// 7. PERMANENT 5-METHOD IMAGE OCR & VISION AI PIPELINE + SMART BURST QUEUE (v5.7)
+// 7. PERMANENT 5-METHOD IMAGE OCR & VISION AI PIPELINE + SMART BURST QUEUE
 // ============================================================================
-
-// Optional Local Offline Tesseract.js Fallback (if installed in node_modules, provides 100% offline unlimited OCR!)
 let localTesseract = null;
 try {
   localTesseract = require('tesseract.js');
@@ -1853,10 +3349,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 24000) {
   }
 }
 
-// SHA-256 Image OCR Result Cache (if the same image is sent again, resolves in 0ms with 0 API calls!)
 const imageOcrResultCache = new Map();
-
-// Sliding-Window Call Counters (tracks actual calls in the last 60s for smart load-balancing across engines)
 const ocrSpaceCallTimestamps = [];
 const visionCallTimestamps = [];
 let ocrSpaceCooldownUntil = 0;
@@ -1877,8 +3370,6 @@ function getRecentVisionCount() {
   return visionCallTimestamps.length;
 }
 
-// Sequential FIFO Queue for Burst Image Orders
-// Processes 1 image at a time and spaces consecutive images when a large batch (8+ images) arrives!
 let imageProcessingChain = Promise.resolve();
 let pendingImageQueueCount = 0;
 let consecutiveBurstProcessed = 0;
@@ -1894,8 +3385,6 @@ function enqueueImageOrderTask(taskFn) {
       }
       consecutiveBurstProcessed++;
 
-      // If user sent a huge batch of images (e.g. 8-20 images at once), add a smooth 3.5s breather
-      // after the 6th consecutive image so free APIs never block the server IP
       if (consecutiveBurstProcessed >= 7) {
         addLog(`⏳ Batch Image #${consecutiveBurstProcessed}: pausing 3.5s to keep free OCR/Vision APIs smooth...`);
         await sleep(3500);
@@ -1915,9 +3404,6 @@ function enqueueImageOrderTask(taskFn) {
   return imageProcessingChain;
 }
 
-/**
- * Resilient WhatsApp Image Downloader with 3x Auto-Retry & Media Re-upload Request
- */
 async function downloadImageBufferWithRetry(msg) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1943,11 +3429,6 @@ async function downloadImageBufferWithRetry(msg) {
   throw lastErr || new Error('Empty image buffer');
 }
 
-/**
- * Method 1 & 4 Helper: Official Free OCR.Space API (https://api.ocr.space/parse/image)
- * Uses EXACT clean headers (no fake User-Agent, no PRO-only apipro1/apipro2 URLs that cause HTTP 403/503!).
- * Supports rotating multiple free OCR.Space keys if configured, plus automatic rate-limit cooldown detection.
- */
 let ocrKeyRotateIdx = 0;
 async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTable = 'true') {
   if (Date.now() < ocrSpaceCooldownUntil) {
@@ -1960,195 +3441,148 @@ async function runOcrSpacePass(base64Image, mimeType, engineNumber = '2', isTabl
     .filter(Boolean);
   const keyPool = configuredKeys.length > 0 ? configuredKeys : ['helloworld'];
 
-  // If using only default 'helloworld' key and 8 calls were already made in the last 60s,
-  // skip OCR.Space for this pass so we don't trigger a 403/rate-limit and let Vision AI handle it immediately!
   if (keyPool.length === 1 && keyPool[0] === 'helloworld' && getRecentOcrSpaceCount() >= 8) {
-    addLog(`⚡ OCR.Space 'helloworld' at 8-call/min limit — routing directly to Keyless Vision AI!`);
     return '';
   }
 
-  const ocrKey = keyPool[(ocrKeyRotateIdx++) % keyPool.length];
-  ocrSpaceCallTimestamps.push(Date.now());
+  const apiKey = keyPool[ocrKeyRotateIdx % keyPool.length];
+  ocrKeyRotateIdx++;
 
-  const formBody = new URLSearchParams();
-  formBody.append('apikey', ocrKey);
-  formBody.append('base64Image', `data:${mimeType};base64,${base64Image}`);
-  formBody.append('language', 'eng');
-  formBody.append('isOverlayRequired', 'false');
-  formBody.append('OCREngine', String(engineNumber));
-  formBody.append('scale', 'true');
-  formBody.append('detectOrientation', 'true');
-  formBody.append('isTable', String(isTable));
+  const formData = new URLSearchParams();
+  formData.append('apikey', apiKey);
+  formData.append('base64Image', `data:${mimeType || 'image/jpeg'};base64,${base64Image}`);
+  formData.append('language', 'eng');
+  formData.append('isOverlayRequired', 'false');
+  formData.append('OCREngine', String(engineNumber));
+  formData.append('scale', 'true');
+  formData.append('isTable', String(isTable));
+  formData.append('detectOrientation', 'true');
 
   try {
-    const res = await fetchWithTimeout(
+    ocrSpaceCallTimestamps.push(Date.now());
+    const response = await fetchWithTimeout(
       'https://api.ocr.space/parse/image',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: formBody.toString()
+        body: formData.toString()
       },
-      18000
+      22000
     );
 
-    if (res.status === 403 || res.status === 429 || res.status === 503) {
-      addLog(`⚠️ OCR.Space HTTP ${res.status} (Demo key busy) — switching to Vision AI for 45s...`);
-      ocrSpaceCooldownUntil = Date.now() + 45000;
+    if (response.status === 403 || response.status === 429 || response.status === 503) {
+      ocrSpaceCooldownUntil = Date.now() + 25000;
       return '';
     }
+    if (!response.ok) return '';
 
-    const json = await res.json();
-    if (json?.IsErroredOnProcessing) {
-      const errMsg = Array.isArray(json.ErrorMessage) ? json.ErrorMessage.join(' ') : String(json.ErrorMessage || '');
-      if (/10 times|rate|limit|maximum|many requests/i.test(errMsg)) {
-        addLog(`⚠️ OCR.Space rate limit reached — switching to Vision AI for 45s...`);
-        ocrSpaceCooldownUntil = Date.now() + 45000;
-        return '';
-      }
-    }
-
-    return (json?.ParsedResults || [])
+    const data = await response.json();
+    if (data?.IsErroredOnProcessing) return '';
+    return (data?.ParsedResults || [])
       .map((r) => r.ParsedText || '')
       .join('\n')
       .trim();
-  } catch (err) {
-    addLog(`⚠️ OCR.Space Engine ${engineNumber} error: ${err.message}`);
+  } catch (e) {
     return '';
   }
 }
 
-/**
- * Method 2, 3 & 5 Helper: Keyless Multimodal Vision AI (https://text.pollinations.ai/openai)
- * Uses EXACT clean headers ('Content-Type': 'application/json' ONLY — no unregistered Referer header!)
- * Includes comprehensive Renata PLC Bangladesh product catalog hints for ultra-accurate handwriting recognition.
- */
-async function runKeylessVisionAiModel(base64Image, mimeType, modelName = 'openai') {
-  // If 7+ Vision calls were made in the last 60s during a big 10-image burst, pause 4s so Pollinations never returns 429
-  if (getRecentVisionCount() >= 7) {
-    addLog(`⏳ Vision AI Pacer: waiting 4.5s for burst image...`);
-    await sleep(4500);
+async function runKeylessVisionPass(base64Image, mimeType, modelName = 'openai') {
+  if (getRecentVisionCount() >= 14) {
+    await sleep(2500);
   }
-  visionCallTimestamps.push(Date.now());
+  const systemPrompt =
+    'You are an expert pharmaceutical order OCR transcription assistant for Renata PLC in Bangladesh. ' +
+    'Transcribe ALL text from this handwritten or printed medicine order image line by line. ' +
+    'Preserve DA ID (e.g. CF4526, RF20363, C210012), PSO code (e.g. E71, T24, 475), Pharmacy/Party name, ' +
+    'and each medicine name with its ordered quantity (e.g. Totifen 100ml - 50, Doxicap - 10, Lucan R 200 - 20). ' +
+    'Output ONLY the transcribed lines without extra commentary.';
 
-  const catalogHint =
-    'Totifen 100ml, Doxicap 100mg, Domiren (60ml, 100ml, 10mg Tab), Deltasone (50ml, 100ml, 5mg Tab 17x30), ' +
-    'Lucan-R (35ml Syp, 50mg, 150mg, 200mg Cap), Zithrin (15ml, 20ml, 30ml, 35ml, 50ml), Prazole 20mg, ' +
-    'Xamic 500mg, Recof 100ml, Reducof 100ml, Trulax 100ml, Flontin (500mg Tab, 60ml Syp), Normanal 500mg, ' +
-    'Furocef (70ml, DS 50ml), Vita D3 (20000, 40000), Nexdex (30mg, 60mg), Pcab (10mg, 20mg), Ferix-V, ' +
-    'Desolon, Emcon-1, Conasyd Cream, Gestrenol, Exicof, Renasone Cream, Beconex (100ml, 200ml, ZI), Stark 60ml, ' +
-    'Protonil (20mg, 40mg), Polycef, Bredicon, Pangesic, Calcin-D, Flustar (Cap, 100ml Syp), Norry, Zodef, ' +
-    'Saline-R, Honycol, Thyrox, Nutrilina, Recox (90mg, 120mg), Copnat N (Cream, Ointment), Furoclav, ' +
-    'Moods (All-Night, Dotted, Ultra Thin, Gold, Electrify), Hydrogest, Delentin, Fenadin (30ml, 60ml), ' +
-    'Novelon Lite, Emeren, Algin (50ml, 100ml), Mazic (Jr, 100ml), Alluren';
-
-  const customGroupsHint = (activeProductGroups || [])
-    .map((g) => g.groupName)
-    .filter((g) => !catalogHint.toUpperCase().includes(g))
-    .join(', ');
-
-  const promptText =
-    'You are an expert OCR system reading a handwritten or printed pharmaceutical order sheet from Renata PLC (Bangladesh). ' +
-    'Read the image carefully and output ONLY the plain text lines in order:\n' +
-    '1. DA Code / ID if written (e.g., CF9054, CF4526, RF9084, RF20363, C122210, C210015) and DA Name.\n' +
-    '2. Customer / Pharmacy Name and PSO Code if written (e.g., E71, Q99, S81, 450).\n' +
-    '3. Every ordered medicine on its own line in the format: Medicine Name Strength = Quantity (e.g., "Totifen 100ml = 50", "Doxicap = 10", "Lucan R 200 = 40", "Domiren 100ml = 60").\n' +
-    `Known Renata medicines: ${catalogHint}${customGroupsHint ? ', ' + customGroupsHint : ''}.\n` +
-    'Important: Output ONLY the extracted lines as plain text. Do NOT add markdown, bullets, or explanations.';
-
-  for (let retry = 0; retry < 2; retry++) {
-    try {
-      const res = await fetchWithTimeout(
-        'https://text.pollinations.ai/openai',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: modelName,
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: promptText },
-                  { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
-                ]
-              }
-            ],
-            temperature: 0.1
-          })
-        },
-        26000
-      );
-
-      if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 524) {
-        if (retry === 0) {
-          addLog(`⏳ Vision AI [${modelName}] busy (HTTP ${res.status}) — waiting 5s and retrying...`);
-          await sleep(5000);
-          continue;
-        }
-        return '';
-      }
-
-      if (!res.ok) return '';
-      const data = await res.json();
-      const content = (data?.choices?.[0]?.message?.content || '').trim();
-      if (content) return content;
-    } catch (err) {
-      if (retry === 0) await sleep(2000);
-    }
+  try {
+    visionCallTimestamps.push(Date.now());
+    const res = await fetchWithTimeout(
+      'https://text.pollinations.ai/openai',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Read all medicine order lines, DA ID, PSO code, and quantities from this image:' },
+                {
+                  type: 'image_url',
+                  image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${base64Image}` }
+                }
+              ]
+            }
+          ],
+          temperature: 0.1
+        })
+      },
+      26000
+    );
+    if (!res.ok) return '';
+    const data = await res.json();
+    return (data?.choices?.[0]?.message?.content || '').trim();
+  } catch (e) {
+    return '';
   }
-  return '';
 }
 
-/**
- * Optional Google Gemini Vision API (if user configured GEMINI_API_KEY)
- */
-async function runGeminiVisionPass(base64Image, mimeType, geminiKey) {
-  const models = ['gemini-2.5-flash', 'gemini-1.5-flash'];
-  const productNamesHint = activeProducts.map((p) => `${p.name} (${p.code})`).join(', ');
-  const promptText =
-    'Read this handwritten or printed order photo for Renata PLC Bangladesh and output ONLY the plain text lines: ' +
-    'DA Code, Pharmacy/Customer Name, PSO Code, and each Product Name with its Quantity (one product per line, e.g. "Totifen 100ml = 50"). ' +
-    `Official products: ${productNamesHint}.`;
-
-  for (const modelName of models) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(geminiKey)}`;
-      const response = await fetchWithTimeout(
-        url,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: promptText },
-                  { inline_data: { mime_type: mimeType, data: base64Image } }
-                ]
-              }
-            ],
-            generationConfig: { temperature: 0.1 }
-          })
-        },
-        18000
-      );
-      const data = await response.json();
-      const extracted = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
-      if (extracted) return { text: extracted, engine: `Gemini Vision (${modelName})` };
-    } catch (e) {}
+async function runGeminiVisionPass(base64Image, mimeType) {
+  const apiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) return '';
+  try {
+    const res = await fetchWithTimeout(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: 'Transcribe all handwritten or printed medicine order lines, DA ID (CF/RF/C), PSO code, Pharmacy name, and quantities from this image line by line:'
+                },
+                {
+                  inline_data: {
+                    mime_type: mimeType || 'image/jpeg',
+                    data: base64Image
+                  }
+                }
+              ]
+            }
+          ]
+        })
+      },
+      22000
+    );
+    if (!res.ok) return '';
+    const data = await res.json();
+    return (data?.candidates?.[0]?.content?.parts || [])
+      .map((p) => p.text || '')
+      .join('\n')
+      .trim();
+  } catch (e) {
+    return '';
   }
-  return null;
 }
 
-/**
- * 5-Method Permanent Image Order Pipeline (v5.7):
- * - Method 1/5: OCR.Space Engine 2 (Neural Handwriting & Table Mode) — EXACT original #1 engine!
- *   (Automatically load-balances with Method 2 if >8 images are sent in under 60s so it never errors!)
- * - Method 2/5: Keyless Vision AI #1 (GPT-4o / OpenAI Vision with Full Renata Catalog Prompt)
- * - Method 3/5: Keyless Vision AI #2 (Large Vision — GPT-4.1 / OpenAI-Large)
- * - Method 4/5: OCR.Space Engine 1 & Raw Line Camera OCR
- * - Method 5/5: Keyless Vision AI #3 (Mistral / Claude Hybrid Vision) + Local Tesseract + 5-Method Consensus
- */
+async function runLocalTesseractPass(imageBuffer) {
+  if (!localTesseract || !imageBuffer) return '';
+  try {
+    const res = await localTesseract.recognize(imageBuffer, 'eng');
+    return (res?.data?.text || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
 async function processImageOrderWithThreeRetries({
   imageBuffer,
   mimeType = 'image/jpeg',
@@ -2159,12 +3593,12 @@ async function processImageOrderWithThreeRetries({
   senderPushName,
   senderJid
 }) {
-  const imgHash = crypto.createHash('sha256').update(imageBuffer).digest('hex').slice(0, 24);
+  const imgHash = crypto.createHash('sha256').update(imageBuffer).digest('hex');
   if (imageOcrResultCache.has(imgHash)) {
-    const cached = imageOcrResultCache.get(imgHash);
-    const combinedCached = [caption, cached.rawExtracted].filter(Boolean).join('\n').trim();
-    const parsedCached = parseWhatsAppOrderMessage({
-      messageText: combinedCached,
+    const cachedText = imageOcrResultCache.get(imgHash);
+    const combinedText = [caption, cachedText].filter(Boolean).join('\n');
+    const parsed = parseWhatsAppOrderMessage({
+      messageText: combinedText,
       messageId,
       timestamp,
       senderPhone,
@@ -2172,162 +3606,62 @@ async function processImageOrderWithThreeRetries({
       senderJid,
       isImageOrder: true
     });
-    if (parsedCached.orders && parsedCached.orders.length > 0) {
-      parsedCached.unrecognizedItems = [];
-      addLog(`⚡ Image matched instantly from Cache (${parsedCached.orders.length} items, 0 API calls).`);
-      return {
-        ok: true,
-        attemptUsed: 1,
-        engine: `${cached.engine} (Cached)`,
-        extractedText: combinedCached,
-        parsed: parsedCached
-      };
+    if ((parsed.orders && parsed.orders.length > 0) || (parsed.unrecognizedItems && parsed.unrecognizedItems.length > 0)) {
+      return { ok: true, parsed, extractedText: cachedText, engine: 'Cached-OCR', attemptUsed: 1 };
     }
   }
 
   const base64Image = imageBuffer.toString('base64');
-  const geminiKey = (botConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
-  const collectedTexts = [];
-  let bestCandidate = null;
-  let bestScore = -1;
-
-  const stages = [
+  const methods = [
     {
       name: 'Method 1/5 (Neural Handwriting & Table OCR Engine 2)',
-      run: async () => {
-        if (geminiKey) {
-          const g = await runGeminiVisionPass(base64Image, mimeType, geminiKey);
-          if (g && g.text) return g;
-        }
-        const t = await runOcrSpacePass(base64Image, mimeType, '2', 'true');
-        if (t) {
-          return { text: t, engine: 'Method 1: Neural Table OCR (Engine 2)' };
-        }
-        // Seamless Burst Failover: if OCR.Space was skipped due to 8-image burst limit, immediately run Keyless Vision AI inside Method 1!
-        const burstAi = await runKeylessVisionAiModel(base64Image, mimeType, 'openai');
-        return { text: burstAi, engine: 'Method 1: Neural OCR + Vision AI Burst Engine' };
-      }
+      run: () => runOcrSpacePass(base64Image, mimeType, '2', 'true')
     },
     {
-      name: 'Method 2/5 (Keyless Multimodal Vision AI #1 — GPT-4o Vision)',
-      run: async () => {
-        const aiText = await runKeylessVisionAiModel(base64Image, mimeType, 'openai');
-        return { text: aiText, engine: 'Method 2: Keyless Vision AI #1 (GPT-4o Vision)' };
-      }
+      name: 'Method 2/5 (Keyless Multimodal Vision AI #1 — Primary)',
+      run: () => runKeylessVisionPass(base64Image, mimeType, 'openai')
     },
     {
-      name: 'Method 3/5 (Keyless Multimodal Vision AI #2 — Large Vision)',
-      run: async () => {
-        const aiLarge = await runKeylessVisionAiModel(base64Image, mimeType, 'openai-large');
-        return { text: aiLarge, engine: 'Method 3: Keyless Vision AI #2 (Large Vision)' };
-      }
+      name: 'Method 3/5 (Keyless Multimodal Vision AI #2 — Fast/Alt Vision)',
+      run: () => runKeylessVisionPass(base64Image, mimeType, 'openai-large')
     },
     {
-      name: 'Method 4/5 (Raw Line-by-Line & High-Contrast OCR Engine 1/2)',
-      run: async () => {
-        const t2Raw = await runOcrSpacePass(base64Image, mimeType, '2', 'false');
-        if (t2Raw) return { text: t2Raw, engine: 'Method 4: Raw Line Camera OCR (Engine 2)' };
-        const t1 = await runOcrSpacePass(base64Image, mimeType, '1', 'true');
-        return { text: t1, engine: 'Method 4: High-Contrast OCR (Engine 1)' };
-      }
+      name: 'Method 4/5 (Raw Line-by-Line Camera OCR Engine 2)',
+      run: () => runOcrSpacePass(base64Image, mimeType, '2', 'false')
     },
     {
-      name: 'Method 5/5 (Deep Hybrid Vision AI #3 + Offline OCR Fallback)',
+      name: 'Method 5/5 (High-Contrast Orientation OCR Engine 1 + Gemini/Local Retry)',
       run: async () => {
-        const aiAlt = await runKeylessVisionAiModel(base64Image, mimeType, 'mistral');
-        if (aiAlt) {
-          return { text: aiAlt, engine: 'Method 5: Deep Vision AI #3 (Mistral Vision)' };
-        }
-        if (localTesseract) {
-          try {
-            const { data } = await localTesseract.recognize(imageBuffer, 'eng');
-            if (data?.text) return { text: data.text.trim(), engine: 'Method 5: Local Offline Tesseract OCR' };
-          } catch (e) {}
-        }
-        const aiClaude = await runKeylessVisionAiModel(base64Image, mimeType, 'claude-hybridspace');
-        return { text: aiClaude, engine: 'Method 5: Deep Hybrid Vision AI' };
+        const gText = await runGeminiVisionPass(base64Image, mimeType);
+        if (gText) return gText;
+        const o1 = await runOcrSpacePass(base64Image, mimeType, '1', 'true');
+        if (o1) return o1;
+        return await runLocalTesseractPass(imageBuffer);
       }
     }
   ];
 
-  for (let i = 0; i < stages.length; i++) {
-    const stage = stages[i];
-    try {
-      if (i > 0) {
-        addLog(`🔄 Image Auto-Recheck [${stage.name}] running...`);
-        await sleep(900);
-      }
-      const res = await stage.run();
-      const rawExtracted = (res?.text || '').trim();
-      if (rawExtracted) {
-        collectedTexts.push(rawExtracted);
-      }
+  let bestExtractedText = '';
+  let bestParsed = null;
+  let bestOrderCount = 0;
+  let bestEngine = '';
+  let bestAttempt = 0;
 
-      const combinedText = [caption, rawExtracted].filter(Boolean).join('\n').trim();
-      if (combinedText) {
-        const parsed = parseWhatsAppOrderMessage({
-          messageText: combinedText,
-          messageId,
-          timestamp,
-          senderPhone,
-          senderPushName,
-          senderJid,
-          isImageOrder: true
-        });
-
-        const matchedCount = (parsed.orders || []).length;
-        const unknownCount = (parsed.unrecognizedItems || []).length;
-
-        if (matchedCount > 0) {
-          const score = matchedCount * 100 - unknownCount * 5;
-          if (score > bestScore) {
-            bestScore = score;
-            bestCandidate = {
-              ok: true,
-              attemptUsed: i + 1,
-              engine: res.engine,
-              rawExtracted,
-              extractedText: combinedText,
-              parsed
-            };
-          }
-
-          // Succeed immediately when valid CRP products are found!
-          parsed.unrecognizedItems = [];
-          imageOcrResultCache.set(imgHash, { rawExtracted, engine: res.engine });
-          if (imageOcrResultCache.size > 300) {
-            const oldestKey = imageOcrResultCache.keys().next().value;
-            imageOcrResultCache.delete(oldestKey);
-          }
-          addLog(`✅ Image Order succeeded on ${stage.name} (${matchedCount} items matched via ${res.engine}).`);
-          return {
-            ok: true,
-            attemptUsed: i + 1,
-            engine: res.engine,
-            extractedText: combinedText,
-            parsed
-          };
-        } else if (unknownCount > 0 && !bestCandidate) {
-          bestCandidate = {
-            ok: true,
-            attemptUsed: i + 1,
-            engine: res.engine,
-            rawExtracted,
-            extractedText: combinedText,
-            parsed
-          };
-        }
-      }
-    } catch (err) {
-      addLog(`⚠️ ${stage.name} warning: ${err.message}`);
+  for (let i = 0; i < methods.length; i++) {
+    const m = methods[i];
+    if (i > 0) {
+      addLog(`🔄 Image Auto-Recheck [${m.name}] running...`);
     }
-  }
+    const textOut = await m.run();
+    if (!textOut) continue;
 
-  // Final Combined Consensus Pass across all 5 methods
-  if (collectedTexts.length > 1) {
-    const mergedAll = [caption, ...collectedTexts].filter(Boolean).join('\n');
-    const parsedMerged = parseWhatsAppOrderMessage({
-      messageText: mergedAll,
+    if (textOut.length > bestExtractedText.length) {
+      bestExtractedText = textOut;
+    }
+
+    const combined = [caption, textOut].filter(Boolean).join('\n');
+    const candidateParsed = parseWhatsAppOrderMessage({
+      messageText: combined,
       messageId,
       timestamp,
       senderPhone,
@@ -2335,67 +3669,67 @@ async function processImageOrderWithThreeRetries({
       senderJid,
       isImageOrder: true
     });
-    if (parsedMerged.orders && parsedMerged.orders.length > 0) {
-      const seen = new Set();
-      parsedMerged.orders = (parsedMerged.orders || []).filter((o) => {
-        const k = `${o.crpCode}_${o.orderedQty}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      parsedMerged.unrecognizedItems = [];
-      addLog(`✅ Image Order succeeded via 5-Method Combined Consensus (${parsedMerged.orders.length} items).`);
+
+    const oCount = (candidateParsed.orders || []).length;
+    const uCount = (candidateParsed.unrecognizedItems || []).length;
+
+    if (oCount > 0 && uCount === 0) {
+      imageOcrResultCache.set(imgHash, textOut);
+      if (imageOcrResultCache.size > 200) {
+        const firstK = imageOcrResultCache.keys().next().value;
+        if (firstK) imageOcrResultCache.delete(firstK);
+      }
       return {
         ok: true,
-        attemptUsed: 5,
-        engine: '5-Method Combined Consensus',
-        extractedText: mergedAll,
-        parsed: parsedMerged
+        parsed: candidateParsed,
+        extractedText: textOut,
+        engine: m.name,
+        attemptUsed: i + 1
       };
+    }
+
+    if (oCount + uCount > bestOrderCount) {
+      bestOrderCount = oCount + uCount;
+      bestParsed = candidateParsed;
+      bestEngine = m.name;
+      bestAttempt = i + 1;
     }
   }
 
-  if (bestCandidate && bestCandidate.parsed?.unrecognizedItems?.length > 0) {
-    return bestCandidate;
+  if (bestParsed && bestOrderCount > 0) {
+    return {
+      ok: true,
+      parsed: bestParsed,
+      extractedText: bestExtractedText,
+      engine: bestEngine,
+      attemptUsed: bestAttempt
+    };
   }
 
   return {
     ok: false,
-    attemptUsed: 5,
-    engine: 'All 5 Methods Exhausted',
-    extractedText: collectedTexts.join('\n').trim(),
-    parsed: null
+    parsed: null,
+    extractedText: bestExtractedText,
+    engine: 'None',
+    attemptUsed: methods.length
   };
 }
 
-function buildImageOrderReplyMessage(orders, ocrEngine = '', attemptUsed = 1) {
-  const first = orders[0];
-  const totalAmount = orders.reduce((sum, o) => sum + o.totalAmount, 0);
-
-  const lines = [
-    '✅ *ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!*',
-    `👤 *DA:* [${first.daId}] ${first.daName}`,
-    `🏥 *Party:* ${first.pharmacyName} (PSO: ${first.psoCode})`,
-    '',
-    '📦 *অর্ডার বিস্তারিত (Trade Price অনুযায়ী):*'
-  ];
-
-  orders.forEach((o, i) => {
-    lines.push(
-      `${i + 1}. *${o.productName}* (Code: ${o.crpCode})\n   পরিমাণ: ${o.orderedQty} × ৳${o.unitPrice.toFixed(2)} = *৳${o.totalAmount.toFixed(2)}*`
-    );
-  });
-
-  lines.push('');
-  lines.push(`💰 *সর্বমোট (Grand Total): ৳${totalAmount.toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*`);
-  if (attemptUsed > 1) {
-    lines.push(`🔄 _Auto-Recheck Pass: ${attemptUsed}/3 (${ocrEngine})_`);
-  }
-  lines.push('');
-  lines.push('⚠️ _এই অর্ডারটি বাতিল করতে চাইলে এই মেসেজের Reply-তে লিখুন:_ */cnl*');
-  lines.push('_(অন্য কিছু লিখলে বা কিছু না লিখলে অর্ডারটি সেভ থাকবে)_');
-
-  return lines.join('\n');
+function buildImageOrderReplyMessage(orders, engineName = 'AI-OCR', attemptUsed = 1) {
+  const first = orders[0] || {};
+  const totalAmt = orders.reduce((acc, o) => acc + (o.totalAmount || 0), 0);
+  const lines = orders.map(
+    (o, i) => `${i + 1}. *${o.productName}* — ${o.orderedQty} × ৳${Number(o.unitPrice).toFixed(2)} = *৳${Number(o.totalAmount).toFixed(2)}*`
+  );
+  return (
+    `✅ *ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!*\n` +
+    `👤 *DA:* [${first.daId}] ${first.daName}\n` +
+    `🏥 *Party:* ${first.pharmacyName} (PSO: ${first.psoCode})\n\n` +
+    `📦 *অর্ডারকৃত প্রোডাক্টসমূহ:*\n` +
+    lines.join('\n') +
+    `\n\n💰 *মোট টাকা:* *৳${totalAmt.toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*\n` +
+    `❌ _অর্ডারটি বাতিল করতে এই মেসেজের Reply-তে লিখুন:_ */cnl*`
+  );
 }
 
 // ============================================================================
@@ -2426,19 +3760,22 @@ if (fs.existsSync(LOCAL_CONFIG_PATH)) {
       ...saved,
       authorizedImageLids: Array.from(
         new Set([...DEFAULT_AUTHORIZED_LIDS, ...(saved.authorizedImageLids || [])])
-      )
+      ).slice(0, 200)
     };
   } catch (e) {}
 }
 
 function saveLocalConfig() {
   try {
+    if (Array.isArray(botConfig.authorizedImageLids) && botConfig.authorizedImageLids.length > 200) {
+      botConfig.authorizedImageLids = botConfig.authorizedImageLids.slice(0, 200);
+    }
     fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(botConfig, null, 2), 'utf8');
   } catch (e) {}
 }
 
 // ============================================================================
-// 8B. v5.8 TARGET GROUP & LAST 5 MESSAGE ID PERSISTENCE IN master_db.json
+// 8B. v5.8-v6.0 TARGET GROUP & LAST 5 MESSAGE ID PERSISTENCE IN master_db.json
 // ============================================================================
 const sheetExistingMsgIds = new Set();
 let isReconnectingWhatsApp = false;
@@ -2463,10 +3800,6 @@ function ensureMasterDbV58Structure() {
   }
 }
 
-/**
- * Restores targetGroupId & targetGroupName from master_db.json (masterDb.targetGroup)
- * so that a 4-5 second WhatsApp disconnect/reconnect NEVER changes or resets the group!
- */
 function syncTargetGroupFromMasterDbToBotConfig() {
   ensureMasterDbV58Structure();
   const tg = masterDb.targetGroup;
@@ -2486,9 +3819,6 @@ function syncTargetGroupFromMasterDbToBotConfig() {
   }
 }
 
-/**
- * Permanently saves the selected Target Group into master_db.json AND bot_config.json
- */
 function saveTargetGroupToMasterDb(groupId, groupName, autoReactOnOrder) {
   ensureMasterDbV58Structure();
   masterDb.targetGroup = {
@@ -2505,9 +3835,6 @@ function saveTargetGroupToMasterDb(groupId, groupName, autoReactOnOrder) {
   saveLocalMasterDb();
 }
 
-/**
- * Checks whether a WhatsApp message ID has already been processed (in last 5 IDs, rolling 150 IDs, or Google Sheet)
- */
 function isMessageAlreadyProcessed(msgId) {
   if (!msgId) return false;
   const cleanId = String(msgId).trim();
@@ -2519,9 +3846,6 @@ function isMessageAlreadyProcessed(msgId) {
   return false;
 }
 
-/**
- * Saves the message ID into masterDb.lastProcessedMsgIds (exact last 5 IDs) in master_db.json
- */
 function recordProcessedGroupMessageId(msgId, timestampMs = Date.now()) {
   if (!msgId) return;
   const cleanId = String(msgId).trim();
@@ -2548,16 +3872,12 @@ function recordProcessedGroupMessageId(msgId, timestampMs = Date.now()) {
   scheduleCloudStateBackup(4000);
 }
 
-/**
- * Syncs existing WhatsApp Msg IDs from Live_Orders!B2:B2500 on startup and reconnect
- * so missed-message recovery never duplicates an order already in Google Sheets.
- */
 async function syncExistingSheetMessageIds() {
   if (!sheetsClient || !googleAuthReady || !GOOGLE_SHEET_ID) return;
   try {
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.LIVE_ORDERS}!B2:B2500`
+      range: `${SHEET_TABS.LIVE_ORDERS}!B2:B3000`
     });
     const rows = res.data.values || [];
     for (const r of rows) {
@@ -2677,7 +3997,7 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
       });
     }
 
-    // 1B. All_Message_Logs Header (Tracks every message with ✅/❌ & live auto-updating Row numbers)
+    // 1B. All_Message_Logs Header
     const msgLogHeaderRes = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: `${SHEET_TABS.MESSAGE_LOGS}!A1:K1`
@@ -2740,7 +4060,7 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
           'Total Order Amount (BDT)', 'Last Order Date & Time'
         ]
       ];
-      DA_MASTER.forEach((da, i) => {
+      activeDAs.forEach((da, i) => {
         const rowNum = i + 2;
         daRows.push([
           i + 1,
@@ -2754,7 +4074,7 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
           `=IFERROR(INDEX(FILTER(${SHEET_TABS.LIVE_ORDERS}!C:C & " " & TEXT(${SHEET_TABS.LIVE_ORDERS}!D:D, "hh:mm:ss AM/PM"), ${SHEET_TABS.LIVE_ORDERS}!E:E=B${rowNum}), COUNTIF(${SHEET_TABS.LIVE_ORDERS}!E:E, B${rowNum})), "-")`
         ]);
       });
-      const totalRowNum = DA_MASTER.length + 2;
+      const totalRowNum = activeDAs.length + 2;
       daRows.push([
         'TOTAL', 'ALL DAs', '-', 'Grand Total Across All DAs', '-',
         `=SUM(F2:F${totalRowNum - 1})`,
@@ -2779,7 +4099,7 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
           'Total Quantity Ordered', 'Total Order Amount (BDT)'
         ]
       ];
-      DEFAULT_CRP_PRODUCTS.forEach((p, idx) => {
+      activeProducts.forEach((p, idx) => {
         const r = idx + 2;
         prodRows.push([
           p.code,
@@ -2791,13 +4111,12 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
           `=SUMIF(${SHEET_TABS.LIVE_ORDERS}!L:L, A${r}, ${SHEET_TABS.LIVE_ORDERS}!Q:Q)`
         ]);
       });
-      const pTotalRow = DEFAULT_CRP_PRODUCTS.length + 2;
+      const totalProdRow = activeProducts.length + 2;
       prodRows.push([
-        'TOTAL', `All ${DEFAULT_CRP_PRODUCTS.length} CRP Products`, '-',
-        `=AVERAGE(D2:D${pTotalRow - 1})`,
-        `=SUM(E2:E${pTotalRow - 1})`,
-        `=SUM(F2:F${pTotalRow - 1})`,
-        `=SUM(G2:G${pTotalRow - 1})`
+        'TOTAL', 'ALL CRP PRODUCTS', '-', '-',
+        `=SUM(E2:E${totalProdRow - 1})`,
+        `=SUM(F2:F${totalProdRow - 1})`,
+        `=SUM(G2:G${totalProdRow - 1})`
       ]);
       await sheetsClient.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SHEET_ID,
@@ -2805,113 +4124,106 @@ async function ensureSpreadsheetStructure(forceUpdateTradePrices = true) {
         valueInputOption: 'USER_ENTERED',
         requestBody: { values: prodRows }
       });
-
-      await migrateExistingLiveOrdersToTradePrice();
     }
 
     return true;
   } catch (err) {
-    addLog(`⚠️ Error ensuring spreadsheet structure: ${err.message}`);
+    addLog(`⚠️ Spreadsheet structure check warning: ${err.message}`);
     return false;
   }
 }
 
-async function migrateExistingLiveOrdersToTradePrice() {
-  if (!sheetsClient || !GOOGLE_SHEET_ID) return;
-  try {
-    const res = await sheetsClient.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.LIVE_ORDERS}!A1:S`
-    });
-    const rows = res.data.values || [];
-    if (rows.length <= 1) return;
-
-    const updates = [];
-    for (let r = 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (!row || !row[0]) continue;
-      const crpCode = String(row[11] || '').trim();
-      const qty = parseFloat(String(row[14] || '0').replace(/,/g, ''));
-      const currentUnitPrice = parseFloat(String(row[15] || '0').replace(/[^\d.]/g, ''));
-
-      if (crpCode && TRADE_PRICE_MAP.has(crpCode) && qty > 0) {
-        const officialTp = TRADE_PRICE_MAP.get(crpCode);
-        if (Math.abs(currentUnitPrice - officialTp) > 0.001) {
-          const newTotal = Number((qty * officialTp).toFixed(2));
-          const rowNum = r + 1;
-          updates.push({
-            range: `${SHEET_TABS.LIVE_ORDERS}!P${rowNum}:Q${rowNum}`,
-            values: [[officialTp, newTotal]]
-          });
-        }
-      }
-    }
-
-    if (updates.length > 0) {
-      await sheetsClient.spreadsheets.values.batchUpdate({
-        spreadsheetId: GOOGLE_SHEET_ID,
-        requestBody: {
-          valueInputOption: 'USER_ENTERED',
-          data: updates
-        }
-      });
-      addLog(`💲 Updated ${updates.length} existing order row(s) in Live_Orders to new TRADE PRICE.`);
-    }
-  } catch (err) {
-    addLog(`⚠️ Trade price migration note: ${err.message}`);
-  }
-}
-
-
 // ============================================================================
-// 9. PERMANENT CLOUD SESSION, CONFIG & MASTER JSON DB BACKUP (_Bot_State)
+// 9. PERMANENT CLOUD SESSION, CONFIG & MASTER JSON DB BACKUP (_Bot_State v6.0)
+//    - Automatically splits BOT_CONFIG, MASTER_DB_GZIP, and WA_AUTH_GZIP into
+//      strict 30,000-character chunks so Google Sheets NEVER throws:
+//      "Your input contains more than the maximum of 50000 characters in a single cell."
 // ============================================================================
 let stateBackupTimer = null;
+let lastStateRowCount = 45;
+
+function appendChunkedStateRows(stateRows, keyPrefix, fullString, updatedAtStr = '') {
+  const safeStr = String(fullString || '');
+  const chunks = [];
+  for (let i = 0; i < safeStr.length; i += MAX_STATE_CHUNK_CHARS) {
+    chunks.push(safeStr.slice(i, i + MAX_STATE_CHUNK_CHARS));
+  }
+  if (chunks.length === 0) chunks.push('');
+  stateRows.push([keyPrefix, chunks[0], updatedAtStr || `${chunks.length} chunk(s)`]);
+  for (let c = 1; c < chunks.length; c++) {
+    stateRows.push([`${keyPrefix}_${c}`, chunks[c], '']);
+  }
+}
 
 async function backupAuthAndConfigToSheet() {
   if (!sheetsClient || !GOOGLE_SHEET_ID) return;
   try {
     const authFiles = {};
     if (fs.existsSync(AUTH_DIR)) {
-      const files = fs.readdirSync(AUTH_DIR);
-      for (const file of files) {
-        if (file.endsWith('.json')) {
-          const fullPath = path.join(AUTH_DIR, file);
-          if (fs.statSync(fullPath).isFile()) {
-            authFiles[file] = fs.readFileSync(fullPath, 'utf8');
-          }
-        }
+      const files = fs
+        .readdirSync(AUTH_DIR)
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => {
+          const fullPath = path.join(AUTH_DIR, f);
+          const stat = fs.statSync(fullPath);
+          return { name: f, fullPath, isFile: stat.isFile(), mtimeMs: stat.mtimeMs };
+        })
+        .filter((x) => x.isFile);
+
+      // Always keep creds.json + app-state-sync + up to 120 most recently modified key/session files
+      // so Baileys auth backup never bloats indefinitely over weeks of running!
+      files.sort((a, b) => {
+        if (a.name === 'creds.json') return -1;
+        if (b.name === 'creds.json') return 1;
+        return b.mtimeMs - a.mtimeMs;
+      });
+
+      const keptFiles = files.slice(0, 125);
+      for (const item of keptFiles) {
+        authFiles[item.name] = fs.readFileSync(item.fullPath, 'utf8');
       }
     }
 
     const payloadJson = JSON.stringify({ authFiles, savedAt: new Date().toISOString() });
-    const compressedBase64 = zlib.gzipSync(Buffer.from(payloadJson, 'utf8')).toString('base64');
+    const compressedAuthBase64 = zlib.gzipSync(Buffer.from(payloadJson, 'utf8')).toString('base64');
 
-    const masterDbJson = JSON.stringify(masterDb);
+    // Exclude bulky full-text messageLogs from _Bot_State cloud GZIP (keep only last 15 compact logs,
+    // because all message logs are ALREADY saved in the All_Message_Logs sheet tab and local master_db.json!)
+    const compactMasterDbForCloud = {
+      ...masterDb,
+      messageLogs: (masterDb.messageLogs || []).slice(0, 15).map((m) => ({
+        ...m,
+        fullMessage: String(m.fullMessage || '').slice(0, 250)
+      }))
+    };
+    const masterDbJson = JSON.stringify(compactMasterDbForCloud);
     const masterDbGzip = zlib.gzipSync(Buffer.from(masterDbJson, 'utf8')).toString('base64');
 
-    const chunks = [];
-    for (let i = 0; i < compressedBase64.length; i += 40000) {
-      chunks.push(compressedBase64.slice(i, i + 40000));
-    }
+    const cleanBotConfigForCloud = {
+      ...botConfig,
+      authorizedImageLids: Array.from(new Set(botConfig.authorizedImageLids || [])).slice(0, 150)
+    };
+    const botConfigJson = JSON.stringify(cleanBotConfigForCloud);
 
-    const stateRows = [
-      ['Key', 'Value', 'Updated At'],
-      ['BOT_CONFIG', JSON.stringify(botConfig), new Date().toISOString()],
-      ['MASTER_DB_GZIP', masterDbGzip, masterDb.updatedAt || new Date().toISOString()],
-      ['WA_AUTH_GZIP', chunks[0] || '', `${chunks.length} chunk(s)`]
-    ];
-    for (let c = 1; c < chunks.length; c++) {
-      stateRows.push([`WA_AUTH_GZIP_${c}`, chunks[c], '']);
-    }
+    const nowIso = new Date().toISOString();
+    const stateRows = [['Key', 'Value', 'Updated At']];
 
-    await sheetsClient.spreadsheets.values.clear({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.BOT_STATE}!A1:Z45`
-    });
+    // Chunk ALL THREE keys into strict <= 30,000-character cells!
+    appendChunkedStateRows(stateRows, 'BOT_CONFIG', botConfigJson, nowIso);
+    appendChunkedStateRows(stateRows, 'MASTER_DB_GZIP', masterDbGzip, masterDb.updatedAt || nowIso);
+    appendChunkedStateRows(stateRows, 'WA_AUTH_GZIP', compressedAuthBase64, nowIso);
+
+    const activeRowCount = stateRows.length;
+    const totalRowsToWrite = Math.max(activeRowCount, lastStateRowCount, 45);
+    while (stateRows.length < totalRowsToWrite) {
+      stateRows.push(['', '', '']);
+    }
+    lastStateRowCount = activeRowCount;
+
+    // Single atomic update (never clears before writing, and every cell is strictly <= 30,000 chars!)
     await sheetsClient.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.BOT_STATE}!A1`,
+      range: `${SHEET_TABS.BOT_STATE}!A1:C${stateRows.length}`,
       valueInputOption: 'RAW',
       requestBody: { values: stateRows }
     });
@@ -2932,47 +4244,60 @@ async function restoreAuthAndConfigFromSheet() {
   try {
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.BOT_STATE}!A1:C45`
+      range: `${SHEET_TABS.BOT_STATE}!A1:C250`
     });
     const rows = res.data.values || [];
-    let compressedChunks = [];
+    lastStateRowCount = Math.max(rows.length, 45);
+
+    const botConfigChunks = [];
+    const masterDbChunks = [];
+    const waAuthChunks = [];
 
     for (const row of rows) {
       const [key, val] = row;
-      if (key === 'BOT_CONFIG' && val) {
-        try {
-          const parsedConfig = JSON.parse(val);
-          botConfig = {
-            ...botConfig,
-            ...parsedConfig,
-            authorizedImageLids: Array.from(
-              new Set([
-                ...DEFAULT_AUTHORIZED_LIDS,
-                ...(botConfig.authorizedImageLids || []),
-                ...(parsedConfig.authorizedImageLids || [])
-              ])
-            )
-          };
-          saveLocalConfig();
-          addLog(`☁️ Restored saved group config: "${botConfig.targetGroupName}" (${botConfig.targetGroupId || 'All Groups'})`);
-        } catch (e) {}
-      } else if (key === 'MASTER_DB_GZIP' && val) {
-        try {
-          const unzippedDb = zlib.gunzipSync(Buffer.from(val, 'base64')).toString('utf8');
-          const parsedDb = JSON.parse(unzippedDb);
-          applyMasterDbObject(parsedDb, true);
-          syncTargetGroupFromMasterDbToBotConfig();
-          saveLocalConfig();
-          addLog(`☁️ Restored Dynamic Master DB from Cloud (${masterDb.das.length} DAs, ${masterDb.products.length} Products, Target Group: "${botConfig.targetGroupName}").`);
-        } catch (e) {}
-      } else if (key && key.startsWith('WA_AUTH_GZIP') && val) {
-        compressedChunks.push(val);
+      if (!key || !val) continue;
+      if (key === 'BOT_CONFIG' || key.startsWith('BOT_CONFIG_')) {
+        botConfigChunks.push(val);
+      } else if (key === 'MASTER_DB_GZIP' || key.startsWith('MASTER_DB_GZIP_')) {
+        masterDbChunks.push(val);
+      } else if (key === 'WA_AUTH_GZIP' || key.startsWith('WA_AUTH_GZIP_')) {
+        waAuthChunks.push(val);
       }
     }
 
+    if (botConfigChunks.length > 0) {
+      try {
+        const parsedConfig = JSON.parse(botConfigChunks.join(''));
+        botConfig = {
+          ...botConfig,
+          ...parsedConfig,
+          authorizedImageLids: Array.from(
+            new Set([
+              ...DEFAULT_AUTHORIZED_LIDS,
+              ...(botConfig.authorizedImageLids || []),
+              ...(parsedConfig.authorizedImageLids || [])
+            ])
+          ).slice(0, 200)
+        };
+        saveLocalConfig();
+        addLog(`☁️ Restored saved group config: "${botConfig.targetGroupName}" (${botConfig.targetGroupId || 'All Groups'})`);
+      } catch (e) {}
+    }
+
+    if (masterDbChunks.length > 0) {
+      try {
+        const unzippedDb = zlib.gunzipSync(Buffer.from(masterDbChunks.join(''), 'base64')).toString('utf8');
+        const parsedDb = JSON.parse(unzippedDb);
+        applyMasterDbObject(parsedDb, true);
+        syncTargetGroupFromMasterDbToBotConfig();
+        saveLocalConfig();
+        addLog(`☁️ Restored Dynamic Master DB from Cloud (${masterDb.das.length} DAs, ${masterDb.products.length} Products, Target Group: "${botConfig.targetGroupName}").`);
+      } catch (e) {}
+    }
+
     const credsPath = path.join(AUTH_DIR, 'creds.json');
-    if (!fs.existsSync(credsPath) && compressedChunks.length > 0) {
-      const fullBase64 = compressedChunks.join('');
+    if (!fs.existsSync(credsPath) && waAuthChunks.length > 0) {
+      const fullBase64 = waAuthChunks.join('');
       const unzipped = zlib.gunzipSync(Buffer.from(fullBase64, 'base64')).toString('utf8');
       const { authFiles } = JSON.parse(unzipped);
       if (authFiles && authFiles['creds.json']) {
@@ -2996,7 +4321,7 @@ async function restoreAuthAndConfigFromSheet() {
 }
 
 // ============================================================================
-// 10. GOOGLE SHEETS ORDER CRUD: SMART FIRST-EMPTY-ROW WRITE, UNSEND & /CNL
+// 10. GOOGLE SHEETS ORDER CRUD + ALL_MESSAGE_LOGS & LIVE ROW AUTO-SYNC (v6.0)
 // ============================================================================
 let sheetQueue = Promise.resolve();
 function enqueueSheetTask(taskFn) {
@@ -3006,16 +4331,6 @@ function enqueueSheetTask(taskFn) {
   return sheetQueue;
 }
 
-/**
- * Writes new order rows into the exact first empty row of Live_Orders
- * (Prevents blank row gaps when rows were manually cleared in Google Sheets!)
- */
-/**
- * ALL MESSAGE LOGS & LIVE GOOGLE SHEET ROW NUMBER AUTO-SYNC ENGINE (v5.9)
- * - Logs every incoming message (saved ✅ or not saved ❌) in masterDb.messageLogs and Google Sheet tab All_Message_Logs
- * - Uses dynamic Google Sheets formulas in All_Message_Logs so deleting any row in Live_Orders auto-updates Row numbers
- * - Periodically & on-demand syncs Live_Orders row indices so the Web Dashboard's Row numbers auto-update too!
- */
 const liveMsgIdToSheetRowsMap = new Map();
 
 function ensureMessageLogsArray() {
@@ -3058,11 +4373,13 @@ async function recordMessageInAllLogs({
   const finalSaved = currentMappedRows.length > 0 ? true : Boolean(isSaved);
   const finalRows = currentMappedRows.length > 0 ? currentMappedRows : (sheetRows || []);
   const rowLabel = finalRows.length > 0 ? `Row ${finalRows.join(', ')}` : (finalSaved ? 'Saved' : '❌ সেভ হয়নি');
+  const safeMsg = safeSheetCell(String(fullMessage || '').trim(), 8000);
+  const safeNote = safeSheetCell(note || (finalSaved ? 'Order Saved' : 'Not Saved'), 2000);
 
   let existing = masterDb.messageLogs.find((m) => m.whatsappMsgId === cleanMsgId);
   if (existing) {
-    if (fullMessage && (!existing.fullMessage || fullMessage.length >= existing.fullMessage.length)) {
-      existing.fullMessage = fullMessage;
+    if (safeMsg && (!existing.fullMessage || safeMsg.length >= existing.fullMessage.length)) {
+      existing.fullMessage = safeMsg;
     }
     if (displayPhone && displayPhone !== '-') existing.senderPhone = displayPhone;
     if (senderPushName) existing.senderPushName = senderPushName;
@@ -3071,7 +4388,7 @@ async function recordMessageInAllLogs({
     existing.isSaved = finalSaved;
     existing.sheetRows = finalRows;
     existing.sheetRowText = rowLabel;
-    if (note) existing.note = note;
+    if (safeNote) existing.note = safeNote;
     existing.updatedAt = new Date().toISOString();
   } else {
     existing = {
@@ -3083,11 +4400,11 @@ async function recordMessageInAllLogs({
       senderPushName: senderPushName || '-',
       daId: daId || '-',
       daName: daName || '-',
-      fullMessage: String(fullMessage || '').trim(),
+      fullMessage: safeMsg,
       isSaved: finalSaved,
       sheetRows: finalRows,
       sheetRowText: rowLabel,
-      note: note || (finalSaved ? 'Order Saved' : 'Not Saved'),
+      note: safeNote,
       updatedAt: new Date().toISOString()
     };
     masterDb.messageLogs.unshift(existing);
@@ -3098,13 +4415,12 @@ async function recordMessageInAllLogs({
 
   saveLocalMasterDb();
 
-  // Also write/update this message in Google Sheets All_Message_Logs tab asynchronously
   if (sheetsClient && googleAuthReady && GOOGLE_SHEET_ID) {
     enqueueSheetTask(async () => {
       try {
         const colBRes = await sheetsClient.spreadsheets.values.get({
           spreadsheetId: GOOGLE_SHEET_ID,
-          range: `${SHEET_TABS.MESSAGE_LOGS}!A1:B2000`
+          range: `${SHEET_TABS.MESSAGE_LOGS}!A1:B2500`
         });
         const rows = colBRes.data.values || [['Log ID', 'WhatsApp Msg ID']];
         let targetRow = -1;
@@ -3122,22 +4438,21 @@ async function recordMessageInAllLogs({
         }
         if (targetRow === -1) targetRow = firstEmptyRow;
 
-        // Live Google Sheets formulas in Col E (Saved ✅/❌) and Col F (Auto-updating Live_Orders Row Number!)
         const statusFormula = `=IF(COUNTIF(${SHEET_TABS.LIVE_ORDERS}!$B$2:$B$5000, INDIRECT("B"&ROW()))>0, "✅ Saved", "❌ Not Saved")`;
         const rowNumFormula = `=IFERROR(IF(COUNTIF(${SHEET_TABS.LIVE_ORDERS}!$B$2:$B$5000, INDIRECT("B"&ROW()))>0, "Row " & TEXTJOIN(", ", TRUE, ARRAYFORMULA(IF(${SHEET_TABS.LIVE_ORDERS}!$B$2:$B$5000=INDIRECT("B"&ROW()), ROW(${SHEET_TABS.LIVE_ORDERS}!$B$2:$B$5000), ""))), "❌ সেভ হয়নি"), "❌ সেভ হয়নি")`;
 
         const rowValues = [[
-          existing.logId,
-          cleanMsgId,
+          safeSheetCell(existing.logId, 200),
+          safeSheetCell(cleanMsgId, 200),
           `'${existing.date}`,
           `'${existing.time}`,
           statusFormula,
           rowNumFormula,
-          existing.senderPhone,
-          existing.senderPushName,
-          `${existing.daId !== '-' ? '[' + existing.daId + '] ' : ''}${existing.daName}`,
-          existing.fullMessage,
-          existing.note
+          safeSheetCell(existing.senderPhone, 100),
+          safeSheetCell(existing.senderPushName, 200),
+          safeSheetCell(`${existing.daId !== '-' ? '[' + existing.daId + '] ' : ''}${existing.daName}`, 300),
+          safeSheetCell(existing.fullMessage, 15000),
+          safeSheetCell(existing.note, 2000)
         ]];
 
         await sheetsClient.spreadsheets.values.update({
@@ -3153,11 +4468,6 @@ async function recordMessageInAllLogs({
   return existing;
 }
 
-/**
- * Reads Live_Orders from Google Sheets and recalculates the exact current 1-based Row Numbers
- * for every message in masterDb.messageLogs and recentOrders!
- * Whenever a user deletes a row in Google Sheets, this automatically shifts all Row numbers to match!
- */
 let isSyncingRowNumbers = false;
 async function syncLiveSheetRowNumbers() {
   if (!sheetsClient || !googleAuthReady || !GOOGLE_SHEET_ID || isSyncingRowNumbers) return;
@@ -3165,19 +4475,17 @@ async function syncLiveSheetRowNumbers() {
   try {
     const res = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.LIVE_ORDERS}!A2:S3000`
+      range: `${SHEET_TABS.LIVE_ORDERS}!A2:S3500`
     });
     const rows = res.data.values || [];
     liveMsgIdToSheetRowsMap.clear();
     const lineIdToRowMap = new Map();
-
-    // Group existing sheet orders by whatsappMsgId in case we need to seed messageLogs on first run
     const sheetOrderGroups = new Map();
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       if (!r || !String(r[0] || '').trim()) continue;
-      const exactSheetRowNum = i + 2; // Row 1 is header, so index 0 is Row 2!
+      const exactSheetRowNum = i + 2;
       const lineId = String(r[0] || '').trim();
       const msgId = String(r[1] || '').trim();
       if (lineId) lineIdToRowMap.set(lineId, exactSheetRowNum);
@@ -3208,7 +4516,6 @@ async function syncLiveSheetRowNumbers() {
       }
     }
 
-    // Update recentOrders with their live Google Sheet row numbers
     for (const o of recentOrders) {
       if (o.orderLineId && lineIdToRowMap.has(o.orderLineId)) {
         o.sheetRowNumber = lineIdToRowMap.get(o.orderLineId);
@@ -3223,7 +4530,6 @@ async function syncLiveSheetRowNumbers() {
     ensureMessageLogsArray();
     let changed = false;
 
-    // Seed masterDb.messageLogs from existing sheet orders if messageLogs doesn't have them yet
     for (const [msgId, grp] of sheetOrderGroups.entries()) {
       const exists = masterDb.messageLogs.some((m) => m.whatsappMsgId === msgId);
       if (!exists) {
@@ -3241,14 +4547,13 @@ async function syncLiveSheetRowNumbers() {
           isSaved: true,
           sheetRows: rNums,
           sheetRowText: `Row ${rNums.join(', ')}`,
-          note: `✅ সেভ হয়েছে (${grp.productsSummary.join(', ')})`,
+          note: `✅ সেভ হয়েছে (${grp.productsSummary.join(', ').slice(0, 300)})`,
           updatedAt: new Date().toISOString()
         });
         changed = true;
       }
     }
 
-    // Update every message log's isSaved & sheetRows based on current Live_Orders rows!
     for (const log of masterDb.messageLogs) {
       const currentRows = liveMsgIdToSheetRowsMap.get(log.whatsappMsgId) || [];
       const nowSaved = currentRows.length > 0;
@@ -3292,31 +4597,30 @@ async function appendOrdersToSheet(orders) {
     }
 
     const values = orders.map((o) => [
-      o.orderLineId,
-      o.whatsappMsgId,
+      safeSheetCell(o.orderLineId, 200),
+      safeSheetCell(o.whatsappMsgId, 200),
       `'${o.date}`,
       `'${o.time}`,
-      o.daId,
-      o.altId,
-      o.daName,
-      o.senderPhone,
-      o.psoCode,
-      o.pharmacyName,
-      o.rawText,
-      o.crpCode,
-      o.productName,
-      o.packUnit,
+      safeSheetCell(o.daId, 100),
+      safeSheetCell(o.altId, 100),
+      safeSheetCell(o.daName, 200),
+      safeSheetCell(o.senderPhone, 100),
+      safeSheetCell(o.psoCode, 100),
+      safeSheetCell(o.pharmacyName, 500),
+      safeSheetCell(o.rawText, 2000),
+      safeSheetCell(o.crpCode, 100),
+      safeSheetCell(o.productName, 300),
+      safeSheetCell(o.packUnit, 100),
       o.orderedQty,
       o.unitPrice,
       o.totalAmount,
-      o.matchType,
-      o.status
+      safeSheetCell(o.matchType, 100),
+      safeSheetCell(o.status, 100)
     ]);
 
-    // Find the exact first empty row in Column A of Live_Orders so there are NEVER blank gaps
     const colARes = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${SHEET_TABS.LIVE_ORDERS}!A1:A2500`
+      range: `${SHEET_TABS.LIVE_ORDERS}!A1:A3500`
     });
     const colARows = colARes.data.values || [['Order Line ID']];
     let targetStartRow = colARows.length + 1;
@@ -3348,7 +4652,7 @@ async function appendOrdersToSheet(orders) {
       recordProcessedGroupMessageId(msgId, Date.now());
       ensureMessageLogsArray();
       const logItem = masterDb.messageLogs.find((m) => m.whatsappMsgId === msgId);
-      const summaryNote = `✅ সেভ হয়েছে (${orders.map((o) => `${o.productName} x${o.orderedQty}`).join(', ')})`;
+      const summaryNote = `✅ সেভ হয়েছে (${orders.map((o) => `${o.productName} x${o.orderedQty}`).join(', ').slice(0, 300)})`;
       if (logItem) {
         logItem.isSaved = true;
         logItem.sheetRows = savedRowNums;
@@ -3424,7 +4728,7 @@ async function removeOrdersByMessageId(whatsappMsgId, reason = 'UNSENT_BY_USER')
       const rowMsgId = String(rows[r]?.[1] || '').trim();
       if (rowMsgId === String(whatsappMsgId).trim()) {
         matchingZeroBasedIndices.push(r);
-        const fullRow = [...rows[r]];
+        const fullRow = rows[r].map((cell) => safeSheetCell(cell, 5000));
         while (fullRow.length < 18) fullRow.push('');
         fullRow[18] = reason;
         fullRow.push(deletedAt);
@@ -3533,7 +4837,6 @@ async function applyFollowUpPatchToSheet(patch) {
   });
 }
 
-
 // ============================================================================
 // 11. WHATSAPP BAILEYS ENGINE + UNIFIED SELF-LEARNING ADMIN BOT (01793362829)
 // ============================================================================
@@ -3545,10 +4848,7 @@ let joinedGroups = [];
 const recentOrders = [];
 const activityLogs = [];
 
-// Pending interactive resolutions waiting for Admin (01793362829) reply
-// Holds the entire order until DA Name/ID and all Product Names are confirmed, then saves to Google Sheets!
 const pendingResolutions = new Map();
-// Maps WhatsApp Message IDs (prompt msg ID in DM, prompt msg ID in Group, and original order msg ID) -> token
 const pendingQuestionMsgIdMap = new Map();
 let pendingCounter = 100;
 
@@ -3570,14 +4870,6 @@ function addLog(msg) {
   if (activityLogs.length > 60) activityLogs.length = 60;
 }
 
-/**
- * Sends the interactive prompt to:
- * 1) All configured Admin Alert Numbers (e.g. 01793362829) in DM
- * 2) The origin chat/group (if different from the Admin DM) quoting the original message
- * And registers ALL sent message IDs in pendingQuestionMsgIdMap so replying in EITHER chat works 100%!
- */
-// Cache of sent WhatsApp messages (msgId -> proto.IMessage) so Baileys can fulfill retry receipts
-// This permanently fixes "Waiting for this message. This may take a while." on WhatsApp!
 const sentMessagesCache = new Map();
 let sendMsgMutex = Promise.resolve();
 
@@ -3591,10 +4883,6 @@ function cacheSentProtoMessage(sentObj, fallbackText = '') {
   }
 }
 
-/**
- * Serializes all outgoing WhatsApp messages through a sequential mutex queue
- * and caches the proto.IMessage for retry receipts so Signal sessions NEVER collide or show "Waiting for this message"!
- */
 function safeSendMessage(jid, content, options = undefined) {
   const runSend = async () => {
     if (!sock || waStatus !== 'CONNECTED' || !jid) return null;
@@ -3632,7 +4920,6 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
   const sentToJids = new Set();
   const senderNormPhone = normalizeBdPhone(item.senderPhone || '');
 
-  // 1. Send in the chat where the order was posted (quoting the order message)
   if (item.originRemoteJid) {
     const sentOrigin = await safeSendMessage(
       item.originRemoteJid,
@@ -3646,8 +4933,6 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
     addLog(`📲 Sent prompt [${item.token}] in origin chat (${item.originRemoteJid})`);
   }
 
-  // 2. Send to Admin Alert Numbers (01793362829) in DM ONLY if the message wasn't already sent in that Admin's DM
-  //    or if someone else in a group triggered the prompt!
   const adminPhones = getAdminAlertPhones();
   for (const ph of adminPhones) {
     const normPh = normalizeBdPhone(ph);
@@ -3659,8 +4944,6 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
     if (lidToPhoneMap.get(originRaw) === normPh || normalizeBdPhone(originRaw) === normPh) {
       continue;
     }
-    // If the Admin themselves sent the message in the group and we already quoted them in the group,
-    // don't double-send to their @s.whatsapp.net DM at the same instant (prevents @lid vs @s.whatsapp.net Signal collision!)
     if (item.originRemoteJid && senderNormPhone === normPh) {
       continue;
     }
@@ -3674,9 +4957,6 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
   }
 }
 
-/**
- * Builds the next question text for a pending order item (checks if DA is unresolved first, then checks unrecognized products)
- */
 function buildPromptTextForPendingItem(item) {
   const senderNumberLabel =
     (item.displayPhone && item.displayPhone !== '-' ? item.displayPhone : '') ||
@@ -3743,10 +5023,6 @@ function buildPromptTextForPendingItem(item) {
   return '';
 }
 
-/**
- * Holds an order in pendingResolutions until all unknown DA / Product questions are answered,
- * then saves the complete order to Google Sheets!
- */
 async function createPendingOrderResolution({
   parsedResult,
   rawText = '',
@@ -3800,7 +5076,6 @@ async function createPendingOrderResolution({
   return pendingItem;
 }
 
-// Keep backward-compatible wrappers for unit tests & web endpoints
 async function createPendingDaResolution(opts) {
   return createPendingOrderResolution({
     parsedResult: {
@@ -3839,10 +5114,6 @@ async function createPendingProductResolution(opts) {
   });
 }
 
-/**
- * Finalizes a pending order once its DA and all Products are resolved:
- * Saves all order lines to Google Sheets and sends confirmation!
- */
 async function finalizeAndSavePendingOrder(item, learnedSummaryLines = []) {
   pendingResolutions.delete(item.token);
 
@@ -3894,9 +5165,6 @@ async function finalizeAndSavePendingOrder(item, learnedSummaryLines = []) {
   };
 }
 
-/**
- * Resolves a pending item (#ORD..., #DA..., #PR...) using Admin's reply (from WhatsApp or Web Dashboard)
- */
 async function resolvePendingItemWithAnswer(token, rawAnswerText) {
   const item = pendingResolutions.get(token);
   if (!item) {
@@ -3908,7 +5176,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
     return { ok: false, message: '⚠️ উত্তর খালি রাখা যাবে না।' };
   }
 
-  // If Admin typed "/cnl" or "cancel", cancel the entire pending order
   if (/^(\/?cnl|cancel|বাতিল)$/i.test(answer)) {
     pendingResolutions.delete(token);
     addLog(`🗑️ Pending order ${token} cancelled by Admin.`);
@@ -3917,9 +5184,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
 
   if (!item.learnedLogs) item.learnedLogs = [];
 
-  // ==========================================================================
-  // STEP 1: IF DA IS STILL UNRESOLVED, RESOLVE DA FROM ADMIN'S REPLY
-  // ==========================================================================
   if (!item.daInfo || !item.daInfo.isKnownDA) {
     let resolvedDA = null;
 
@@ -3975,7 +5239,9 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
           daId: finalId,
           altId: '',
           name: answer,
-          phones: [],
+          phones: (!item.isImageOrder && item.senderPhone && !getAuthorizedImagePhones().includes(normalizeBdPhone(item.senderPhone)))
+            ? [normalizeBdPhone(item.senderPhone)]
+            : [],
           aliases: [answer.toLowerCase(), finalId.toLowerCase()]
         };
         masterDb.das.push(resolvedDA);
@@ -3985,93 +5251,79 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
     }
 
     item.daInfo = { ...resolvedDA, isKnownDA: true };
-    item.learnedLogs.push(`🆔 প্রতিনিধি সেভ: *[${resolvedDA.daId}] ${resolvedDA.name}*`);
-    addLog(`✅ Resolved DA for ${token}: [${resolvedDA.daId}] ${resolvedDA.name}`);
+    for (const o of item.orders || []) {
+      o.daId = resolvedDA.daId;
+      o.altId = resolvedDA.altId || '-';
+      o.daName = resolvedDA.name;
+    }
+    item.learnedLogs.push(`👤 প্রতিনিধি সেভ: *[${resolvedDA.daId}] ${resolvedDA.name}*`);
+    addLog(`🧠 Admin resolved DA for ${token} -> [${resolvedDA.daId}] ${resolvedDA.name}`);
 
-    // Update DA on any already-parsed orders in this item
-    item.orders = (item.orders || []).map((o) => ({
-      ...o,
-      daId: resolvedDA.daId,
-      altId: resolvedDA.altId || '-',
-      daName: resolvedDA.name
-    }));
-
-    // Check if there are STILL unrecognized products in this same order!
     if (item.unrecognizedItems && item.unrecognizedItems.length > 0) {
       const nextPrompt = buildPromptTextForPendingItem(item);
       return {
         ok: true,
         needsMoreInput: true,
         nextPromptToken: item.token,
-        message: `✅ প্রতিনিধি *[${resolvedDA.daId}] ${resolvedDA.name}* সেভ হয়েছে!\n\nএবার নিচের অপরিচিত প্রোডাক্টটির নাম দিন:\n\n${nextPrompt}`
+        message: `✅ প্রতিনিধি *[${resolvedDA.daId}] ${resolvedDA.name}* ডেটাবেসে সেভ হয়েছে!\n\nএবার নিচের অপরিচিত প্রোডাক্টটির নাম কনফার্ম করুন:\n\n${nextPrompt}`
       };
     }
 
-    // Otherwise all products are ready -> Save to Google Sheets now!
     return await finalizeAndSavePendingOrder(item, item.learnedLogs);
   }
 
-  // ==========================================================================
-  // STEP 2: RESOLVE UNKNOWN PRODUCT / WRONG SPELLING IN item.unrecognizedItems[0]
-  // ==========================================================================
   if (item.unrecognizedItems && item.unrecognizedItems.length > 0) {
     const currentUnk = item.unrecognizedItems[0];
 
-    // Check if Admin wants to skip just this unrecognized product line
-    if (/^(skip|no|bad|না|বাদ)$/i.test(answer)) {
+    if (/^(skip|bad|বাদ|no|na)$/i.test(answer)) {
       item.unrecognizedItems.shift();
-      addLog(`⏭️ Skipped unrecognized product "${currentUnk.unknownProductText}" in ${token}.`);
+      item.learnedLogs.push(`⏭️ বাদ দেওয়া হয়েছে: *"${currentUnk.rawLine}"*`);
       if (item.unrecognizedItems.length > 0) {
         const nextPrompt = buildPromptTextForPendingItem(item);
-        return { ok: true, needsMoreInput: true, nextPromptToken: item.token, message: nextPrompt };
+        return {
+          ok: true,
+          needsMoreInput: true,
+          nextPromptToken: item.token,
+          message: `⏭️ *"${currentUnk.unknownProductText}"* বাদ দেওয়া হয়েছে।\n\nএবার পরের প্রোডাক্টটি কনফার্ম করুন:\n\n${nextPrompt}`
+        };
       }
       return await finalizeAndSavePendingOrder(item, item.learnedLogs);
     }
 
     let matchedProd = null;
-
-    // 1. Check if Admin typed "NEW | CODE | NAME | PRICE"
     if (/^new\s*\|/i.test(answer)) {
-      const parts = answer.split('|').map((s) => s.trim()).filter(Boolean);
+      const parts = answer.split('|').map((s) => s.trim());
       if (parts.length >= 4) {
         const newCode = parts[1].toUpperCase();
         const newName = parts[2].toUpperCase();
         const newPrice = parseFloat(parts[3]) || 0;
-        const newUnit = parts[4] || 'Box/Bottle';
-        matchedProd = {
-          code: newCode,
-          name: newName,
-          unit: newUnit,
-          price: newPrice,
-          family: newName.split(/\s+/)[0],
-          aliases: [newName.toLowerCase(), currentUnk.unknownProductText.toLowerCase()]
-        };
-        syncProductWithBrandGroup(matchedProd, currentUnk.unknownProductText.toLowerCase());
-        masterDb.products.push(matchedProd);
-        saveLocalMasterDb();
-        scheduleCloudStateBackup(2000);
+        const newUnit = parts[4] || "Box/Bottle";
+        if (newCode && newName && newPrice > 0) {
+          matchedProd = {
+            code: newCode,
+            name: newName,
+            unit: newUnit,
+            price: newPrice,
+            family: newName.split(/\s+/)[0],
+            aliases: [newName.toLowerCase(), currentUnk.unknownProductText.toLowerCase()]
+          };
+          masterDb.products.push(matchedProd);
+          saveLocalMasterDb();
+          scheduleCloudStateBackup(2000);
+        }
       }
     }
 
-    // 2. Match Admin's reply against existing products by Code, Name, or Alias
-    //    (Also pass currentUnk.unknownProductText so any ml/mg size like "200" in "Luen R200" helps disambiguate variants!)
     if (!matchedProd) {
-      const cleanAns = answer.trim();
-      const byExactCode = activeProducts.find((p) => String(p.code).toLowerCase() === cleanAns.toLowerCase());
+      const byExactCode = activeProducts.find(
+        (p) => String(p.code).toUpperCase() === answer.toUpperCase()
+      );
       if (byExactCode) {
         matchedProd = byExactCode;
       } else {
-        const combinedHint = `${cleanAns} ${currentUnk.unknownProductText || ''}`.toLowerCase();
-        const directMatch = matchCRPProduct(cleanAns);
-        if (directMatch?.product) {
-          matchedProd =
-            resolveBrandFamilyVariant(directMatch.product.family, combinedHint) ||
-            directMatch.product;
-        } else {
-          const bySubName = activeProducts.find((p) => p.name.toLowerCase().includes(cleanAns.toLowerCase()));
-          if (bySubName) {
-            matchedProd = resolveBrandFamilyVariant(bySubName.family, combinedHint) || bySubName;
-          }
+        const mRes = matchCRPProduct(answer);
+        if (mRes && mRes.product) {
+          matchedProd = mRes.product;
         }
       }
     }
@@ -4079,6 +5331,8 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
     if (!matchedProd) {
       return {
         ok: false,
+        needsMoreInput: true,
+        nextPromptToken: item.token,
         message:
           `⚠️ *"${answer}"* দিয়ে কোনো প্রোডাক্ট খুঁজে পাওয়া যায়নি।\n` +
           `সঠিক প্রোডাক্টের কোড (যেমন \`919\`) বা নাম (যেমন \`Totifen\` বা \`Lucan R 200\`) লিখুন, অথবা নতুন প্রোডাক্ট যোগ করতে লিখুন:\n` +
@@ -4086,17 +5340,15 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       };
     }
 
-    // Learn the wrong spelling into matchedProd.aliases AND sync common brand stem to its Product Group!
     const learnedAlias = currentUnk.unknownProductText.toLowerCase().trim();
     if (!matchedProd.aliases) matchedProd.aliases = [];
-    if (learnedAlias && !matchedProd.aliases.includes(learnedAlias)) {
+    if (learnedAlias && !isAccidentalPsoAlias(learnedAlias) && !matchedProd.aliases.includes(learnedAlias)) {
       matchedProd.aliases.push(learnedAlias);
     }
-    const syncedGroup = syncProductWithBrandGroup(matchedProd, learnedAlias);
+    syncProductWithBrandGroup(matchedProd, learnedAlias);
     saveLocalMasterDb();
     scheduleCloudStateBackup(2000);
 
-    // Convert currentUnk into a resolved order row and add to item.orders!
     const totalAmount = Number((currentUnk.orderedQty * matchedProd.price).toFixed(2));
     item.orders.push({
       orderLineId: `${item.whatsappMsgId}_${item.orders.length + 1}`,
@@ -4127,7 +5379,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       `🧠 Self-Learned Alias: "${learnedAlias}" -> [${matchedProd.code}] ${matchedProd.name} (${currentUnk.orderedQty} pcs = ৳${totalAmount})`
     );
 
-    // If there are more unrecognized products in the same order, ask for the next one!
     if (item.unrecognizedItems.length > 0) {
       const nextPrompt = buildPromptTextForPendingItem(item);
       return {
@@ -4138,7 +5389,6 @@ async function resolvePendingItemWithAnswer(token, rawAnswerText) {
       };
     }
 
-    // All products and DA are now resolved -> Save the complete order to Google Sheets!
     return await finalizeAndSavePendingOrder(item, item.learnedLogs);
   }
 
@@ -4169,9 +5419,6 @@ function isAllowedTargetGroup(remoteJid) {
   return false;
 }
 
-/**
- * Unwraps nested Baileys message containers (deviceSentMessage, ephemeralMessage, viewOnceMessage, etc.)
- */
 function unwrapBaileysMessageContainer(m) {
   if (!m) return null;
   if (m.deviceSentMessage?.message) return unwrapBaileysMessageContainer(m.deviceSentMessage.message);
@@ -4315,7 +5562,6 @@ async function refreshJoinedGroups() {
       }))
       .sort((a, b) => a.subject.localeCompare(b.subject));
 
-    // Always restore saved target group from master_db.json first so reconnect never resets it
     syncTargetGroupFromMasterDbToBotConfig();
 
     if (botConfig.targetGroupId && botConfig.targetGroupId !== 'ALL') {
@@ -4396,7 +5642,7 @@ async function startWhatsApp() {
       printQRInTerminal: true,
       logger: pino({ level: 'silent' }),
       browser: Browsers.ubuntu('Renata CRP Order Tracker'),
-      keepAliveIntervalMs: 20000,      // Sends WebSocket ping every 20s to prevent code: 428 & 503 drops
+      keepAliveIntervalMs: 20000,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       retryRequestDelayMs: 1500,
@@ -4450,10 +5696,7 @@ async function startWhatsApp() {
           if (botPh.startsWith('8801')) lidToPhoneMap.set(botLid, botPh);
         }
 
-        // 1. Restore Target Group from master_db.json immediately on connect/reconnect
         syncTargetGroupFromMasterDbToBotConfig();
-
-        // 2. Sync existing message IDs from Google Sheet + master_db.json (lastProcessedMsgIds)
         await syncExistingSheetMessageIds();
 
         addLog(
@@ -4477,7 +5720,6 @@ async function startWhatsApp() {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         addLog(`🔴 WhatsApp connection closed (code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
 
-        // Keep Target Group locked from master_db.json even while disconnected
         syncTargetGroupFromMasterDbToBotConfig();
 
         if (statusCode === DisconnectReason.loggedOut) {
@@ -4492,7 +5734,6 @@ async function startWhatsApp() {
         } else if (shouldReconnect && !isReconnectingWhatsApp) {
           isReconnectingWhatsApp = true;
           waStatus = 'CONNECTING';
-          // Fast 1.5s reconnect for transient 428 / 503 socket drops
           const reconnectDelay = (statusCode === 428 || statusCode === 503) ? 1500 : 3000;
           setTimeout(() => {
             isReconnectingWhatsApp = false;
@@ -4524,7 +5765,6 @@ async function startWhatsApp() {
 
           const textOrCaption = (inspected.text || inspected.caption || '').trim();
 
-          // Ignore the bot's own outgoing prompts/confirmations so it never loops
           if (
             textOrCaption.includes('নতুন/অপরিচিত DA ID শনাক্ত হয়েছে!') ||
             textOrCaption.includes('অর্ডারে কোনো পরিচিত DA ID বা নাম পাওয়া যায়নি!') ||
@@ -4534,13 +5774,13 @@ async function startWhatsApp() {
             textOrCaption.includes('ছবি থেকে অর্ডারটি Google Sheet-এ সেভ হয়েছে!') ||
             textOrCaption.includes('অর্ডারটি বাতিল (/cnl) করা হয়েছে!') ||
             textOrCaption.includes('ছবিটি ৩ বার অটো-রিচেক') ||
+            textOrCaption.includes('ছবিটি ৫টি ভিন্ন পদ্ধতিতে') ||
             textOrCaption.includes('নতুন প্রতিনিধি অটো-যুক্ত হয়েছে!') ||
             textOrCaption.includes('প্রোডাক্ট খুঁজে পাওয়া যায়নি।')
           ) {
             continue;
           }
 
-          // 0. Check "/bind" command across ALL groups and DMs
           const bindMatch = textOrCaption.match(/^\/?bind(?:\s+([\+\d\-\s]{10,18}))?$/i);
           if (bindMatch) {
             const allowedList = getAuthorizedImagePhones();
@@ -4571,14 +5811,10 @@ async function startWhatsApp() {
             continue;
           }
 
-          // ==================================================================
-          // 1. CHECK IF THIS TEXT MESSAGE IS A REPLY TO A PENDING RESOLUTION
-          // ==================================================================
           if (inspected.type === 'TEXT' && pendingResolutions.size > 0) {
             let matchedToken = null;
             let answerBody = inspected.text.trim();
 
-            // A) Check if quoted message ID matches a registered question/order message ID
             if (inspected.quotedMsgId && pendingQuestionMsgIdMap.has(inspected.quotedMsgId)) {
               const candidateTok = pendingQuestionMsgIdMap.get(inspected.quotedMsgId);
               if (pendingResolutions.has(candidateTok)) {
@@ -4586,7 +5822,6 @@ async function startWhatsApp() {
               }
             }
 
-            // B) Check if the quoted message's TEXT contains (#ORD101 / #DA101 / #PR101)
             if (!matchedToken && inspected.quotedText) {
               const qTokenMatch = inspected.quotedText.match(/#(?:ORD|DA|PR)\d+/i);
               if (qTokenMatch) {
@@ -4597,7 +5832,6 @@ async function startWhatsApp() {
               }
             }
 
-            // C) Check if reply text itself starts with "#ORD101 ..." or "ORD101 ..."
             if (!matchedToken) {
               const prefixMatch = answerBody.match(/^#?((?:ORD|DA|PR)\d+)\s+([\s\S]+)$/i);
               if (prefixMatch) {
@@ -4609,17 +5843,12 @@ async function startWhatsApp() {
               }
             }
 
-            // D) Direct reply WITHOUT swiping/quoting:
-            //    - In 1-on-1 DM (!isGroup): ANY short reply automatically resolves the latest pending question!
-            //    - In Group (isGroup): If sent by Admin (01793362829 / 01732273944) or original order sender,
-            //      and it's a single-line answer (not a new multi-line order), resolve the latest pending question!
             if (!matchedToken) {
               const allPending = Array.from(pendingResolutions.values());
               const latestPending = allPending[allPending.length - 1];
               const isSingleLineReply = !answerBody.includes('\n') && answerBody.length <= 65;
 
               if (!isGroup && isSingleLineReply) {
-                // Also auto-map this DM sender's LID to Admin phone so future checks know it's the Admin!
                 const primaryAdmin = getAdminAlertPhones()[0] || '8801793362829';
                 if (!senderPhone.startsWith('8801')) {
                   lidToPhoneMap.set(rawSenderId, primaryAdmin);
@@ -4631,7 +5860,6 @@ async function startWhatsApp() {
                 isSingleLineReply &&
                 (isAdminAlertSender(msg, senderPhone) || rawSenderId === latestPending.rawSenderId)
               ) {
-                // In group, ensure the reply doesn't look like a brand new order with quantities (unless it's "Lucan R 200")
                 const hasTrailingOrderQty = /[\-:=]\s*\d+\s*(?:ta|pes|pcs|pc|p|box|bx)?$/i.test(answerBody) || /\b\d+\s*(?:ta|pes|pcs|pc|box|bx)$/i.test(answerBody);
                 if (!hasTrailingOrderQty) {
                   matchedToken = latestPending.token;
@@ -4670,23 +5898,18 @@ async function startWhatsApp() {
             }
           }
 
-          // 2. Ensure target group from master_db.json is active and check if group is allowed
           if (isGroup && !isAllowedTargetGroup(remoteJid)) {
             if (!(inspected.type === 'IMAGE' && isAuthorizedForImageOrder(msg, senderPhone))) {
               continue;
             }
           }
 
-          // 2B. Reconnect Missed-Order Recovery & Last 5 Message ID Deduplication:
-          //     When WhatsApp reconnects after a disconnect, Baileys delivers missed messages via 'append' or 'notify'.
-          //     If msgId is already in masterDb.lastProcessedMsgIds / recentProcessedMsgIds / Google Sheets, skip it!
           if (isGroup && (inspected.type === 'TEXT' || inspected.type === 'IMAGE')) {
             const isCnlCmd = inspected.type === 'TEXT' && /^\/?cnl\b/i.test(inspected.text.trim());
             if (!isCnlCmd && inspected.msgId && isMessageAlreadyProcessed(inspected.msgId)) {
               continue;
             }
             if (type === 'append') {
-              // On offline/reconnect sync, only inspect messages from the last 24 hours
               if (Date.now() - msgTimestamp > 24 * 60 * 60 * 1000) {
                 continue;
               }
@@ -4694,14 +5917,12 @@ async function startWhatsApp() {
             }
           }
 
-          // CASE 1: Message Unsent / Deleted for Everyone
           if (inspected.type === 'REVOKE') {
             addLog(`🚨 Unsend/Delete detected for Msg ID: ${inspected.targetMsgId}`);
             await removeOrdersByMessageId(inspected.targetMsgId, 'UNSENT_BY_USER');
             continue;
           }
 
-          // CASE 2: Message Edited
           if (inspected.type === 'EDIT') {
             addLog(`✏️ Message Edit detected for Msg ID: ${inspected.targetMsgId}`);
             await removeOrdersByMessageId(inspected.targetMsgId, 'REPLACED_BY_EDIT');
@@ -4734,7 +5955,6 @@ async function startWhatsApp() {
             continue;
           }
 
-          // CASE 3: Handwritten / Paper Image Order (3-Retry + Keyless Vision AI Pipeline)
           if (inspected.type === 'IMAGE') {
             if (!senderPhone.startsWith('8801') && isGroup && sock) {
               try {
@@ -4759,13 +5979,11 @@ async function startWhatsApp() {
               } catch (e) {}
             }
 
-            // Pre-download image buffer while WhatsApp media token is fresh (with 3x auto-retry)
             const preDownloadedBufferPromise = downloadImageBufferWithRetry(msg).catch((e) => {
               addLog(`⚠️ Initial media pre-fetch warning (${inspected.msgId}): ${e.message}`);
               return null;
             });
 
-            // Process images strictly ONE BY ONE in a sequential FIFO queue with rate-limit guard!
             enqueueImageOrderTask(async () => {
               addLog(`📸 Processing queued image (${inspected.msgId}) via 5-Method Rate-Limit-Proof Pipeline...`);
               let imageBuffer = await preDownloadedBufferPromise;
@@ -4899,7 +6117,6 @@ async function startWhatsApp() {
             continue;
           }
 
-          // CASE 4: Text Messages ("/cnl" Cancel Reply OR Standard Group Text Order)
           if (inspected.type === 'TEXT') {
             if (/^\/?cnl\b/i.test(inspected.text.trim())) {
               let targetOrderMsgId = null;
@@ -4978,7 +6195,6 @@ async function startWhatsApp() {
                   sheetRows: [],
                   note: '⏳ পেন্ডিং প্রশ্ন (উত্তরের অপেক্ষায়)'
                 });
-                // Hold the entire order until Admin (01793362829) replies to confirm DA / Product!
                 await createPendingOrderResolution({
                   parsedResult: parsed,
                   rawText: inspected.text,
@@ -5030,7 +6246,6 @@ async function startWhatsApp() {
                 note: '🔧 Follow-up ID/PSO Patch'
               });
             } else {
-              // Normal non-order group message — also save in All Message Logs as ❌ Not Saved
               await recordMessageInAllLogs({
                 whatsappMsgId: inspected.msgId,
                 dateStr: parsed.dateStr,
@@ -5045,7 +6260,6 @@ async function startWhatsApp() {
                 note: '❌ সাধারণ মেসেজ (কোনো অর্ডার নেই)'
               });
             }
-            // Save this group message ID in master_db.json (lastProcessedMsgIds - last 5 IDs)
             recordProcessedGroupMessageId(inspected.msgId, msgTimestamp);
           }
         } catch (err) {
@@ -5054,7 +6268,6 @@ async function startWhatsApp() {
       }
     });
 
-    // Also catch any missed group messages delivered via messaging-history.set on reconnect
     sock.ev.on('messaging-history.set', async ({ messages: histMessages }) => {
       try {
         if (!Array.isArray(histMessages) || histMessages.length === 0) return;
@@ -5137,7 +6350,7 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
-    version: '5.0-self-learning-db',
+    version: '6.0-multi-chunk-cloud-state',
     waStatus,
     googleAuthReady,
     targetGroup: botConfig.targetGroupName,
@@ -5199,7 +6412,6 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// Trigger manual or periodic sync of Live_Orders Row Numbers
 app.post('/api/message-logs/sync-rows', async (req, res) => {
   await syncLiveSheetRowNumbers();
   res.json({
@@ -5208,10 +6420,6 @@ app.post('/api/message-logs/sync-rows', async (req, res) => {
   });
 });
 
-/**
- * Edit & Re-submit any WhatsApp message (from Pending Questions, All Message Logs, or Live Orders)
- * directly from the Web Dashboard!
- */
 app.post('/api/message/edit-submit', async (req, res) => {
   try {
     const {
@@ -5220,8 +6428,7 @@ app.post('/api/message/edit-submit', async (req, res) => {
       editedText,
       senderPhone,
       senderPushName,
-      overrideDaText,
-      forceIgnoreUnrecognized
+      overrideDaText
     } = req.body || {};
 
     const cleanText = String(editedText || '').trim();
@@ -5231,7 +6438,6 @@ app.post('/api/message/edit-submit', async (req, res) => {
 
     const finalMsgId = String(whatsappMsgId || `WEB_EDIT_${Date.now()}`).trim();
 
-    // 1. If overrideDaText was provided (e.g. "CF4526 Seraj"), ensure that DA exists in masterDb.das
     let combinedText = cleanText;
     if (overrideDaText && String(overrideDaText).trim()) {
       const daOverrideStr = String(overrideDaText).trim();
@@ -5265,7 +6471,6 @@ app.post('/api/message/edit-submit', async (req, res) => {
       }
     }
 
-    // 2. Remove any pending resolution linked to pendingToken or finalMsgId
     if (pendingToken && pendingResolutions.has(pendingToken)) {
       pendingResolutions.delete(pendingToken);
     }
@@ -5275,12 +6480,10 @@ app.post('/api/message/edit-submit', async (req, res) => {
       }
     }
 
-    // 3. If this message previously had rows saved in Live_Orders, remove old rows first before saving edited order
     if (liveMsgIdToSheetRowsMap.has(finalMsgId) || sheetExistingMsgIds.has(finalMsgId)) {
       await removeOrdersByMessageId(finalMsgId, 'REPLACED_BY_WEB_EDIT');
     }
 
-    // 4. Parse the edited message
     const parsed = parseWhatsAppOrderMessage({
       messageText: combinedText,
       messageId: finalMsgId,
@@ -5310,7 +6513,6 @@ app.post('/api/message/edit-submit', async (req, res) => {
       });
     }
 
-    // If DA is still unknown and user didn't provide an ID/Name, use senderPushName or mark as WEB-APPROVED
     if (parsed.daInfo && !parsed.daInfo.isKnownDA) {
       const fallbackDaId = parsed.daInfo.detectedDaId || (overrideDaText ? overrideDaText.trim().split(/\s+/)[0].toUpperCase() : 'WEB-DA');
       const fallbackDaName = overrideDaText
@@ -5325,7 +6527,6 @@ app.post('/api/message/edit-submit', async (req, res) => {
       parsed.daInfo.isKnownDA = true;
     }
 
-    // 5. Save the parsed order rows to Google Sheets!
     const savedRows = await appendOrdersToSheet(parsed.orders);
     await recordMessageInAllLogs({
       whatsappMsgId: finalMsgId,
@@ -5356,7 +6557,6 @@ app.post('/api/message/edit-submit', async (req, res) => {
   }
 });
 
-// Get full Master DB (DAs, Products, Admin Phones, Image Phones, Pending Questions)
 app.get('/api/master-db', (req, res) => {
   res.json({
     ok: true,
@@ -5378,7 +6578,6 @@ app.get('/api/master-db', (req, res) => {
   });
 });
 
-// Product Brand Group CRUD Endpoints (Add / Edit / Add Keyword / Delete Group)
 app.post('/api/product-group/save', (req, res) => {
   const { groupName, keywords } = req.body || {};
   const cleanGroup = String(groupName || '').trim().toUpperCase();
@@ -5391,7 +6590,7 @@ app.post('/api/product-group/save', (req, res) => {
         cleanGroup.toLowerCase(),
         ...(Array.isArray(keywords) ? keywords : String(keywords || '').split(','))
           .map((k) => String(k || '').trim().toLowerCase())
-          .filter(Boolean)
+          .filter((k) => k && !isAccidentalPsoAlias(k))
       ]
     )
   );
@@ -5419,7 +6618,7 @@ app.post('/api/product-group/keyword', (req, res) => {
 
   if (action === 'remove') {
     grp.keywords = grp.keywords.filter((k) => k.toLowerCase() !== cleanKw);
-  } else if (cleanKw) {
+  } else if (cleanKw && !isAccidentalPsoAlias(cleanKw)) {
     const stem = extractCommonBrandStem(cleanKw) || cleanKw;
     if (!grp.keywords.includes(stem)) grp.keywords.push(stem);
     if (!grp.keywords.includes(cleanKw)) grp.keywords.push(cleanKw);
@@ -5444,14 +6643,12 @@ app.post('/api/product-group/delete', (req, res) => {
   res.json({ ok: true, productGroups: masterDb.productGroups });
 });
 
-// Export Master DB as downloadable JSON file
 app.get('/api/master-db/export', (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="crp_master_db_backup.json"');
   res.send(JSON.stringify(masterDb, null, 2));
 });
 
-// Import Master DB from JSON (Supports both 'merge' and 'replace' modes + older/newer JSON structures)
 app.post('/api/master-db/import', async (req, res) => {
   try {
     const body = req.body || {};
@@ -5503,9 +6700,6 @@ app.post('/api/master-db/import', async (req, res) => {
   }
 });
 
-// ============================================================================
-// DA DATABASE CRUD ENDPOINTS (ADD / EDIT / DELETE SINGLE / CLEAR ALL / RESET)
-// ============================================================================
 app.post('/api/da/save', async (req, res) => {
   const { originalDaId, daId, altId, name, phones, aliases } = req.body || {};
   const cleanId = String(daId || '').trim().toUpperCase();
@@ -5583,9 +6777,6 @@ app.post('/api/da/delete', async (req, res) => {
   res.json({ ok: true, removed: before - masterDb.das.length, totalDAs: masterDb.das.length });
 });
 
-// ============================================================================
-// PRODUCT & WRONG SPELLING (ALIASES) CRUD ENDPOINTS
-// ============================================================================
 app.post('/api/product/save', async (req, res) => {
   const { originalCode, code, name, unit, price, family, aliases } = req.body || {};
   const cleanCode = String(code || '').trim().toUpperCase();
@@ -5600,7 +6791,7 @@ app.post('/api/product/save', async (req, res) => {
     new Set(
       (Array.isArray(aliases) ? aliases : String(aliases || '').split(','))
         .map((a) => String(a || '').trim().toLowerCase())
-        .filter(Boolean)
+        .filter((a) => a && !isAccidentalPsoAlias(a))
     )
   );
 
@@ -5643,7 +6834,7 @@ app.post('/api/product/alias', async (req, res) => {
   if (action === 'remove') {
     prod.aliases = prod.aliases.filter((a) => a.toLowerCase() !== cleanAlias);
     addLog(`🗑️ Removed alias "${cleanAlias}" from [${cleanCode}] ${prod.name}`);
-  } else if (cleanAlias) {
+  } else if (cleanAlias && !isAccidentalPsoAlias(cleanAlias)) {
     if (!prod.aliases.includes(cleanAlias)) {
       prod.aliases.push(cleanAlias);
       syncProductWithBrandGroup(prod, cleanAlias);
@@ -5683,9 +6874,6 @@ app.post('/api/product/delete', async (req, res) => {
   res.json({ ok: true, totalProducts: masterDb.products.length });
 });
 
-// ============================================================================
-// MULTIPLE PHONE NUMBERS (ADMIN ALERT & IMAGE AUTHORIZED) CRUD ENDPOINT
-// ============================================================================
 app.post('/api/phones/save', async (req, res) => {
   const { adminAlertPhones, authorizedImagePhones } = req.body || {};
 
@@ -5716,9 +6904,6 @@ app.post('/api/phones/save', async (req, res) => {
   });
 });
 
-// ============================================================================
-// PENDING RESOLUTION ACTION ENDPOINT (RESOLVE OR CANCEL FROM WEB DASHBOARD)
-// ============================================================================
 app.post('/api/pending/resolve', async (req, res) => {
   const { token, answer } = req.body || {};
   const result = await resolvePendingItemWithAnswer(String(token || '').trim(), String(answer || '').trim());
@@ -5783,7 +6968,6 @@ app.post('/api/config/group', async (req, res) => {
   }
   botConfig.updatedAt = new Date().toISOString();
 
-  // Save permanently into master_db.json AND bot_config.json so reconnect never resets the group
   saveTargetGroupToMasterDb(botConfig.targetGroupId, botConfig.targetGroupName, botConfig.autoReactOnOrder);
   await backupAuthAndConfigToSheet();
   addLog(`🔒 Group Config Saved in master_db.json: "${botConfig.targetGroupName}" [ID: ${botConfig.targetGroupId || 'ALL'}]`);
@@ -5864,10 +7048,10 @@ app.post('/api/whatsapp/logout', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Serve Neo-Brutalism v5.0 Master Command Center UI at "/"
+// Serve Neo-Brutalism v6.0 Master Command Center UI at "/"
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v5.9 \u2014 Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    /* Navigation Tabs */\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>\u26a1 Renata PLC (NK Depot) \u2014 CRP Order Bot v5.9</h1>\n        <p>Dynamic JSON Master DB \u2022 Self-Learning WhatsApp Admin Bot (01793362829) \u2022 5x Keyless AI OCR \u2022 Brand Group AI \u2022 Sequential Queue</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">\u23f3 WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">\u23f3 Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">\u26a1 RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">\ud83d\udcca Google Sheet \u2197</a>\n      </div>\n    </header>\n\n    <!-- NAVIGATION TABS -->\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">\ud83d\udce1 \u09e7. \u09ac\u099f \u0995\u09a8\u09cd\u099f\u09cd\u09b0\u09cb\u09b2 \u0993 \u09b2\u09be\u0987\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">\ud83d\udc65 \u09e8. \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">\ud83d\udc8a \u09e9. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-groups', this)\">\ud83e\udde9 \u09ea. \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (<span id=\"navGrpCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">\ud83d\udcf1 \u09eb. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u0993 JSON \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f</button>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 1: BOT CONTROL, PENDING RESOLUTIONS, LIVE ORDERS & LOGS         -->\n    <!-- =================================================================== -->\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">\ud83c\udfaf \u09b8\u0995\u09cd\u09b0\u09bf\u09df \u0997\u09cd\u09b0\u09c1\u09aa</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">\ud83d\udce6 \u09ae\u09cb\u099f \u09b8\u09c7\u09ad \u0985\u09b0\u09cd\u09a1\u09be\u09b0</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">\ud83d\udcb0 \u09ae\u09cb\u099f \u0985\u09b0\u09cd\u09a1\u09be\u09b0 (\u09f3)</div>\n          <div class=\"val\" id=\"statAmount\">\u09f30.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">\u2753 \u09aa\u09c7\u09a8\u09cd\u09a1\u09bf\u0982 \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">\ud83d\udcf2 \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u09a8\u09ae\u09cd\u09ac\u09b0</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <!-- PENDING AI QUESTIONS CARD (When unknown DA or unknown Product is waiting for reply) -->\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u0993 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8\u09b8\u09ae\u09c2\u09b9 (WhatsApp 01793362829 \u0985\u09a5\u09ac\u09be \u098f\u0996\u09be\u09a8 \u09a5\u09c7\u0995\u09c7 \u0989\u09a4\u09cd\u09a4\u09b0 \u09a6\u09bf\u09a8)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <!-- WHATSAPP QR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>\u09e7. WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09b6\u09a8</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <!-- GROUP SELECTOR -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\u09e8. WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">\ud83d\udd04 \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09ab\u09cd\u09b0\u09c7\u09b6</button>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0986\u09aa\u09a8\u09be\u09b0 WhatsApp \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>\n            </select>\n            <label>\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u09b0\u09cd\u09a6\u09bf\u09b7\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b8\u09c7\u09ad \u09b9\u09b2\u09c7 \u09ae\u09c7\u09b8\u09c7\u099c\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u2705 \u09b0\u09bf\u09df\u09c7\u0995\u09b6\u09a8 \u09a6\u09bf\u09ac\u09c7\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">\ud83d\udcbe Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">\ud83d\udcb2 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n            <div style=\"margin-top:10px; padding:9px 11px; background:#FEF9C3; border:2px solid #000; border-radius:8px; font-size:0.78rem; font-weight:700;\">\n              <div>📌 <b>JSON-এ সেভ থাকা গ্রুপ:</b> <span id=\"jsonSavedGroupLabel\">Loading...</span></div>\n              <div style=\"margin-top:4px;\">🆔 <b>সর্বশেষ ৫টি মেসেজ আইডি (master_db.json):</b> <span id=\"last5MsgIdsLabel\" style=\"font-family:monospace; word-break:break-all;\">None</span></div>\n            </div>\n          </div>\n        </div>\n\n        <!-- TEST PARSER -->\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>\ud83e\uddea \u09e9. \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0993 \u09b8\u09c7\u09b2\u09ab-\u09b2\u09be\u09b0\u09cd\u09a8\u09bf\u0982 \u099f\u09c7\u09b8\u09cd\u099f\u09be\u09b0</span>\n          </div>\n          <div class=\"card-body\">\n            <label>\u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09ae\u09c7\u09b8\u09c7\u099c \u09b2\u09bf\u0996\u09c7 \u099f\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09a8\u09be\u09ae/\u0993\u09b7\u09c1\u09a7 \u09a6\u09bf\u09b2\u09c7 01793362829-\u098f \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09ac\u09c7):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nCus: Nipun pharmacy E71\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">\ud83d\udd0d Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">\ud83d\ude80 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <!-- EDIT & SUBMIT MESSAGE MODAL -->\n      <div id=\"editMsgModal\" style=\"display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:9999; padding:16px; overflow-y:auto; align-items:center; justify-content:center;\">\n        <div class=\"card\" style=\"max-width:640px; width:100%; margin:40px auto; border:3.5px solid #000; box-shadow:8px 8px 0px #000;\">\n          <div class=\"card-header h-mint\">\n            <span>✏️ মেসেজ এডিট করে Google Sheet-এ সাবমিট করুন (Edit & Submit Order)</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"closeEditMsgModal()\">✖ বন্ধ করুন</button>\n          </div>\n          <div class=\"card-body\">\n            <input type=\"hidden\" id=\"editModalMsgId\" />\n            <input type=\"hidden\" id=\"editModalToken\" />\n            <div style=\"display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px;\">\n              <div>\n                <label style=\"margin-top:0;\">📱 প্রেরকের মোবাইল নম্বর (Sender Number):</label>\n                <input type=\"text\" id=\"editModalPhone\" placeholder=\"+88017...\" />\n              </div>\n              <div>\n                <label style=\"margin-top:0;\">👤 প্রতিনিধির ID ও নাম (যেমন: CF4526 Seraj):</label>\n                <input type=\"text\" id=\"editModalDaText\" placeholder=\"মেসেজে লেখা না থাকলে এখানে দিন (ঐচ্ছিক)\" />\n              </div>\n            </div>\n            <label>📩 সম্পূর্ণ মেসেজ (এখানে ভুল বানান, PSO কোড, ID বা পরিমাণ ঠিক করুন):</label>\n            <textarea id=\"editModalText\" style=\"min-height:150px; font-size:0.9rem; line-height:1.45;\"></textarea>\n            <div id=\"editModalStatus\" style=\"margin-top:8px; font-size:0.84rem; font-weight:800;\"></div>\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"submitEditedMessageFromWeb()\">🚀 সংশোধন করে সাবমিট ও Google Sheet-এ সেভ করুন</button>\n              <button class=\"btn-danger\" onclick=\"closeEditMsgModal()\">বাতিল</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <!-- ALL MESSAGE LOGS CARD (✅ Saved / ❌ Not Saved + Auto-Updating Google Sheet Row Number + Edit & Submit) -->\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>📨 সব মেসেজ লগ — কোন মেসেজ সেভ হয়েছে (✅) আর কোনটি হয়নি (❌) এবং Google Sheet Row নম্বর</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n            <select id=\"msgLogFilterSelect\" onchange=\"renderMessageLogsTable()\" style=\"width:auto; padding:5px 10px; font-size:0.78rem;\">\n              <option value=\"ALL\">📋 সব মেসেজ (All)</option>\n              <option value=\"SAVED\">✅ শুধু সেভ হওয়া (Saved)</option>\n              <option value=\"UNSAVED\">❌ সেভ না হওয়া (Not Saved)</option>\n            </select>\n            <input type=\"text\" id=\"msgLogSearchInput\" placeholder=\"🔍 মেসেজ, Row বা নম্বর খুঁজুন...\" oninput=\"renderMessageLogsTable()\" style=\"width:200px; padding:5px 10px; font-size:0.78rem;\" />\n            <button class=\"btn-yellow btn-sm\" onclick=\"syncRowsFromSheetNow()\">🔄 Row নম্বর সিঙ্ক</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"openEditMsgModal('', '', '', '', '')\">➕ নতুন মেসেজ লিখে সাবমিট</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\" style=\"max-height:480px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>স্ট্যাটাস (✅/❌)</th>\n                  <th>Google Sheet Row নং</th>\n                  <th>তারিখ ও সময়</th>\n                  <th>প্রেরকের নম্বর ও নাম</th>\n                  <th>প্রতিনিধি (DA)</th>\n                  <th>সম্পূর্ণ মেসেজ (Full Message)</th>\n                  <th>বিবরণ / নোট</th>\n                  <th>অ্যাকশন (Edit & Submit)</th>\n                </tr>\n              </thead>\n              <tbody id=\"messageLogsTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIVE ORDERS -->\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udccb \u09b8\u09b0\u09cd\u09ac\u09b6\u09c7\u09b7 \u099f\u09cd\u09b0\u09cd\u09af\u09be\u0995 \u09b9\u0993\u09df\u09be \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09b8\u09ae\u09c2\u09b9 (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">\ud83e\uddf9 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Sheet Row</th>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match / Edit</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <!-- SERVER LOGS -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udda5\ufe0f \u09b8\u09bf\u09b8\u09cd\u099f\u09c7\u09ae \u09b2\u0997 (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">\ud83e\uddf9 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 2: DA DATABASE MANAGER (ADD / EDIT / DELETE / CLEAR ALL)        -->\n    <!-- =================================================================== -->\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>\u2795 \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA) \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">\ud83d\uddd1\ufe0f \u09b8\u09ac DA \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09c1\u09a8 (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (\u09af\u09c7\u09ae\u09a8: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a6\u09c7\u0993\u09df\u09be \u09af\u09be\u09ac\u09c7):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>\u09a1\u09be\u0995\u09a8\u09be\u09ae / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83d\udc65 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09a4\u09be\u09b2\u09bf\u0995\u09be (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"\ud83d\udd0d ID, \u09a8\u09be\u09ae \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>\u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a8\u09be\u09ae (Name)</th>\n                  <th>\u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a8\u09ae\u09cd\u09ac\u09b0</th>\n                  <th>Aliases / \u09a1\u09be\u0995\u09a8\u09be\u09ae</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8 (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 3: PRODUCT & WRONG SPELLING (ALIASES) MANAGER                   -->\n    <!-- =================================================================== -->\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>\ud83d\udc8a \u09a8\u09a4\u09c1\u09a8 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u09a6\u09be\u09ae \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases) \u098f\u09a1\u09bf\u099f \u0995\u09b0\u09c1\u09a8</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">\ud83d\udd04 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09c1\u09a8</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (\u09af\u09c7\u09ae\u09a8: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>\u09aa\u09cd\u09af\u09be\u0995 \u09b8\u09be\u0987\u099c (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (\u09f3 \u09a6\u09b0):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family / \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. LUCAN-R, TOTIFEN\" />\n            </div>\n          </div>\n          <label>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u09b8\u09cd\u099f / Aliases (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09b2\u09bf\u0996\u09c1\u09a8 \u2014 \u09af\u09c7\u0995\u09cb\u09a8\u09cb \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09b2\u09c7\u0987 \u098f\u0987 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u099a\u09bf\u09a8\u09c7 \u09a8\u09c7\u09ac\u09c7):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">\ud83d\udcbe \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8 (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>\ud83d\udc8a \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"\ud83d\udd0d \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae, \u0995\u09cb\u09a1 \u09ac\u09be \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>\u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u0993 \u09aa\u09cd\u09af\u09be\u0995</th>\n                  <th>Trade Price (\u09f3)</th>\n                  <th>\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b8\u09ae\u09c2\u09b9 (Recognized Wrong Spellings / Aliases)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 4: PRODUCT COMMON GROUP & KEYWORD MANAGER                       -->\n    <!-- =================================================================== -->\n    <div id=\"tab-groups\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>\ud83e\udde9 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0995\u09ae\u09a8 \u0997\u09cd\u09b0\u09c1\u09aa \u0993 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09ae\u09cd\u09af\u09be\u09a8\u09c7\u099c\u09be\u09b0 (Total Groups: <span id=\"grpTotalLabel\">0</span>)</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap;\">\n            <input type=\"text\" id=\"newGroupNameInput\" placeholder=\"\u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09be\u09ae (e.g. LUCAN-R)\" style=\"max-width:170px; padding:6px 10px;\" />\n            <input type=\"text\" id=\"newGroupKeywordsInput\" placeholder=\"\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 (e.g. lucanr, luen, luncanr)\" style=\"max-width:260px; padding:6px 10px;\" />\n            <button class=\"btn-primary btn-sm\" onclick=\"saveBrandGroup()\">\ud83d\udcbe \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetBrandGroupsToDefault()\">\u267b\ufe0f \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.85rem; font-weight:700; margin-bottom:12px;\">\n            \ud83d\udca1 <b>\u0995\u09c0\u09ad\u09be\u09ac\u09c7 \u0995\u09be\u099c \u0995\u09b0\u09c7:</b> \u098f\u0995\u0987 \u09a8\u09be\u09ae\u09c7\u09b0 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f (\u09af\u09c7\u09ae\u09a8: <code>LUCAN-R 200</code>, <code>LUCAN-R 150</code>, <code>LUCAN-R 50</code>, <code>LUCAN-R SYP</code>) \u098f\u0995\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09a5\u09be\u0995\u09c7\u0964 \u0995\u09cb\u09a8\u09cb \u098f\u0995\u099f\u09bf \u09ad\u09cd\u09af\u09be\u09b0\u09bf\u09df\u09c7\u09a8\u09cd\u099f\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09a8\u09a4\u09c1\u09a8 \u09ac\u09be\u09a8\u09be\u09a8 (\u09af\u09c7\u09ae\u09a8: <code>luen 200</code> \u09ac\u09be <code>luncanr 200</code>) \u09b6\u09c7\u0996\u09be\u09b2\u09c7 \u0995\u09ae\u09a8 \u09a8\u09be\u09ae <code>luen</code> / <code>luncanr</code> \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u098f\u0987 \u0997\u09cd\u09b0\u09c1\u09aa\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09df\u2014\u09ab\u09b2\u09c7 \u09aa\u09b0\u09ac\u09b0\u09cd\u09a4\u09c0\u09a4\u09c7 \u0995\u09c7\u0989 <code>luen 150</code>, <code>luen 50</code> \u09ac\u09be <code>luen syp</code> \u09b2\u09bf\u0996\u09b2\u09c7\u0993 \u09ac\u099f \u09a8\u09bf\u099c\u09c7 \u09a5\u09c7\u0995\u09c7\u0987 \u099a\u09bf\u09a8\u09c7 \u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf Google Sheet-\u098f \u09af\u09cb\u0997 \u0995\u09b0\u09ac\u09c7!\n          </p>\n          <div style=\"margin-bottom:12px;\">\n            <input type=\"text\" id=\"groupSearchInput\" placeholder=\"\ud83d\udd0d \u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae, \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09a6\u09bf\u09df\u09c7 \u0996\u09c1\u0981\u099c\u09c1\u09a8...\" oninput=\"renderProductGroupsTable()\" style=\"max-width:360px;\" />\n          </div>\n          <div class=\"table-wrap\" style=\"max-height:520px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Group Name (\u0995\u09ae\u09a8 \u09a8\u09be\u09ae)</th>\n                  <th>\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09b8\u09ae\u09c2\u09b9 (Variants & Trade Price)</th>\n                  <th>\u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 / \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Shared Keywords)</th>\n                  <th>\u09a8\u09a4\u09c1\u09a8 \u0995\u09ae\u09a8 \u0995\u09bf\u0993\u09df\u09be\u09b0\u09cd\u09a1 \u09af\u09cb\u0997</th>\n                  <th>\u0985\u09cd\u09af\u09be\u0995\u09b6\u09a8</th>\n                </tr>\n              </thead>\n              <tbody id=\"productGroupsBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- =================================================================== -->\n    <!-- TAB 5: ADMIN SETTINGS, PHONE NUMBERS & JSON FILE IMPORT / EXPORT    -->\n    <!-- =================================================================== -->\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-yellow\">\n            <span>\ud83d\udcf2 \u09e7. \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u0985\u09cd\u09af\u09be\u09b2\u09be\u09b0\u09cd\u099f \u0993 \u09b0\u09bf\u09aa\u09cd\u09b2\u09be\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7 <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 DA ID/\u09a8\u09be\u09ae</b> \u0985\u09a5\u09ac\u09be <b>\u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u0993\u09b7\u09c1\u09a7\u09c7\u09b0 \u09ac\u09be\u09a8\u09be\u09a8</b> \u09aa\u09be\u0993\u09df\u09be \u0997\u09c7\u09b2\u09c7 \u09ac\u099f \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb\u09a4\u09c7 WhatsApp \u09ae\u09c7\u09b8\u09c7\u099c \u09aa\u09be\u09a0\u09bf\u09df\u09c7 \u099c\u09bf\u099c\u09cd\u099e\u09c7\u09b8 \u0995\u09b0\u09ac\u09c7 \u098f\u09ac\u0982 \u098f\u0987 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 Reply \u09a6\u09bf\u09b2\u09c7 \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8\u09c7 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n            </p>\n            <label>\u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u098f\u0995\u09be\u09a7\u09bf\u0995 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u0985\u09cd\u09af\u09be\u09a1\u09ae\u09bf\u09a8 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>\ud83d\udcf8 \u09e8. \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              \u0996\u09be\u09a4\u09be\u09df \u09b2\u09bf\u0996\u09c7 \u099b\u09ac\u09bf \u09a4\u09c1\u09b2\u09c7 \u09aa\u09be\u09a0\u09be\u09b2\u09c7 \u09b6\u09c1\u09a7\u09c1\u09ae\u09be\u09a4\u09cd\u09b0 \u09a8\u09bf\u099a\u09c7\u09b0 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09a5\u09c7\u0995\u09c7 \u09ac\u099f \u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09b0\u09bf\u09a1 \u0995\u09b0\u09ac\u09c7 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7 \u09af\u09a4\u0996\u09c1\u09b6\u09bf \u09a8\u09ae\u09cd\u09ac\u09b0 \u09af\u09cb\u0997 \u09ac\u09be \u09b0\u09bf\u09ae\u09c1\u09ad \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8):\n            </p>\n            <label>\u099b\u09ac\u09bf\u09b0 \u0985\u09b0\u09cd\u09a1\u09be\u09b0\u09c7\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0\u09b8\u09ae\u09c2\u09b9 (\u0995\u09ae\u09be \u09a6\u09bf\u09df\u09c7):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">\ud83d\udcbe \u099b\u09ac\u09bf\u09b0 \u0985\u09a8\u09c1\u09ae\u09cb\u09a6\u09bf\u09a4 \u09a8\u09ae\u09cd\u09ac\u09b0 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <!-- JSON FILE IMPORT & EXPORT CARD -->\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>\ud83d\udcc2 \u09e9. \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 JSON \u09ab\u09be\u0987\u09b2 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0993 \u09ac\u09cd\u09af\u09be\u0995\u0986\u09aa (Import / Export Master DB JSON)</span>\n          <a href=\"/api/master-db/export\" class=\"btn-link btn-blue btn-sm\">\ud83d\udce5 \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09a1\u09be\u0989\u09a8\u09b2\u09cb\u09a1 (.json)</a>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.86rem; font-weight:700; margin-bottom:12px;\">\n            \u0986\u09aa\u09a8\u09be\u09b0 \u0995\u09be\u099b\u09c7 \u0986\u0997\u09c7\u09b0 \u0995\u09cb\u09a8\u09cb <code>.json</code> \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09ab\u09be\u0987\u09b2 \u09a5\u09be\u0995\u09b2\u09c7 \u09a8\u09bf\u099a\u09c7 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c7 \u09b8\u09b0\u09be\u09b8\u09b0\u09bf \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09ac\u09c7\u09a8\u0964 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09b2\u09c7 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (DA), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f, \u09b6\u09c7\u0996\u09be\u09a8\u09cb \u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 (Aliases), \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0997\u09cd\u09b0\u09c1\u09aa \u098f\u09ac\u0982 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u0993 Google Sheet-\u098f \u0985\u099f\u09cb\u09ae\u09c7\u099f\u09bf\u0995 \u09af\u09c1\u0995\u09cd\u09a4 \u09b9\u09df\u09c7 \u09af\u09be\u09ac\u09c7:\n          </p>\n\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:16px; align-items:start;\">\n            <div style=\"border:2.5px dashed #000; background:#FEF9C3; padding:14px; border-radius:10px;\">\n              <label style=\"margin-top:0;\">\ud83d\udcc1 \u09e7. \u0986\u09aa\u09a8\u09be\u09b0 \u0995\u09ae\u09cd\u09aa\u09bf\u0989\u099f\u09be\u09b0 \u09ac\u09be \u09ae\u09cb\u09ac\u09be\u0987\u09b2 \u09a5\u09c7\u0995\u09c7 JSON \u09ab\u09be\u0987\u09b2 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8:</label>\n              <input type=\"file\" id=\"jsonImportFileInput\" accept=\".json,application/json\" onchange=\"handleJsonFileSelect(this)\" style=\"margin-top:6px; padding:8px; background:#fff; border:2px solid #000; border-radius:8px; width:100%; font-weight:700; cursor:pointer;\" />\n              <div id=\"jsonFileSummary\" style=\"margin-top:8px; font-size:0.82rem; font-weight:800; color:#047857;\"></div>\n\n              <label style=\"margin-top:12px;\">\u2699\ufe0f \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09ae\u09cb\u09a1 (Import Mode):</label>\n              <select id=\"jsonImportModeSelect\">\n                <option value=\"merge\">\u2795 \u0986\u0997\u09c7\u09b0 \u09a1\u09be\u099f\u09be\u09b0 \u09b8\u09be\u09a5\u09c7 \u09ae\u09be\u09b0\u09cd\u099c \u0995\u09b0\u09c1\u09a8 (Merge \u2014 \u0986\u0997\u09c7\u09b0 \u0993 \u09a8\u09a4\u09c1\u09a8 \u09b8\u09ac \u09a5\u09be\u0995\u09ac\u09c7)</option>\n                <option value=\"replace\">\ud83d\udd04 \u09aa\u09c1\u09b0\u09cb \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b0\u09bf\u09aa\u09cd\u09b2\u09c7\u09b8 \u0995\u09b0\u09c1\u09a8 (Replace \u2014 \u09ab\u09be\u0987\u09b2\u09c7\u09b0 \u09a1\u09be\u099f\u09be \u09b8\u09c7\u099f \u09b9\u09ac\u09c7)</option>\n              </select>\n\n              <div class=\"btn-row\">\n                <button class=\"btn-primary\" onclick=\"importMasterDbJson()\">\ud83d\udce4 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u0995\u09b0\u09c1\u09a8</button>\n                <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">\u2b07 Download master_db.json</a>\n              </div>\n              <div id=\"jsonImportStatusMsg\" style=\"margin-top:10px; font-size:0.85rem; font-weight:800;\"></div>\n            </div>\n\n            <div>\n              <label style=\"margin-top:0;\">\ud83d\udcdd \u09e8. \u09ab\u09be\u0987\u09b2 \u09aa\u09cd\u09b0\u09bf\u09ad\u09bf\u0989 \u0985\u09a5\u09ac\u09be \u09b8\u09b0\u09be\u09b8\u09b0\u09bf JSON \u0995\u09cb\u09a1 \u09aa\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8 (\u0990\u099a\u09cd\u099b\u09bf\u0995):</label>\n              <textarea id=\"jsonImportTextInput\" placeholder='{\"das\": [...], \"products\": [...], \"productGroups\": [...]}' style=\"min-height:165px; font-size:0.78rem;\"></textarea>\n            </div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          const navGrp = document.getElementById('navGrpCount');\n          if (navGrp) navGrp.textContent = (data.productGroups || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n          renderProductGroupsTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">\ud83d\uddd1\ufe0f Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a8\u09bf\u09b6\u09cd\u099a\u09bf\u09a4 \u09af\u09c7 [${daId}] \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09a1\u09c7\u099f\u09be\u09ac\u09c7\u09b8 \u09a5\u09c7\u0995\u09c7 \u09b8\u09ac \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (All DAs) \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ea\u09ec \u099c\u09a8 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf\u09b0 \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    \n    function renderProductGroupsTable() {\n      const q = (document.getElementById('groupSearchInput')?.value || '').trim().toLowerCase();\n      const allGroups = masterData.productGroups || [];\n      const prods = masterData.products || [];\n      const navGrp = document.getElementById('navGrpCount');\n      if (navGrp) navGrp.textContent = allGroups.length;\n      const groups = allGroups.filter((g) => {\n        if (!q) return true;\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        const memberNames = members.map((m) => `${m.code} ${m.name}`).join(' ');\n        return `${g.groupName} ${(g.keywords || []).join(' ')} ${memberNames}`.toLowerCase().includes(q);\n      });\n      const lbl = document.getElementById('grpTotalLabel');\n      if (lbl) lbl.textContent = groups.length;\n      const tbody = document.getElementById('productGroupsBody');\n      if (!tbody) return;\n      if (groups.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"5\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u0997\u09cd\u09b0\u09c1\u09aa \u09a8\u09c7\u0987\u0964</td></tr>';\n        return;\n      }\n      tbody.innerHTML = groups.map((g) => {\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        return `\n          <tr>\n            <td><span class=\"badge ok\">${esc(g.groupName)}</span></td>\n            <td style=\"font-size:0.78rem;\">\n              ${members.map((m) => `<div><b>[${esc(m.code)}]</b> ${esc(m.name)} (\u09f3${Number(m.price).toFixed(2)})</div>`).join('') || '\u2014'}\n            </td>\n            <td>\n              ${(g.keywords || []).map((kw) => `\n                <span class=\"alias-chip\">\n                  ${esc(kw)}\n                  <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyGroupKeyword('${esc(g.groupName)}', '${esc(kw)}', 'remove')\">\u00d7</span>\n                </span>\n              `).join('')}\n            </td>\n            <td>\n              <div style=\"display:flex; gap:4px; min-width:150px;\">\n                <input type=\"text\" id=\"grpKw_${esc(g.groupName)}\" placeholder=\"\u0995\u09ae\u09a8 \u09ac\u09be\u09a8\u09be\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n                <button class=\"btn-primary btn-sm\" onclick=\"quickAddGroupKw('${esc(g.groupName)}')\">+ \u09af\u09cb\u0997</button>\n              </div>\n            </td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"editBrandGroup('${esc(g.groupName)}')\">\u270f\ufe0f</button>\n              <button class=\"btn-danger btn-sm\" onclick=\"deleteBrandGroup('${esc(g.groupName)}')\">\ud83d\uddd1\ufe0f</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function editBrandGroup(groupName) {\n      const g = (masterData.productGroups || []).find((x) => x.groupName === groupName);\n      if (!g) return;\n      document.getElementById('newGroupNameInput').value = g.groupName;\n      document.getElementById('newGroupKeywordsInput').value = (g.keywords || []).join(', ');\n    }\n\n    async function saveBrandGroup() {\n      const groupName = document.getElementById('newGroupNameInput').value;\n      const keywords = document.getElementById('newGroupKeywordsInput').value;\n      if (!groupName.trim()) return alert('\u0997\u09cd\u09b0\u09c1\u09aa\u09c7\u09b0 \u09a8\u09be\u09ae \u09a6\u09bf\u09a8');\n      await fetch('/api/product-group/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keywords })\n      });\n      document.getElementById('newGroupNameInput').value = '';\n      document.getElementById('newGroupKeywordsInput').value = '';\n      await loadMasterDb();\n    }\n\n    async function quickAddGroupKw(groupName) {\n      const inp = document.getElementById('grpKw_' + groupName);\n      if (!inp || !inp.value.trim()) return;\n      await modifyGroupKeyword(groupName, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyGroupKeyword(groupName, keyword, action) {\n      await fetch('/api/product-group/keyword', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keyword, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteBrandGroup(groupName) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${groupName}] \u0997\u09cd\u09b0\u09c1\u09aa\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetBrandGroupsToDefault() {\n      if (!confirm('\u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u0995\u09ae\u09a8 \u09ac\u09cd\u09b0\u09cd\u09af\u09be\u09a8\u09cd\u09a1 \u0997\u09cd\u09b0\u09c1\u09aa \u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u0985\u09ac\u09b8\u09cd\u09a5\u09be\u09df \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    function handleJsonFileSelect(inputEl) {\n      const file = inputEl?.files?.[0];\n      const summaryEl = document.getElementById('jsonFileSummary');\n      if (!file) return;\n      const reader = new FileReader();\n      reader.onload = (ev) => {\n        const content = String(ev.target?.result || '').trim();\n        document.getElementById('jsonImportTextInput').value = content;\n        try {\n          const parsed = JSON.parse(content);\n          const dCount = Array.isArray(parsed.das) ? parsed.das.length : 0;\n          const pCount = Array.isArray(parsed.products) ? parsed.products.length : 0;\n          const gCount = Array.isArray(parsed.productGroups) ? parsed.productGroups.length : 0;\n          summaryEl.style.color = '#047857';\n          summaryEl.textContent = `\u2705 \u09ab\u09be\u0987\u09b2 \u09b2\u09cb\u09a1 \u09b9\u09df\u09c7\u099b\u09c7 (${file.name}): \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf ${dCount} \u099c\u09a8, \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f ${pCount} \u099f\u09bf` + (gCount ? `, \u0997\u09cd\u09b0\u09c1\u09aa ${gCount} \u099f\u09bf` : '');\n        } catch (err) {\n          summaryEl.style.color = '#b91c1c';\n          summaryEl.textContent = '\u26a0\ufe0f \u09ab\u09be\u0987\u09b2\u099f\u09bf \u09b8\u09a0\u09bf\u0995 JSON \u09ab\u09b0\u09ae\u09cd\u09af\u09be\u099f\u09c7 \u09a8\u09c7\u0987: ' + err.message;\n        }\n      };\n      reader.readAsText(file, 'UTF-8');\n    }\n\n    async function importMasterDbJson() {\n      const rawText = (document.getElementById('jsonImportTextInput')?.value || '').trim();\n      const mode = document.getElementById('jsonImportModeSelect')?.value || 'merge';\n      const statusEl = document.getElementById('jsonImportStatusMsg');\n      if (!rawText) {\n        alert('\u0985\u09a8\u09c1\u0997\u09cd\u09b0\u09b9 \u0995\u09b0\u09c7 \u09aa\u09cd\u09b0\u09a5\u09ae\u09c7 \u098f\u0995\u099f\u09bf .json \u09ab\u09be\u0987\u09b2 \u09b8\u09bf\u09b2\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09c1\u09a8 \u0985\u09a5\u09ac\u09be \u099f\u09c7\u0995\u09cd\u09b8\u099f \u09ac\u0995\u09cd\u09b8\u09c7 JSON \u09aa\u09c7\u09b8\u09cd\u099f \u0995\u09b0\u09c1\u09a8\u0964');\n        return;\n      }\n      let parsedJson = null;\n      try {\n        parsedJson = JSON.parse(rawText);\n      } catch (err) {\n        alert('JSON \u09ab\u09b0\u09ae\u09cd\u09af\u09be\u099f \u09b8\u09a0\u09bf\u0995 \u09a8\u09df: ' + err.message);\n        return;\n      }\n\n      if (mode === 'replace' && !confirm('\u09b8\u09a4\u09b0\u09cd\u0995\u09ac\u09be\u09b0\u09cd\u09a4\u09be: \u0986\u09aa\u09a8\u09bf \u0995\u09bf \u09ac\u09b0\u09cd\u09a4\u09ae\u09be\u09a8 \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b8\u09ae\u09cd\u09aa\u09c2\u09b0\u09cd\u09a3 \u09b0\u09bf\u09aa\u09cd\u09b2\u09c7\u09b8 \u0995\u09b0\u09c7 \u09ab\u09be\u0987\u09b2\u09c7\u09b0 \u09a1\u09be\u099f\u09be \u09ac\u09b8\u09be\u09a4\u09c7 \u099a\u09be\u09a8?')) {\n        return;\n      }\n\n      statusEl.style.color = '#1d4ed8';\n      statusEl.textContent = '\u23f3 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...';\n\n      try {\n        const res = await fetch('/api/master-db/import', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ mode, dbData: parsedJson })\n        });\n        const data = await res.json();\n        if (!data.ok) {\n          statusEl.style.color = '#b91c1c';\n          statusEl.textContent = '\u274c ' + (data.error || 'Import failed');\n          alert(data.error || 'Import failed');\n          return;\n        }\n        statusEl.style.color = '#047857';\n        statusEl.textContent = data.message || '\u2705 \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u09df\u09c7\u099b\u09c7!';\n        alert(data.message || '\u2705 JSON \u09a1\u09be\u099f\u09be\u09ac\u09c7\u09b8 \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u0987\u09ae\u09aa\u09cb\u09b0\u09cd\u099f \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      } catch (e) {\n        statusEl.style.color = '#b91c1c';\n        statusEl.textContent = '\u274c Error: ' + e.message;\n      }\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">\u0995\u09cb\u09a8\u09cb \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">\u09f3${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"\u09ae\u09c1\u099b\u09c1\u09a8\">\u00d7</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"\u09ad\u09c1\u09b2 \u09ac\u09be\u09a8\u09be\u09a8 \u09b2\u09bf\u0996\u09c1\u09a8...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ \u09af\u09cb\u0997</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">\u270f\ufe0f Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">\ud83d\uddd1\ufe0f</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`\u0986\u09aa\u09a8\u09bf \u0995\u09bf [${code}] \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u099f\u09bf \u09ae\u09c1\u099b\u09c7 \u09ab\u09c7\u09b2\u09a4\u09c7 \u099a\u09be\u09a8?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('\u09a1\u09bf\u09ab\u09b2\u09cd\u099f \u09ed\u09ef\u099f\u09bf \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u098f\u09ac\u0982 \u0985\u09ab\u09bf\u09b6\u09bf\u09df\u09be\u09b2 Trade Price \u09b0\u09bf\u09b8\u09cd\u099f\u09cb\u09b0 \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('\u2705 \u09a8\u09ae\u09cd\u09ac\u09b0\u0997\u09c1\u09b2\u09cb \u09b8\u09ab\u09b2\u09ad\u09be\u09ac\u09c7 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '\ud83d\udfe2 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '\ud83d\udcf2 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '\u23f3 ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '\ud83d\udfe2 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '\u26a0\ufe0f Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '\u26a1 RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '\u09f3' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        // Render Pending Resolutions Box (Always keep current input focus safe!)\n        window.latestPendingItems = pendings;\n        window.latestMessageLogs = data.messageLogs || [];\n        renderMessageLogsTable();\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        const activeTag = document.activeElement ? document.activeElement.id || '' : '';\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          if (!activeTag.startsWith('pendingAns_')) {\n            pList.innerHTML = pendings.map((p, idx) => {\n              const phoneLabel = (p.displayPhone && p.displayPhone !== '-' ? p.displayPhone : (p.senderPhone || 'Unknown')) + (p.senderPushName ? ' (' + p.senderPushName + ')' : '');\n              const fullMsg = p.rawText || p.rawLine || '';\n              if (p.type === 'UNKNOWN_DA') {\n                return `\n                  <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                    <div style=\"display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px;\">\n                      <b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09a4\u09bf\u09a8\u09bf\u09a7\u09bf (Unknown DA) ${p.detectedDaId ? `[\u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 ID: ${esc(p.detectedDaId)}]` : ''}</b>\n                      <span class=\"badge info\">📱 প্রেরকের নম্বর: ${esc(phoneLabel)}</span>\n                    </div>\n                    <div style=\"font-size:0.84rem; margin:6px 0;\">💊 <b>শনাক্তকৃত অর্ডার:</b> ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', ') || 'প্রোডাক্ট লিস্ট নিচে দেখুন')}</div>\n                    <div style=\"font-size:0.8rem; font-weight:700; margin-top:4px;\">📩 সম্পূর্ণ মেসেজ (Full Message):</div>\n                    <div style=\"white-space:pre-wrap; background:#FFFDF7; border:2px solid #000; padding:8px 10px; border-radius:6px; font-family:monospace; font-size:0.82rem; margin:4px 0 8px 0;\">${esc(fullMsg)}</div>\n                    <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;\">\n                      <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID \u0993 \u09a8\u09be\u09ae \u09b2\u09bf\u0996\u09c1\u09a8 (\u09af\u09c7\u09ae\u09a8: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                      <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\u2705 ID/নাম সেভ করুন</button>\n                      <button class=\"btn-blue btn-sm\" onclick=\"openEditPendingByIdx(${idx})\">✏️ মেসেজ এডিট ও সাবমিট</button>\n                      <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', '/cnl')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a4\u09bf\u09b2</button>\n                    </div>\n                  </div>\n                `;\n              } else {\n                return `\n                  <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                    <div style=\"display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px;\">\n                      <b>${esc(p.token)} \u2014 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f/\u09ac\u09be\u09a8\u09be\u09a8: \"${esc(p.unknownProductText)}\" (\u09aa\u09b0\u09bf\u09ae\u09be\u09a3: ${esc(p.orderedQty)})</b>\n                      <span class=\"badge info\">📱 প্রেরকের নম্বর: ${esc(phoneLabel)}</span>\n                    </div>\n                    <div style=\"font-size:0.84rem; margin:6px 0;\">👤 <b>প্রতিনিধি:</b> ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | <b>অপরিচিত লাইন:</b> \"${esc(p.rawLine)}\"</div>\n                    <div style=\"font-size:0.8rem; font-weight:700; margin-top:4px;\">📩 সম্পূর্ণ মেসেজ (Full Message):</div>\n                    <div style=\"white-space:pre-wrap; background:#FFFDF7; border:2px solid #000; padding:8px 10px; border-radius:6px; font-family:monospace; font-size:0.82rem; margin:4px 0 8px 0;\">${esc(fullMsg)}</div>\n                    <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;\">\n                      <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"\u09b8\u09a0\u09bf\u0995 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f\u09c7\u09b0 \u09a8\u09be\u09ae \u09ac\u09be \u0995\u09cb\u09a1 (\u09af\u09c7\u09ae\u09a8: Totifen \u09ac\u09be 919)\" style=\"max-width:320px;\" />\n                      <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">\ud83e\udde0 \u09ac\u09be\u09a8\u09be\u09a8 \u09b6\u09c7\u0996\u09be\u09a8 \u0993 \u09b8\u09c7\u09ad \u0995\u09b0\u09c1\u09a8</button>\n                      <button class=\"btn-blue btn-sm\" onclick=\"openEditPendingByIdx(${idx})\">✏️ মেসেজ এডিট ও সাবমিট</button>\n                      <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">\ud83d\uddd1\ufe0f \u09ac\u09be\u09a6 \u09a6\u09bf\u09a8</button>\n                    </div>\n                  </div>\n                `;\n              }\n            }).join('');\n          }\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">\u2705</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp \u09b8\u099a\u09b2 \u0986\u099b\u09c7!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">\u2601\ufe0f Cloud Session & Master DB Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp \u2794 Linked Devices \u09a5\u09c7\u0995\u09c7 \u09b8\u09cd\u0995\u09cd\u09af\u09be\u09a8 \u0995\u09b0\u09c1\u09a8</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">\ud83d\udd04 WhatsApp \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u09b9\u099a\u09cd\u099b\u09c7...</p>';\n        }\n\n        const jsonGrpEl = document.getElementById('jsonSavedGroupLabel');\n        if (jsonGrpEl) {\n          const tg = data.targetGroup || data.botConfig || {};\n          jsonGrpEl.textContent = (tg.targetGroupName || 'All Joined Groups') + (tg.targetGroupId && tg.targetGroupId !== 'ALL' ? ' [' + tg.targetGroupId + ']' : '');\n        }\n        const last5El = document.getElementById('last5MsgIdsLabel');\n        if (last5El) {\n          const ids = data.lastProcessedMsgIds || [];\n          last5El.textContent = ids.length > 0 ? ids.join(', ') : 'এখনো কোনো মেসেজ আইডি সেভ হয়নি';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        const savedGroupId = (data.targetGroup && data.targetGroup.targetGroupId) || data.botConfig.targetGroupId || '';\n        const savedGroupName = (data.targetGroup && data.targetGroup.targetGroupName) || data.botConfig.targetGroupName || '';\n        if (!groupInputTouched && document.activeElement !== select) {\n          select.innerHTML = '<option value=\"ALL\">\ud83c\udf10 All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa \u09a5\u09c7\u0995\u09c7 \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09bf\u09ac\u09c7)</option>';\n          let matchedOption = (savedGroupId === 'ALL' || !savedGroupId);\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (savedGroupId === g.id || (!savedGroupId && savedGroupName && g.subject.toLowerCase().trim() === savedGroupName.toLowerCase().trim())) {\n              opt.selected = true;\n              matchedOption = true;\n            }\n            select.appendChild(opt);\n          });\n          if (!matchedOption && savedGroupId && savedGroupId !== 'ALL') {\n            const pinnedOpt = document.createElement('option');\n            pinnedOpt.value = savedGroupId;\n            pinnedOpt.dataset.name = savedGroupName || savedGroupId;\n            pinnedOpt.textContent = '📌 ' + (savedGroupName || savedGroupId) + ' (Saved in master_db.json)';\n            pinnedOpt.selected = true;\n            select.appendChild(pinnedOpt);\n          }\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        window.latestRecentOrders = data.recentOrders || [];\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o, oIdx) =>\n                '<tr>' +\n                '<td>' + (o.sheetRowNumber ? '<span class=\"badge ok\">📍 Row ' + esc(o.sheetRowNumber) + '</span>' : '<span class=\"badge warn\">Saved</span>') + '</td>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>\u09f3' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">\u09f3' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td style=\"white-space:nowrap;\">' + esc(o.matchType) + '<br/><button class=\"btn-blue btn-sm\" style=\"margin-top:4px;\" onclick=\"openEditOrderByIdx(' + oIdx + ')\">✏️ Edit</button></td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"11\" style=\"text-align:center; font-weight:700;\">\u09ae\u09c7\u09ae\u09cb\u09b0\u09bf \u09ac\u09be\u09ab\u09be\u09b0\u09c7 \u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09a8\u09c7\u0987\u0964</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (\u09b8\u09ac \u0997\u09cd\u09b0\u09c1\u09aa)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('\u0997\u09cd\u09b0\u09c1\u09aa \u09b2\u09bf\u09b8\u09cd\u099f \u0986\u09aa\u09a1\u09c7\u099f \u09b9\u09df\u09c7\u099b\u09c7! \u09ae\u09cb\u099f \u0997\u09cd\u09b0\u09c1\u09aa: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '\u2705 \u0997\u09cd\u09b0\u09c1\u09aa \u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u09b8\u09c7\u09ad \u09b9\u09df\u09c7\u099b\u09c7: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '\u2705 Google Sheet-\u098f \u09b8\u09ac \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u0993 DA \u09a4\u09be\u09b2\u09bf\u0995\u09be \u09b8\u09bf\u0999\u09cd\u0995 \u09b9\u09df\u09c7\u099b\u09c7!' : '\u26a0\ufe0f Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">\ud83d\udc64 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) \u2014 ${data.daInfo.isKnownDA ? '\u2705 \u09aa\u09b0\u09bf\u099a\u09bf\u09a4' : '\u2753 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 (Admin \u09aa\u09cd\u09b0\u09b6\u09cd\u09a8 \u09aa\u09be\u09a0\u09be\u09a8\u09cb \u09b9\u09ac\u09c7)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">\u2705 \u09b6\u09a8\u09be\u0995\u09cd\u09a4\u0995\u09c3\u09a4 \u0985\u09b0\u09cd\u09a1\u09be\u09b0: ${data.orders.length}\u099f\u09bf</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">\ud83e\udd14 \u0985\u09aa\u09b0\u09bf\u099a\u09bf\u09a4 \u09aa\u09cd\u09b0\u09cb\u09a1\u09be\u0995\u09cd\u099f \u09ac\u09be\u09a8\u09be\u09a8: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || '\u0995\u09cb\u09a8\u09cb \u0985\u09b0\u09cd\u09a1\u09be\u09b0 \u09aa\u09be\u0993\u09df\u09be \u09af\u09be\u09df\u09a8\u09bf\u0964';\n      fetchStatus();\n    }\n\n    function renderMessageLogsTable() {\n      const tbody = document.getElementById('messageLogsTableBody');\n      if (!tbody) return;\n      const filterVal = document.getElementById('msgLogFilterSelect')?.value || 'ALL';\n      const q = (document.getElementById('msgLogSearchInput')?.value || '').trim().toLowerCase();\n      const allLogs = window.latestMessageLogs || [];\n      const filtered = allLogs.filter((m) => {\n        if (filterVal === 'SAVED' && !m.isSaved) return false;\n        if (filterVal === 'UNSAVED' && m.isSaved) return false;\n        if (!q) return true;\n        return `${m.whatsappMsgId} ${m.senderPhone} ${m.senderPushName} ${m.daId} ${m.daName} ${m.fullMessage} ${m.sheetRowText} ${m.note}`.toLowerCase().includes(q);\n      });\n      if (filtered.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" style=\"text-align:center; font-weight:700;\">কোনো মেসেজ লগ পাওয়া যায়নি।</td></tr>';\n        return;\n      }\n      tbody.innerHTML = filtered.map((m, idx) => {\n        const origIdx = allLogs.indexOf(m);\n        const statusBadge = m.isSaved\n          ? '<span class=\"badge ok\">✅ সেভ হয়েছে</span>'\n          : '<span class=\"badge err\">❌ সেভ হয়নি</span>';\n        const rowBadge = m.isSaved && m.sheetRowText && !m.sheetRowText.startsWith('❌')\n          ? `<span class=\"badge info\">📍 ${esc(m.sheetRowText)}</span>`\n          : '<span class=\"badge err\">❌ নেই</span>';\n        return `\n          <tr>\n            <td style=\"white-space:nowrap;\">${statusBadge}</td>\n            <td style=\"white-space:nowrap; font-weight:800;\">${rowBadge}</td>\n            <td style=\"white-space:nowrap;\"><b>${esc(m.date)}</b><br/>${esc(m.time)}</td>\n            <td><b>${esc(m.senderPhone || '-')}</b><br/><span style=\"font-size:0.76rem;\">${esc(m.senderPushName || '')}</span></td>\n            <td><b>${esc(m.daId || '-')}</b><br/><span>${esc(m.daName || '-')}</span></td>\n            <td style=\"white-space:pre-wrap; font-family:monospace; font-size:0.79rem; min-width:220px; max-width:360px;\">${esc(m.fullMessage || '-')}</td>\n            <td style=\"font-size:0.78rem; font-weight:700;\">${esc(m.note || '-')}</td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"openEditLogByIdx(${origIdx})\">✏️ এডিট ও সাবমিট</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function openEditMsgModal(msgId, token, phone, daText, fullText) {\n      document.getElementById('editModalMsgId').value = msgId || '';\n      document.getElementById('editModalToken').value = token || '';\n      document.getElementById('editModalPhone').value = phone && phone !== '-' ? phone : '';\n      document.getElementById('editModalDaText').value = daText && daText !== '-' && !daText.startsWith('UNRESOLVED') ? daText : '';\n      document.getElementById('editModalText').value = fullText || '';\n      document.getElementById('editModalStatus').textContent = '';\n      document.getElementById('editMsgModal').style.display = 'flex';\n    }\n\n    function closeEditMsgModal() {\n      document.getElementById('editMsgModal').style.display = 'none';\n    }\n\n    function openEditPendingByIdx(idx) {\n      const p = (window.latestPendingItems || [])[idx];\n      if (!p) return;\n      const ph = (p.displayPhone && p.displayPhone !== '-' ? p.displayPhone : p.senderPhone) || '';\n      const daStr = p.daInfo && p.daInfo.isKnownDA ? `${p.daInfo.daId} ${p.daInfo.name}` : (p.detectedDaId || '');\n      openEditMsgModal(p.whatsappMsgId || '', p.token || '', ph, daStr, p.rawText || p.rawLine || '');\n    }\n\n    function openEditLogByIdx(idx) {\n      const m = (window.latestMessageLogs || [])[idx];\n      if (!m) return;\n      const daStr = m.daId && m.daId !== '-' && m.daId !== 'UNRESOLVED' ? `${m.daId} ${m.daName !== '-' ? m.daName : ''}`.trim() : '';\n      openEditMsgModal(m.whatsappMsgId || '', '', m.senderPhone || '', daStr, m.fullMessage || '');\n    }\n\n    function openEditOrderByIdx(idx) {\n      const o = (window.latestRecentOrders || [])[idx];\n      if (!o) return;\n      const logMatch = (window.latestMessageLogs || []).find((m) => m.whatsappMsgId === o.whatsappMsgId);\n      const fullTxt = logMatch && logMatch.fullMessage ? logMatch.fullMessage : `${o.daId} ${o.daName}\nPSO: ${o.psoCode}\nCus: ${o.pharmacyName}\n${o.rawText}`;\n      openEditMsgModal(o.whatsappMsgId || '', '', o.senderPhone || '', `${o.daId} ${o.daName}`, fullTxt);\n    }\n\n    async function submitEditedMessageFromWeb() {\n      const whatsappMsgId = document.getElementById('editModalMsgId').value;\n      const pendingToken = document.getElementById('editModalToken').value;\n      const senderPhone = document.getElementById('editModalPhone').value;\n      const overrideDaText = document.getElementById('editModalDaText').value;\n      const editedText = document.getElementById('editModalText').value;\n      const statusEl = document.getElementById('editModalStatus');\n\n      if (!editedText.trim()) {\n        alert('অনুগ্রহ করে মেসেজের লেখা দিন।');\n        return;\n      }\n      statusEl.style.color = '#1d4ed8';\n      statusEl.textContent = '⏳ মেসেজটি পার্স করে Google Sheet-এ সেভ করা হচ্ছে...';\n      try {\n        const res = await fetch('/api/message/edit-submit', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ whatsappMsgId, pendingToken, senderPhone, overrideDaText, editedText })\n        });\n        const data = await res.json();\n        if (!data.ok) {\n          statusEl.style.color = '#b91c1c';\n          statusEl.textContent = '❌ ' + (data.error || 'Error saving edited message');\n          return;\n        }\n        statusEl.style.color = '#047857';\n        statusEl.textContent = data.message || '✅ সফলভাবে সেভ হয়েছে!';\n        setTimeout(() => {\n          closeEditMsgModal();\n          fetchStatus();\n          loadMasterDb();\n        }, 600);\n      } catch (e) {\n        statusEl.style.color = '#b91c1c';\n        statusEl.textContent = '❌ Error: ' + e.message;\n      }\n    }\n\n    async function syncRowsFromSheetNow() {\n      await fetch('/api/message-logs/sync-rows', { method: 'POST' });\n      await fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('\u09a8\u09a4\u09c1\u09a8 WhatsApp \u0985\u09cd\u09af\u09be\u0995\u09be\u0989\u09a8\u09cd\u099f \u0995\u09be\u09a8\u09c7\u0995\u09cd\u099f \u0995\u09b0\u09a4\u09c7 \u099a\u09be\u09a8?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
+  res.send("<!DOCTYPE html>\n<html lang=\"bn\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Renata CRP Order Tracker v6.0 — Dynamic Master DB & Self-Learning AI</title>\n  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n  <link href=\"https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap\" rel=\"stylesheet\">\n  <style>\n    :root {\n      --bg: #FFFDF7;\n      --ink: #000000;\n      --yellow: #FFE600;\n      --mint: #6EE7B7;\n      --sky: #7DD3FC;\n      --pink: #FF90E8;\n      --coral: #FDA4AF;\n      --lavender: #C4B5FD;\n      --orange: #FDBA74;\n      --white: #FFFFFF;\n      --border: 3px solid #000000;\n      --shadow: 6px 6px 0px #000000;\n      --shadow-sm: 4px 4px 0px #000000;\n    }\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body {\n      font-family: 'Space Grotesk', 'Hind Siliguri', sans-serif;\n      background-color: var(--bg);\n      background-image: radial-gradient(#000000 1.1px, transparent 1.1px);\n      background-size: 22px 22px;\n      color: var(--ink);\n      line-height: 1.5;\n      padding: 16px;\n    }\n    .container { max-width: 1320px; margin: 0 auto; }\n\n    header {\n      display: flex;\n      flex-wrap: wrap;\n      justify-content: space-between;\n      align-items: center;\n      gap: 14px;\n      background: var(--yellow);\n      border: 3.5px solid var(--ink);\n      box-shadow: 7px 7px 0px var(--ink);\n      padding: 18px 22px;\n      border-radius: 12px;\n      margin-bottom: 18px;\n    }\n    header h1 { font-size: 1.4rem; font-weight: 800; text-transform: uppercase; }\n    header p { font-size: 0.9rem; font-weight: 700; opacity: 0.85; margin-top: 2px; }\n\n    .badge {\n      display: inline-flex;\n      align-items: center;\n      gap: 5px;\n      padding: 6px 12px;\n      border-radius: 8px;\n      font-size: 0.8rem;\n      font-weight: 800;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      background: var(--white);\n    }\n    .badge.ok { background: var(--mint); }\n    .badge.warn { background: var(--orange); }\n    .badge.err { background: var(--coral); }\n    .badge.info { background: var(--lavender); }\n\n    .nav-tabs {\n      display: flex;\n      flex-wrap: wrap;\n      gap: 10px;\n      margin-bottom: 20px;\n    }\n    .tab-btn {\n      cursor: pointer;\n      border: 3px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 10px 18px;\n      border-radius: 10px;\n      font-weight: 800;\n      font-size: 0.92rem;\n      background: var(--white);\n      color: var(--ink);\n      transition: all 0.1s ease;\n    }\n    .tab-btn.active {\n      background: var(--ink) !important;\n      color: var(--yellow) !important;\n      transform: translate(2px, 2px);\n      box-shadow: 2px 2px 0px var(--ink);\n    }\n\n    .tab-panel { display: none; }\n    .tab-panel.active { display: block; }\n\n    .stats-row {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));\n      gap: 14px;\n      margin-bottom: 20px;\n    }\n    .stat-card {\n      border: var(--border);\n      box-shadow: var(--shadow-sm);\n      padding: 14px 16px;\n      border-radius: 10px;\n    }\n    .stat-card.c1 { background: #A7F3D0; }\n    .stat-card.c2 { background: #BAE6FD; }\n    .stat-card.c3 { background: #FEF08A; }\n    .stat-card.c4 { background: #FECDD3; }\n    .stat-card.c5 { background: #DDD6FE; }\n    .stat-card .lbl { font-size: 0.76rem; font-weight: 800; text-transform: uppercase; }\n    .stat-card .val { font-size: 1.35rem; font-weight: 800; margin-top: 4px; }\n\n    .grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));\n      gap: 20px;\n      margin-bottom: 22px;\n    }\n    .card {\n      background: var(--white);\n      border: var(--border);\n      box-shadow: var(--shadow);\n      border-radius: 12px;\n      overflow: hidden;\n      margin-bottom: 20px;\n    }\n    .card-header {\n      padding: 13px 18px;\n      border-bottom: var(--border);\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      gap: 10px;\n      flex-wrap: wrap;\n      font-weight: 800;\n      font-size: 1rem;\n    }\n    .card-header.h-pink { background: var(--pink); }\n    .card-header.h-mint { background: var(--mint); }\n    .card-header.h-sky { background: var(--sky); }\n    .card-header.h-yellow { background: var(--yellow); }\n    .card-header.h-lavender { background: var(--lavender); }\n    .card-header.h-orange { background: var(--orange); }\n    .card-body { padding: 18px; }\n\n    .qr-box {\n      display: flex;\n      flex-direction: column;\n      align-items: center;\n      justify-content: center;\n      padding: 16px;\n      background: #FFFDF7;\n      border: 2.5px dashed var(--ink);\n      border-radius: 10px;\n      min-height: 220px;\n      text-align: center;\n    }\n    .qr-box img {\n      max-width: 210px;\n      border-radius: 8px;\n      border: 3px solid var(--ink);\n      box-shadow: var(--shadow-sm);\n      margin-bottom: 10px;\n      background: #fff;\n    }\n\n    label { display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 5px; margin-top: 10px; }\n    select, input[type=\"text\"], input[type=\"number\"], input[type=\"password\"], textarea {\n      width: 100%;\n      background: #FFFDF7;\n      border: 2.5px solid var(--ink);\n      box-shadow: 3px 3px 0px var(--ink);\n      color: var(--ink);\n      padding: 9px 12px;\n      border-radius: 8px;\n      font-size: 0.9rem;\n      font-weight: 600;\n      font-family: inherit;\n      outline: none;\n    }\n    select:focus, input:focus, textarea:focus { background: #FEF9C3; }\n    textarea { min-height: 100px; font-family: monospace; resize: vertical; }\n\n    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }\n    button, .btn-link {\n      cursor: pointer;\n      border: 2.5px solid var(--ink);\n      box-shadow: 4px 4px 0px var(--ink);\n      padding: 9px 14px;\n      border-radius: 8px;\n      font-weight: 800;\n      font-size: 0.84rem;\n      font-family: inherit;\n      display: inline-flex;\n      align-items: center;\n      gap: 6px;\n      text-decoration: none;\n      color: var(--ink);\n      background: var(--white);\n      transition: transform 0.08s ease, box-shadow 0.08s ease;\n    }\n    button:hover, .btn-link:hover { transform: translate(1.5px, 1.5px); box-shadow: 2.5px 2.5px 0px var(--ink); }\n    button:active, .btn-link:active { transform: translate(3.5px, 3.5px); box-shadow: 0px 0px 0px var(--ink); }\n    .btn-primary { background: var(--mint); }\n    .btn-blue { background: var(--sky); }\n    .btn-yellow { background: var(--yellow); }\n    .btn-pink { background: var(--pink); }\n    .btn-danger { background: var(--coral); }\n    .btn-sm { padding: 5px 10px; font-size: 0.76rem; box-shadow: 2.5px 2.5px 0px var(--ink); }\n\n    .table-wrap {\n      overflow-x: auto;\n      max-height: 460px;\n      overflow-y: auto;\n      border: 2.5px solid var(--ink);\n      border-radius: 8px;\n    }\n    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; background: var(--white); }\n    th, td {\n      padding: 9px 11px;\n      border-bottom: 2px solid var(--ink);\n      border-right: 1.5px solid var(--ink);\n      text-align: left;\n    }\n    th {\n      background: var(--ink);\n      color: var(--yellow);\n      font-weight: 800;\n      text-transform: uppercase;\n      position: sticky;\n      top: 0;\n      z-index: 2;\n    }\n    tr:nth-child(even) td { background: #FFFDF5; }\n    tr:hover td { background: #FEF08A; }\n\n    .alias-chip {\n      display: inline-flex;\n      align-items: center;\n      gap: 4px;\n      background: #FEF9C3;\n      border: 1.5px solid #000;\n      padding: 2px 7px;\n      border-radius: 6px;\n      font-size: 0.75rem;\n      font-weight: 700;\n      margin: 2px;\n    }\n\n    .log-box {\n      background: #111827;\n      border: 3px solid var(--ink);\n      border-radius: 8px;\n      padding: 12px;\n      height: 210px;\n      overflow-y: auto;\n      font-family: monospace;\n      font-size: 0.8rem;\n      color: #A7F3D0;\n    }\n    .log-box div { padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.12); }\n\n    @media (max-width: 640px) {\n      body { padding: 10px; }\n      .grid { grid-template-columns: 1fr; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <div>\n        <h1>⚡ Renata PLC (NK Depot) — CRP Order Bot v6.0</h1>\n        <p>Dynamic JSON Master DB • Multi-Chunk Cloud Backup (50K Limit Proof) • All Message Logs & Auto Row Sync</p>\n      </div>\n      <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n        <span id=\"waBadge\" class=\"badge warn\">⏳ WhatsApp...</span>\n        <span id=\"sheetBadge\" class=\"badge warn\">⏳ Sheet...</span>\n        <span id=\"ramBadge\" class=\"badge info\">⚡ RAM: -- MB</span>\n        <a id=\"openSheetBtn\" href=\"#\" target=\"_blank\" class=\"btn-link btn-blue\">📊 Google Sheet ↗</a>\n      </div>\n    </header>\n\n    <div class=\"nav-tabs\">\n      <button class=\"tab-btn active\" onclick=\"switchTab('tab-control', this)\">📡 ১. বট কন্ট্রোল ও লাইভ অর্ডার</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-da', this)\">👥 ২. প্রতিনিধি ডেটাবেস (<span id=\"navDaCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-products', this)\">💊 ৩. প্রোডাক্ট ও ভুল বানান (<span id=\"navProdCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-groups', this)\">🧩 ৪. প্রোডাক্ট কমন গ্রুপ ও কিওয়ার্ড (<span id=\"navGrpCount\">0</span>)</button>\n      <button class=\"tab-btn\" onclick=\"switchTab('tab-phones', this)\">📱 ৫. অ্যাডমিন সেটিংস ও JSON ইমপোর্ট</button>\n    </div>\n\n    <div id=\"tab-control\" class=\"tab-panel active\">\n      <div class=\"stats-row\">\n        <div class=\"stat-card c1\">\n          <div class=\"lbl\">🎯 সক্রিয় গ্রুপ</div>\n          <div class=\"val\" id=\"statGroup\" style=\"font-size:1rem;\">Loading...</div>\n        </div>\n        <div class=\"stat-card c2\">\n          <div class=\"lbl\">📦 মোট সেভ অর্ডার</div>\n          <div class=\"val\" id=\"statSaved\">0</div>\n        </div>\n        <div class=\"stat-card c3\">\n          <div class=\"lbl\">💰 মোট অর্ডার (৳)</div>\n          <div class=\"val\" id=\"statAmount\">৳0.00</div>\n        </div>\n        <div class=\"stat-card c4\">\n          <div class=\"lbl\">❓ পেন্ডিং প্রশ্ন (Admin)</div>\n          <div class=\"val\" id=\"statPending\">0</div>\n        </div>\n        <div class=\"stat-card c5\">\n          <div class=\"lbl\">📲 অ্যাডমিন অ্যালার্ট নম্বর</div>\n          <div class=\"val\" id=\"statAdminPhones\" style=\"font-size:0.86rem; line-height:1.35;\">+8801793362829</div>\n        </div>\n      </div>\n\n      <div id=\"pendingCard\" class=\"card\" style=\"display:none;\">\n        <div class=\"card-header h-orange\">\n          <span>❓ অপরিচিত প্রতিনিধি (DA) ও প্রোডাক্ট প্রশ্নসমূহ (WhatsApp 01793362829 অথবা এখান থেকে উত্তর দিন)</span>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"pendingListContainer\"></div>\n        </div>\n      </div>\n\n      <div class=\"grid\">\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-pink\">\n            <span>১. WhatsApp কানেকশন</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"logoutWhatsApp()\">Change Account</button>\n          </div>\n          <div class=\"card-body\">\n            <div id=\"qrContainer\" class=\"qr-box\">\n              <p style=\"font-weight:700;\">Loading WhatsApp status...</p>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>২. WhatsApp গ্রুপ সেটিংস</span>\n            <button class=\"btn-yellow btn-sm\" onclick=\"refreshGroups()\">🔄 গ্রুপ রিফ্রেশ</button>\n          </div>\n          <div class=\"card-body\">\n            <label>আপনার WhatsApp গ্রুপ সিলেক্ট করুন:</label>\n            <select id=\"groupSelect\" onchange=\"onGroupDropdownChange()\">\n              <option value=\"ALL\">🌐 All Joined Groups (সব গ্রুপ থেকে অর্ডার নিবে)</option>\n            </select>\n            <label>অথবা নির্দিষ্ট গ্রুপের নাম:</label>\n            <input type=\"text\" id=\"targetGroupNameInput\" placeholder=\"e.g. CRP sales NK Depot\" oninput=\"onGroupNameManualInput()\" />\n            <input type=\"hidden\" id=\"targetGroupIdInput\" />\n\n            <label style=\"display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;\">\n              <input type=\"checkbox\" id=\"autoReactCheckbox\" style=\"width:18px; height:18px; accent-color:#000;\" checked />\n              অর্ডার সেভ হলে মেসেজে অটোমেটিক ✅ রিয়েকশন দিবে\n            </label>\n\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"saveGroupConfig()\">💾 Save Group Settings</button>\n              <button class=\"btn-blue\" onclick=\"syncSheetStructure()\">📊 Sync DB to Sheet</button>\n            </div>\n            <p id=\"saveStatusMsg\" style=\"font-size:0.84rem; font-weight:800; color:#047857; margin-top:8px;\"></p>\n            <div style=\"margin-top:10px; padding:9px 11px; background:#FEF9C3; border:2px solid #000; border-radius:8px; font-size:0.78rem; font-weight:700;\">\n              <div>📌 <b>JSON-এ সেভ থাকা গ্রুপ:</b> <span id=\"jsonSavedGroupLabel\">Loading...</span></div>\n              <div style=\"margin-top:4px;\">🆔 <b>সর্বশেষ ৫টি মেসেজ আইডি (master_db.json):</b> <span id=\"last5MsgIdsLabel\" style=\"font-family:monospace; word-break:break-all;\">None</span></div>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-sky\">\n            <span>🧪 ৩. অর্ডার ও সেলফ-লার্নিং টেস্টার</span>\n          </div>\n          <div class=\"card-body\">\n            <label>অর্ডার মেসেজ লিখে টেস্ট করুন (অপরিচিত নাম/ওষুধ দিলে 01793362829-এ প্রশ্ন পাঠাবে):</label>\n            <textarea id=\"testInput\">CF4526 Seraj\nPso t-23\nCus: Nipun pharmacy\nTotifen 50\nDoxicup 10 pes</textarea>\n            <div class=\"btn-row\">\n              <button class=\"btn-yellow\" onclick=\"runTestParse(false)\">🔍 Test Parser</button>\n              <button class=\"btn-primary\" onclick=\"runTestParse(true)\">🚀 Test & Save / Ask Admin</button>\n            </div>\n            <div id=\"testResultBox\" style=\"margin-top:10px; font-size:0.82rem; font-weight:600;\"></div>\n          </div>\n        </div>\n      </div>\n\n      <div id=\"editMsgModal\" style=\"display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:9999; padding:16px; overflow-y:auto; align-items:center; justify-content:center;\">\n        <div class=\"card\" style=\"max-width:640px; width:100%; margin:40px auto; border:3.5px solid #000; box-shadow:8px 8px 0px #000;\">\n          <div class=\"card-header h-mint\">\n            <span>✏️ মেসেজ এডিট করে Google Sheet-এ সাবমিট করুন (Edit & Submit Order)</span>\n            <button class=\"btn-danger btn-sm\" onclick=\"closeEditMsgModal()\">✖ বন্ধ করুন</button>\n          </div>\n          <div class=\"card-body\">\n            <input type=\"hidden\" id=\"editModalMsgId\" />\n            <input type=\"hidden\" id=\"editModalToken\" />\n            <div style=\"display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px;\">\n              <div>\n                <label style=\"margin-top:0;\">📱 প্রেরকের মোবাইল নম্বর (Sender Number):</label>\n                <input type=\"text\" id=\"editModalPhone\" placeholder=\"+88017...\" />\n              </div>\n              <div>\n                <label style=\"margin-top:0;\">👤 প্রতিনিধির ID ও নাম (যেমন: CF4526 Seraj):</label>\n                <input type=\"text\" id=\"editModalDaText\" placeholder=\"মেসেজে লেখা না থাকলে এখানে দিন (ঐচ্ছিক)\" />\n              </div>\n            </div>\n            <label>📩 সম্পূর্ণ মেসেজ (এখানে ভুল বানান, PSO কোড, ID বা পরিমাণ ঠিক করুন):</label>\n            <textarea id=\"editModalText\" style=\"min-height:150px; font-size:0.9rem; line-height:1.45;\"></textarea>\n            <div id=\"editModalStatus\" style=\"margin-top:8px; font-size:0.84rem; font-weight:800;\"></div>\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"submitEditedMessageFromWeb()\">🚀 সংশোধন করে সাবমিট ও Google Sheet-এ সেভ করুন</button>\n              <button class=\"btn-danger\" onclick=\"closeEditMsgModal()\">বাতিল</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>📨 সব মেসেজ লগ — কোন মেসেজ সেভ হয়েছে (✅) আর কোনটি হয়নি (❌) এবং Google Sheet Row নম্বর</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center;\">\n            <select id=\"msgLogFilterSelect\" onchange=\"renderMessageLogsTable()\" style=\"width:auto; padding:5px 10px; font-size:0.78rem;\">\n              <option value=\"ALL\">📋 সব মেসেজ (All)</option>\n              <option value=\"SAVED\">✅ শুধু সেভ হওয়া (Saved)</option>\n              <option value=\"UNSAVED\">❌ সেভ না হওয়া (Not Saved)</option>\n            </select>\n            <input type=\"text\" id=\"msgLogSearchInput\" placeholder=\"🔍 মেসেজ, Row বা নম্বর খুঁজুন...\" oninput=\"renderMessageLogsTable()\" style=\"width:200px; padding:5px 10px; font-size:0.78rem;\" />\n            <button class=\"btn-yellow btn-sm\" onclick=\"syncRowsFromSheetNow()\">🔄 Row নম্বর সিঙ্ক</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"openEditMsgModal('', '', '', '', '')\">➕ নতুন মেসেজ লিখে সাবমিট</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\" style=\"max-height:480px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>স্ট্যাটাস (✅/❌)</th>\n                  <th>Google Sheet Row নং</th>\n                  <th>তারিখ ও সময়</th>\n                  <th>প্রেরকের নম্বর ও নাম</th>\n                  <th>প্রতিনিধি (DA)</th>\n                  <th>সম্পূর্ণ মেসেজ (Full Message)</th>\n                  <th>বিবরণ / নোট</th>\n                  <th>অ্যাকশন (Edit & Submit)</th>\n                </tr>\n              </thead>\n              <tbody id=\"messageLogsTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>📋 সর্বশেষ ট্র্যাক হওয়া অর্ডারসমূহ (Live Parsed Orders)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearLiveOrders()\">🧹 Clear Orders List</button>\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Sheet Row</th>\n                  <th>Date & Time</th>\n                  <th>DA ID & Name</th>\n                  <th>PSO</th>\n                  <th>Pharmacy</th>\n                  <th>Raw Text</th>\n                  <th>Product</th>\n                  <th>Qty</th>\n                  <th>TP</th>\n                  <th>Total</th>\n                  <th>Match / Edit</th>\n                </tr>\n              </thead>\n              <tbody id=\"ordersTableBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>🖥️ সিস্টেম লগ (Live Server Logs)</span>\n          <button class=\"btn-danger btn-sm\" onclick=\"clearServerLogs()\">🧹 Clear Server Logs</button>\n        </div>\n        <div class=\"card-body\">\n          <div id=\"logBox\" class=\"log-box\"></div>\n        </div>\n      </div>\n    </div>\n\n    <div id=\"tab-da\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-mint\">\n          <span>➕ নতুন প্রতিনিধি (DA) যোগ করুন অথবা এডিট করুন</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetDaForm()\">🔄 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetAllDasToDefault()\">♻️ ডিফল্ট ৪৬ জন রিস্টোর করুন</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteAllDas()\">🗑️ সব DA মুছে ফেলুন (Remove All)</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"daOriginalId\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px;\">\n            <div>\n              <label>Primary DA ID (যেমন: CF4526, RF20363):</label>\n              <input type=\"text\" id=\"daIdInput\" placeholder=\"e.g. CF9988\" />\n            </div>\n            <div>\n              <label>Alt / Old ID (ঐচ্ছিক):</label>\n              <input type=\"text\" id=\"daAltIdInput\" placeholder=\"e.g. C122210\" />\n            </div>\n            <div>\n              <label>প্রতিনিধির নাম (DA Name):</label>\n              <input type=\"text\" id=\"daNameInput\" placeholder=\"e.g. Md Karim Uddin\" />\n            </div>\n            <div>\n              <label>মোবাইল নম্বর (কমা দিয়ে একাধিক দেওয়া যাবে):</label>\n              <input type=\"text\" id=\"daPhonesInput\" placeholder=\"e.g. 01711223344\" />\n            </div>\n            <div>\n              <label>ডাকনাম / Aliases (কমা দিয়ে):</label>\n              <input type=\"text\" id=\"daAliasesInput\" placeholder=\"e.g. karim, karim da\" />\n            </div>\n          </div>\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveDaRecord()\">💾 প্রতিনিধি সেভ করুন (Save DA)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>👥 বর্তমান প্রতিনিধি তালিকা (Total DAs: <span id=\"daTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"daSearchInput\" placeholder=\"🔍 ID, নাম বা মোবাইল দিয়ে খুঁজুন...\" oninput=\"renderDaTable()\" style=\"max-width:280px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>#</th>\n                  <th>DA ID</th>\n                  <th>Alt ID</th>\n                  <th>প্রতিনিধির নাম (Name)</th>\n                  <th>মোবাইল নম্বর</th>\n                  <th>Aliases / ডাকনাম</th>\n                  <th>অ্যাকশন (Edit / Delete)</th>\n                </tr>\n              </thead>\n              <tbody id=\"daDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <div id=\"tab-products\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-sky\">\n          <span>💊 নতুন প্রোডাক্ট যোগ করুন অথবা দাম ও ভুল বানান (Aliases) এডিট করুন</span>\n          <div style=\"display:flex; gap:8px;\">\n            <button class=\"btn-yellow btn-sm\" onclick=\"resetProductForm()\">🔄 Clear Form</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetProductsToDefault()\">♻️ ডিফল্ট ৭৯টি প্রোডাক্ট রিস্টোর করুন</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <input type=\"hidden\" id=\"prodOriginalCode\" />\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px;\">\n            <div>\n              <label>CRP Code (যেমন: 919, CS7):</label>\n              <input type=\"text\" id=\"prodCodeInput\" placeholder=\"e.g. 919\" />\n            </div>\n            <div>\n              <label>প্রোডাক্টের নাম (Official Name):</label>\n              <input type=\"text\" id=\"prodNameInput\" placeholder=\"e.g. TOTIFEN SYRUP 100ML\" />\n            </div>\n            <div>\n              <label>প্যাক সাইজ (Pack Unit):</label>\n              <input type=\"text\" id=\"prodUnitInput\" placeholder=\"e.g. Bottle (100ml)\" />\n            </div>\n            <div>\n              <label>Trade Price (৳ দর):</label>\n              <input type=\"number\" step=\"0.01\" id=\"prodPriceInput\" placeholder=\"e.g. 47.23\" />\n            </div>\n            <div>\n              <label>Brand Family / গ্রুপ নাম (ঐচ্ছিক):</label>\n              <input type=\"text\" id=\"prodFamilyInput\" placeholder=\"e.g. LUCAN-R, TOTIFEN\" />\n            </div>\n          </div>\n          <label>ভুল বানান লিস্ট / Aliases (কমা দিয়ে লিখুন — যেকোনো বানান লিখলেই এই প্রোডাক্ট চিনে নেবে):</label>\n          <input type=\"text\" id=\"prodAliasesInput\" placeholder=\"e.g. totifen, totipen, totifin, toti syp, totifen 100\" />\n          <div class=\"btn-row\">\n            <button class=\"btn-primary\" onclick=\"saveProductRecord()\">💾 প্রোডাক্ট ও বানান সেভ করুন (Save Product)</button>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-pink\">\n          <span>💊 সব প্রোডাক্ট ও ভুল বানান ডেটাবেস (Total: <span id=\"prodTotalLabel\">0</span>)</span>\n          <input type=\"text\" id=\"prodSearchInput\" placeholder=\"🔍 প্রোডাক্টের নাম, কোড বা ভুল বানান খুঁজুন...\" oninput=\"renderProductTable()\" style=\"max-width:300px; padding:6px 10px;\" />\n        </div>\n        <div class=\"card-body\">\n          <div class=\"table-wrap\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Code</th>\n                  <th>প্রোডাক্টের নাম ও প্যাক</th>\n                  <th>Trade Price (৳)</th>\n                  <th>ভুল বানান সমূহ (Recognized Wrong Spellings / Aliases)</th>\n                  <th>নতুন বানান যোগ</th>\n                  <th>অ্যাকশন</th>\n                </tr>\n              </thead>\n              <tbody id=\"productDatabaseBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <div id=\"tab-groups\" class=\"tab-panel\">\n      <div class=\"card\">\n        <div class=\"card-header h-yellow\">\n          <span>🧩 প্রোডাক্ট কমন গ্রুপ ও কিওয়ার্ড ম্যানেজার (Total Groups: <span id=\"grpTotalLabel\">0</span>)</span>\n          <div style=\"display:flex; gap:8px; flex-wrap:wrap;\">\n            <input type=\"text\" id=\"newGroupNameInput\" placeholder=\"গ্রুপ নাম (e.g. LUCAN-R)\" style=\"max-width:170px; padding:6px 10px;\" />\n            <input type=\"text\" id=\"newGroupKeywordsInput\" placeholder=\"কমন কিওয়ার্ড (e.g. lucanr, luen, luncanr)\" style=\"max-width:260px; padding:6px 10px;\" />\n            <button class=\"btn-primary btn-sm\" onclick=\"saveBrandGroup()\">💾 গ্রুপ সেভ করুন</button>\n            <button class=\"btn-blue btn-sm\" onclick=\"resetBrandGroupsToDefault()\">♻️ ডিফল্ট গ্রুপ রিস্টোর</button>\n          </div>\n        </div>\n        <div class=\"card-body\">\n          <p style=\"font-size:0.85rem; font-weight:700; margin-bottom:12px;\">\n            💡 <b>কীভাবে কাজ করে:</b> একই নামের একাধিক প্রোডাক্ট (যেমন: <code>LUCAN-R 200</code>, <code>LUCAN-R 150</code>, <code>LUCAN-R 50</code>, <code>LUCAN-R SYP</code>) একই গ্রুপে থাকে। কোনো একটি ভ্যারিয়েন্টের জন্য নতুন বানান (যেমন: <code>luen 200</code> বা <code>luncanr 200</code>) শেখালে কমন নাম <code>luen</code> / <code>luncanr</code> অটোমেটিক এই গ্রুপে যুক্ত হয়ে যায়—ফলে পরবর্তীতে কেউ <code>luen 150</code>, <code>luen 50</code> বা <code>luen syp</code> লিখলেও বট নিজে থেকেই চিনে সঠিক প্রোডাক্টটি Google Sheet-এ যোগ করবে!\n          </p>\n          <div style=\"margin-bottom:12px;\">\n            <input type=\"text\" id=\"groupSearchInput\" placeholder=\"🔍 গ্রুপের নাম, প্রোডাক্ট বা কমন কিওয়ার্ড দিয়ে খুঁজুন...\" oninput=\"renderProductGroupsTable()\" style=\"max-width:360px;\" />\n          </div>\n          <div class=\"table-wrap\" style=\"max-height:520px;\">\n            <table>\n              <thead>\n                <tr>\n                  <th>Group Name (কমন নাম)</th>\n                  <th>গ্রুপের প্রোডাক্টসমূহ (Variants & Trade Price)</th>\n                  <th>কমন কিওয়ার্ড / ভুল বানান (Shared Keywords)</th>\n                  <th>নতুন কমন কিওয়ার্ড যোগ</th>\n                  <th>অ্যাকশন</th>\n                </tr>\n              </thead>\n              <tbody id=\"productGroupsBody\"></tbody>\n            </table>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <div id=\"tab-phones\" class=\"tab-panel\">\n      <div class=\"grid\">\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-yellow\">\n            <span>📲 ১. অ্যাডমিন অ্যালার্ট ও রিপ্লাই নম্বরসমূহ (Multiple Admin Numbers)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              কোনো অর্ডারে <b>অপরিচিত DA ID/নাম</b> অথবা <b>অপরিচিত ওষুধের বানান</b> পাওয়া গেলে বট নিচের নম্বরগুলোতে WhatsApp মেসেজ পাঠিয়ে জিজ্ঞেস করবে এবং এই নম্বরগুলো থেকে Reply দিলে অটোমেটিক ডেটাবেসে যুক্ত হয়ে যাবে:\n            </p>\n            <label>অ্যাডমিন নম্বরসমূহ (কমা দিয়ে একাধিক নম্বর যোগ করুন):</label>\n            <input type=\"text\" id=\"adminAlertPhonesInput\" placeholder=\"8801793362829, 8801732273944\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">💾 অ্যাডমিন নম্বর সেভ করুন</button>\n            </div>\n          </div>\n        </div>\n\n        <div class=\"card\" style=\"margin-bottom:0;\">\n          <div class=\"card-header h-mint\">\n            <span>📸 ২. ছবির অর্ডার অনুমোদিত নম্বরসমূহ (Authorized Image Senders)</span>\n          </div>\n          <div class=\"card-body\">\n            <p style=\"font-size:0.86rem; font-weight:600; margin-bottom:10px;\">\n              খাতায় লিখে ছবি তুলে পাঠালে শুধুমাত্র নিচের নম্বরগুলো থেকে বট ছবির অর্ডার রিড করবে (কমা দিয়ে যতখুশি নম্বর যোগ বা রিমুভ করতে পারবেন):\n            </p>\n            <label>ছবির অর্ডারের অনুমোদিত নম্বরসমূহ (কমা দিয়ে):</label>\n            <input type=\"text\" id=\"authImagePhonesInput\" placeholder=\"8801732273944, 8801793362829\" />\n            <div class=\"btn-row\">\n              <button class=\"btn-primary\" onclick=\"savePhoneSettings()\">💾 ছবির অনুমোদিত নম্বর সেভ করুন</button>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <div class=\"card\">\n        <div class=\"card-header h-lavender\">\n          <span>📂 ৩. ডাটাবেস JSON ফাইল ইমপোর্ট ও ব্যাকআপ (Import / Export Master DB JSON)</span>\n          <a href=\"/api/master-db/export\" class=\"btn-link btn-blue btn-sm\">📥 বর্তমান ডাটাবেস ডাউনলোড (.json)</a>\n        </div>\n        <div class=\"card-body\">\n          <div style=\"display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:16px; align-items:start;\">\n            <div style=\"border:2.5px dashed #000; background:#FEF9C3; padding:14px; border-radius:10px;\">\n              <label style=\"margin-top:0;\">📁 ১. আপনার কম্পিউটার বা মোবাইল থেকে JSON ফাইল সিলেক্ট করুন:</label>\n              <input type=\"file\" id=\"jsonImportFileInput\" accept=\".json,application/json\" onchange=\"handleJsonFileSelect(this)\" style=\"margin-top:6px; padding:8px; background:#fff; border:2px solid #000; border-radius:8px; width:100%; font-weight:700; cursor:pointer;\" />\n              <div id=\"jsonFileSummary\" style=\"margin-top:8px; font-size:0.82rem; font-weight:800; color:#047857;\"></div>\n\n              <label style=\"margin-top:12px;\">⚙️ ইমপোর্ট মোড (Import Mode):</label>\n              <select id=\"jsonImportModeSelect\">\n                <option value=\"merge\">➕ আগের ডাটার সাথে মার্জ করুন (Merge — আগের ও নতুন সব থাকবে)</option>\n                <option value=\"replace\">🔄 পুরো ডাটাবেস রিপ্লেস করুন (Replace — ফাইলের ডাটা সেট হবে)</option>\n              </select>\n\n              <div class=\"btn-row\">\n                <button class=\"btn-primary\" onclick=\"importMasterDbJson()\">📤 JSON ডাটাবেস ইমপোর্ট করুন</button>\n                <a href=\"/api/master-db/export\" class=\"btn-link btn-blue\">⬇ Download master_db.json</a>\n              </div>\n              <div id=\"jsonImportStatusMsg\" style=\"margin-top:10px; font-size:0.85rem; font-weight:800;\"></div>\n            </div>\n\n            <div>\n              <label style=\"margin-top:0;\">📝 ২. ফাইল প্রিভিউ অথবা সরাসরি JSON কোড পেস্ট করুন (ঐচ্ছিক):</label>\n              <textarea id=\"jsonImportTextInput\" placeholder='{\"das\": [...], \"products\": [...], \"productGroups\": [...]}' style=\"min-height:165px; font-size:0.78rem;\"></textarea>\n            </div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n  </div>\n\n  <script>\n    let masterData = { das: [], products: [], adminAlertPhones: [], authorizedImagePhones: [], pendingResolutions: [] };\n    let groupInputTouched = false;\n    let lastGroupsCount = -1;\n\n    function switchTab(tabId, btnEl) {\n      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));\n      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));\n      document.getElementById(tabId).classList.add('active');\n      btnEl.classList.add('active');\n      if (tabId !== 'tab-control') {\n        loadMasterDb();\n      }\n    }\n\n    function esc(s) {\n      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n    }\n\n    function onGroupNameManualInput() {\n      groupInputTouched = true;\n      document.getElementById('targetGroupIdInput').value = '';\n    }\n\n    async function loadMasterDb() {\n      try {\n        const res = await fetch('/api/master-db');\n        const data = await res.json();\n        if (data.ok) {\n          masterData = data;\n          document.getElementById('navDaCount').textContent = (data.das || []).length;\n          document.getElementById('navProdCount').textContent = (data.products || []).length;\n          const navGrp = document.getElementById('navGrpCount');\n          if (navGrp) navGrp.textContent = (data.productGroups || []).length;\n          document.getElementById('adminAlertPhonesInput').value = (data.adminAlertPhones || []).join(', ');\n          document.getElementById('authImagePhonesInput').value = (data.authorizedImagePhones || []).join(', ');\n          renderDaTable();\n          renderProductTable();\n          renderProductGroupsTable();\n        }\n      } catch (e) {}\n    }\n\n    function renderDaTable() {\n      const q = (document.getElementById('daSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.das || []).filter((d) => {\n        if (!q) return true;\n        return `${d.daId} ${d.altId} ${d.name} ${(d.phones || []).join(' ')} ${(d.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('daTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('daDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"7\" style=\"text-align:center; font-weight:700;\">কোনো প্রতিনিধি পাওয়া যায়নি।</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((d, idx) => `\n        <tr>\n          <td><b>#${idx + 1}</b></td>\n          <td><span class=\"badge info\">${esc(d.daId)}</span></td>\n          <td>${esc(d.altId || '-')}</td>\n          <td><b>${esc(d.name)}</b></td>\n          <td>${esc((d.phones || []).join(', ') || '-')}</td>\n          <td>${(d.aliases || []).map((a) => `<span class=\"alias-chip\">${esc(a)}</span>`).join(' ')}</td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editDa('${esc(d.daId)}')\">✏️ Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleDa('${esc(d.daId)}')\">🗑️ Delete</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editDa(daId) {\n      const d = (masterData.das || []).find((x) => x.daId === daId);\n      if (!d) return;\n      document.getElementById('daOriginalId').value = d.daId;\n      document.getElementById('daIdInput').value = d.daId;\n      document.getElementById('daAltIdInput').value = d.altId || '';\n      document.getElementById('daNameInput').value = d.name || '';\n      document.getElementById('daPhonesInput').value = (d.phones || []).join(', ');\n      document.getElementById('daAliasesInput').value = (d.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetDaForm() {\n      document.getElementById('daOriginalId').value = '';\n      document.getElementById('daIdInput').value = '';\n      document.getElementById('daAltIdInput').value = '';\n      document.getElementById('daNameInput').value = '';\n      document.getElementById('daPhonesInput').value = '';\n      document.getElementById('daAliasesInput').value = '';\n    }\n\n    async function saveDaRecord() {\n      const originalDaId = document.getElementById('daOriginalId').value;\n      const daId = document.getElementById('daIdInput').value;\n      const altId = document.getElementById('daAltIdInput').value;\n      const name = document.getElementById('daNameInput').value;\n      const phones = document.getElementById('daPhonesInput').value;\n      const aliases = document.getElementById('daAliasesInput').value;\n\n      const res = await fetch('/api/da/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalDaId, daId, altId, name, phones, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving DA');\n        return;\n      }\n      resetDaForm();\n      await loadMasterDb();\n    }\n\n    async function deleteSingleDa(daId) {\n      if (!confirm(`আপনি কি নিশ্চিত যে [${daId}] প্রতিনিধিটি মুছে ফেলতে চান?`)) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ daId })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteAllDas() {\n      if (!confirm('সতর্কবার্তা: আপনি কি ডেটাবেস থেকে সব প্রতিনিধি (All DAs) মুছে ফেলতে চান?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ deleteAll: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetAllDasToDefault() {\n      if (!confirm('ডিফল্ট ৪৬ জন প্রতিনিধির তালিকা রিস্টোর করতে চান?')) return;\n      await fetch('/api/da/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    function renderProductGroupsTable() {\n      const q = (document.getElementById('groupSearchInput')?.value || '').trim().toLowerCase();\n      const allGroups = masterData.productGroups || [];\n      const prods = masterData.products || [];\n      const navGrp = document.getElementById('navGrpCount');\n      if (navGrp) navGrp.textContent = allGroups.length;\n      const groups = allGroups.filter((g) => {\n        if (!q) return true;\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        const memberNames = members.map((m) => `${m.code} ${m.name}`).join(' ');\n        return `${g.groupName} ${(g.keywords || []).join(' ')} ${memberNames}`.toLowerCase().includes(q);\n      });\n      const lbl = document.getElementById('grpTotalLabel');\n      if (lbl) lbl.textContent = groups.length;\n      const tbody = document.getElementById('productGroupsBody');\n      if (!tbody) return;\n      if (groups.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"5\" style=\"text-align:center; font-weight:700;\">কোনো গ্রুপ নেই।</td></tr>';\n        return;\n      }\n      tbody.innerHTML = groups.map((g) => {\n        const members = prods.filter((p) => String(p.family || '').toUpperCase() === g.groupName.toUpperCase());\n        return `\n          <tr>\n            <td><span class=\"badge ok\">${esc(g.groupName)}</span></td>\n            <td style=\"font-size:0.78rem;\">\n              ${members.map((m) => `<div><b>[${esc(m.code)}]</b> ${esc(m.name)} (৳${Number(m.price).toFixed(2)})</div>`).join('') || '—'}\n            </td>\n            <td>\n              ${(g.keywords || []).map((kw) => `\n                <span class=\"alias-chip\">\n                  ${esc(kw)}\n                  <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyGroupKeyword('${esc(g.groupName)}', '${esc(kw)}', 'remove')\">×</span>\n                </span>\n              `).join('')}\n            </td>\n            <td>\n              <div style=\"display:flex; gap:4px; min-width:150px;\">\n                <input type=\"text\" id=\"grpKw_${esc(g.groupName)}\" placeholder=\"কমন বানান...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n                <button class=\"btn-primary btn-sm\" onclick=\"quickAddGroupKw('${esc(g.groupName)}')\">+ যোগ</button>\n              </div>\n            </td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"editBrandGroup('${esc(g.groupName)}')\">✏️</button>\n              <button class=\"btn-danger btn-sm\" onclick=\"deleteBrandGroup('${esc(g.groupName)}')\">🗑️</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function editBrandGroup(groupName) {\n      const g = (masterData.productGroups || []).find((x) => x.groupName === groupName);\n      if (!g) return;\n      document.getElementById('newGroupNameInput').value = g.groupName;\n      document.getElementById('newGroupKeywordsInput').value = (g.keywords || []).join(', ');\n    }\n\n    async function saveBrandGroup() {\n      const groupName = document.getElementById('newGroupNameInput').value;\n      const keywords = document.getElementById('newGroupKeywordsInput').value;\n      if (!groupName.trim()) return alert('গ্রুপের নাম দিন');\n      await fetch('/api/product-group/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keywords })\n      });\n      document.getElementById('newGroupNameInput').value = '';\n      document.getElementById('newGroupKeywordsInput').value = '';\n      await loadMasterDb();\n    }\n\n    async function quickAddGroupKw(groupName) {\n      const inp = document.getElementById('grpKw_' + groupName);\n      if (!inp || !inp.value.trim()) return;\n      await modifyGroupKeyword(groupName, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyGroupKeyword(groupName, keyword, action) {\n      await fetch('/api/product-group/keyword', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName, keyword, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteBrandGroup(groupName) {\n      if (!confirm(`আপনি কি [${groupName}] গ্রুপটি মুছে ফেলতে চান?`)) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupName })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetBrandGroupsToDefault() {\n      if (!confirm('সব প্রোডাক্টের কমন ব্র্যান্ড গ্রুপ ডিফল্ট অবস্থায় রিস্টোর করতে চান?')) return;\n      await fetch('/api/product-group/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    function handleJsonFileSelect(inputEl) {\n      const file = inputEl?.files?.[0];\n      const summaryEl = document.getElementById('jsonFileSummary');\n      if (!file) return;\n      const reader = new FileReader();\n      reader.onload = (ev) => {\n        const content = String(ev.target?.result || '').trim();\n        document.getElementById('jsonImportTextInput').value = content;\n        try {\n          const parsed = JSON.parse(content);\n          const dCount = Array.isArray(parsed.das) ? parsed.das.length : 0;\n          const pCount = Array.isArray(parsed.products) ? parsed.products.length : 0;\n          const gCount = Array.isArray(parsed.productGroups) ? parsed.productGroups.length : 0;\n          summaryEl.style.color = '#047857';\n          summaryEl.textContent = `✅ ফাইল লোড হয়েছে (${file.name}): প্রতিনিধি ${dCount} জন, প্রোডাক্ট ${pCount} টি` + (gCount ? `, গ্রুপ ${gCount} টি` : '');\n        } catch (err) {\n          summaryEl.style.color = '#b91c1c';\n          summaryEl.textContent = '⚠️ ফাইলটি সঠিক JSON ফরম্যাটে নেই: ' + err.message;\n        }\n      };\n      reader.readAsText(file, 'UTF-8');\n    }\n\n    async function importMasterDbJson() {\n      const rawText = (document.getElementById('jsonImportTextInput')?.value || '').trim();\n      const mode = document.getElementById('jsonImportModeSelect')?.value || 'merge';\n      const statusEl = document.getElementById('jsonImportStatusMsg');\n      if (!rawText) {\n        alert('অনুগ্রহ করে প্রথমে একটি .json ফাইল সিলেক্ট করুন অথবা টেক্সট বক্সে JSON পেস্ট করুন।');\n        return;\n      }\n      let parsedJson = null;\n      try {\n        parsedJson = JSON.parse(rawText);\n      } catch (err) {\n        alert('JSON ফরম্যাট সঠিক নয়: ' + err.message);\n        return;\n      }\n\n      if (mode === 'replace' && !confirm('সতর্কবার্তা: আপনি কি বর্তমান ডাটাবেস সম্পূর্ণ রিপ্লেস করে ফাইলের ডাটা বসাতে চান?')) {\n        return;\n      }\n\n      statusEl.style.color = '#1d4ed8';\n      statusEl.textContent = '⏳ JSON ডাটাবেস ইমপোর্ট হচ্ছে...';\n\n      try {\n        const res = await fetch('/api/master-db/import', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ mode, dbData: parsedJson })\n        });\n        const data = await res.json();\n        if (!data.ok) {\n          statusEl.style.color = '#b91c1c';\n          statusEl.textContent = '❌ ' + (data.error || 'Import failed');\n          alert(data.error || 'Import failed');\n          return;\n        }\n        statusEl.style.color = '#047857';\n        statusEl.textContent = data.message || '✅ সফলভাবে ইমপোর্ট হয়েছে!';\n        alert(data.message || '✅ JSON ডাটাবেস সফলভাবে ইমপোর্ট হয়েছে!');\n        await loadMasterDb();\n        await fetchStatus();\n      } catch (e) {\n        statusEl.style.color = '#b91c1c';\n        statusEl.textContent = '❌ Error: ' + e.message;\n      }\n    }\n\n    function renderProductTable() {\n      const q = (document.getElementById('prodSearchInput')?.value || '').trim().toLowerCase();\n      const list = (masterData.products || []).filter((p) => {\n        if (!q) return true;\n        return `${p.code} ${p.name} ${p.unit} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(q);\n      });\n\n      document.getElementById('prodTotalLabel').textContent = list.length;\n      const tbody = document.getElementById('productDatabaseBody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center; font-weight:700;\">কোনো প্রোডাক্ট পাওয়া যায়নি।</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map((p) => `\n        <tr>\n          <td><span class=\"badge warn\">${esc(p.code)}</span></td>\n          <td><b>${esc(p.name)}</b><br/><span style=\"font-size:0.76rem;\">${esc(p.unit)}</span></td>\n          <td style=\"font-weight:800;\">৳${Number(p.price || 0).toFixed(2)}</td>\n          <td>\n            ${(p.aliases || []).map((a) => `\n              <span class=\"alias-chip\">\n                ${esc(a)}\n                <span style=\"cursor:pointer; color:#b91c1c; font-weight:900;\" onclick=\"modifyProductAlias('${esc(p.code)}', '${esc(a)}', 'remove')\" title=\"মুছুন\">×</span>\n              </span>\n            `).join('')}\n          </td>\n          <td>\n            <div style=\"display:flex; gap:4px; min-width:160px;\">\n              <input type=\"text\" id=\"quickAlias_${esc(p.code)}\" placeholder=\"ভুল বানান লিখুন...\" style=\"padding:4px 8px; font-size:0.78rem;\" />\n              <button class=\"btn-primary btn-sm\" onclick=\"quickAddAlias('${esc(p.code)}')\">+ যোগ</button>\n            </div>\n          </td>\n          <td style=\"white-space:nowrap;\">\n            <button class=\"btn-blue btn-sm\" onclick=\"editProduct('${esc(p.code)}')\">✏️ Edit</button>\n            <button class=\"btn-danger btn-sm\" onclick=\"deleteSingleProduct('${esc(p.code)}')\">🗑️</button>\n          </td>\n        </tr>\n      `).join('');\n    }\n\n    function editProduct(code) {\n      const p = (masterData.products || []).find((x) => String(x.code) === String(code));\n      if (!p) return;\n      document.getElementById('prodOriginalCode').value = p.code;\n      document.getElementById('prodCodeInput').value = p.code;\n      document.getElementById('prodNameInput').value = p.name;\n      document.getElementById('prodUnitInput').value = p.unit || '';\n      document.getElementById('prodPriceInput').value = p.price || 0;\n      document.getElementById('prodFamilyInput').value = p.family || '';\n      document.getElementById('prodAliasesInput').value = (p.aliases || []).join(', ');\n      window.scrollTo({ top: 0, behavior: 'smooth' });\n    }\n\n    function resetProductForm() {\n      document.getElementById('prodOriginalCode').value = '';\n      document.getElementById('prodCodeInput').value = '';\n      document.getElementById('prodNameInput').value = '';\n      document.getElementById('prodUnitInput').value = '';\n      document.getElementById('prodPriceInput').value = '';\n      document.getElementById('prodFamilyInput').value = '';\n      document.getElementById('prodAliasesInput').value = '';\n    }\n\n    async function saveProductRecord() {\n      const originalCode = document.getElementById('prodOriginalCode').value;\n      const code = document.getElementById('prodCodeInput').value;\n      const name = document.getElementById('prodNameInput').value;\n      const unit = document.getElementById('prodUnitInput').value;\n      const price = document.getElementById('prodPriceInput').value;\n      const family = document.getElementById('prodFamilyInput').value;\n      const aliases = document.getElementById('prodAliasesInput').value;\n\n      const res = await fetch('/api/product/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ originalCode, code, name, unit, price, family, aliases })\n      });\n      const data = await res.json();\n      if (!data.ok) {\n        alert(data.error || 'Error saving product');\n        return;\n      }\n      resetProductForm();\n      await loadMasterDb();\n    }\n\n    async function quickAddAlias(code) {\n      const inp = document.getElementById('quickAlias_' + code);\n      if (!inp || !inp.value.trim()) return;\n      await modifyProductAlias(code, inp.value.trim(), 'add');\n      inp.value = '';\n    }\n\n    async function modifyProductAlias(code, alias, action) {\n      await fetch('/api/product/alias', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code, alias, action })\n      });\n      await loadMasterDb();\n    }\n\n    async function deleteSingleProduct(code) {\n      if (!confirm(`আপনি কি [${code}] প্রোডাক্টটি মুছে ফেলতে চান?`)) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ code })\n      });\n      await loadMasterDb();\n    }\n\n    async function resetProductsToDefault() {\n      if (!confirm('ডিফল্ট ৭৯টি প্রোডাক্ট এবং অফিশিয়াল Trade Price রিস্টোর করতে চান?')) return;\n      await fetch('/api/product/delete', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ resetDefault: true })\n      });\n      await loadMasterDb();\n    }\n\n    async function savePhoneSettings() {\n      const adminAlertPhones = document.getElementById('adminAlertPhonesInput').value;\n      const authorizedImagePhones = document.getElementById('authImagePhonesInput').value;\n      const res = await fetch('/api/phones/save', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ adminAlertPhones, authorizedImagePhones })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        alert('✅ নম্বরগুলো সফলভাবে সেভ হয়েছে!');\n        await loadMasterDb();\n        await fetchStatus();\n      }\n    }\n\n    async function resolvePendingFromWeb(token, customAnswer) {\n      const ans = customAnswer !== undefined ? customAnswer : document.getElementById('pendingAns_' + token)?.value;\n      if (!ans || !ans.trim()) return;\n      const res = await fetch('/api/pending/resolve', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ token, answer: ans })\n      });\n      const data = await res.json();\n      alert(data.message || 'Done');\n      await fetchStatus();\n      await loadMasterDb();\n    }\n\n    async function fetchStatus() {\n      try {\n        const res = await fetch('/api/status');\n        const data = await res.json();\n\n        document.getElementById('navDaCount').textContent = data.daCount || 0;\n        document.getElementById('navProdCount').textContent = data.productCount || 0;\n\n        const waBadge = document.getElementById('waBadge');\n        if (data.waStatus === 'CONNECTED') {\n          waBadge.className = 'badge ok';\n          waBadge.textContent = '🟢 WhatsApp Connected';\n        } else if (data.waStatus === 'QR_READY') {\n          waBadge.className = 'badge warn';\n          waBadge.textContent = '📲 Scan QR Code';\n        } else {\n          waBadge.className = 'badge err';\n          waBadge.textContent = '⏳ ' + data.waStatus;\n        }\n\n        const sheetBadge = document.getElementById('sheetBadge');\n        if (data.googleAuthReady) {\n          sheetBadge.className = 'badge ok';\n          sheetBadge.textContent = '🟢 Sheet Connected';\n        } else {\n          sheetBadge.className = 'badge err';\n          sheetBadge.textContent = '⚠️ Sheet Auth Needed';\n        }\n\n        document.getElementById('ramBadge').textContent = '⚡ RAM: ' + (data.memoryMB || 0) + ' MB';\n        document.getElementById('openSheetBtn').href = data.googleSheetUrl;\n\n        document.getElementById('statGroup').textContent =\n          data.botConfig.targetGroupName || data.botConfig.targetGroupId || 'All Joined Groups';\n        document.getElementById('statSaved').textContent = data.stats.totalOrdersSaved;\n        document.getElementById('statAmount').textContent =\n          '৳' + Number(data.stats.totalAmountSaved || 0).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\n        const pendings = data.pendingResolutions || [];\n        document.getElementById('statPending').textContent = pendings.length;\n        document.getElementById('statAdminPhones').innerHTML = (data.adminAlertPhones || []).join('<br/>');\n\n        window.latestPendingItems = pendings;\n        window.latestMessageLogs = data.messageLogs || [];\n        renderMessageLogsTable();\n\n        const pCard = document.getElementById('pendingCard');\n        const pList = document.getElementById('pendingListContainer');\n        const activeTag = document.activeElement ? document.activeElement.id || '' : '';\n        if (pendings.length > 0) {\n          pCard.style.display = 'block';\n          if (!activeTag.startsWith('pendingAns_')) {\n            pList.innerHTML = pendings.map((p, idx) => {\n              const phoneLabel = (p.displayPhone && p.displayPhone !== '-' ? p.displayPhone : (p.senderPhone || 'Unknown')) + (p.senderPushName ? ' (' + p.senderPushName + ')' : '');\n              const fullMsg = p.rawText || p.rawLine || '';\n              if (p.type === 'UNKNOWN_DA') {\n                return `\n                  <div style=\"border:2.5px solid #000; background:#FEF9C3; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                    <div style=\"display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px;\">\n                      <b>${esc(p.token)} — অপরিচিত প্রতিনিধি (Unknown DA) ${p.detectedDaId ? `[শনাক্তকৃত ID: ${esc(p.detectedDaId)}]` : ''}</b>\n                      <span class=\"badge info\">📱 প্রেরকের নম্বর: ${esc(phoneLabel)}</span>\n                    </div>\n                    <div style=\"font-size:0.84rem; margin:6px 0;\">💊 <b>শনাক্তকৃত অর্ডার:</b> ${esc((p.orders || []).map((o) => o.productName + ' (' + o.orderedQty + ')').join(', ') || 'প্রোডাক্ট লিস্ট নিচে দেখুন')}</div>\n                    <div style=\"font-size:0.8rem; font-weight:700; margin-top:4px;\">📩 সম্পূর্ণ মেসেজ (Full Message):</div>\n                    <div style=\"white-space:pre-wrap; background:#FFFDF7; border:2px solid #000; padding:8px 10px; border-radius:6px; font-family:monospace; font-size:0.82rem; margin:4px 0 8px 0;\">${esc(fullMsg)}</div>\n                    <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;\">\n                      <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"ID ও নাম লিখুন (যেমন: CF4526 Seraj)\" style=\"max-width:300px;\" />\n                      <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">✅ ID/নাম সেভ করুন</button>\n                      <button class=\"btn-blue btn-sm\" onclick=\"openEditPendingByIdx(${idx})\">✏️ মেসেজ এডিট ও সাবমিট</button>\n                      <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', '/cnl')\">🗑️ বাতিল</button>\n                    </div>\n                  </div>\n                `;\n              } else {\n                return `\n                  <div style=\"border:2.5px solid #000; background:#E0F2FE; padding:12px; border-radius:8px; margin-bottom:10px;\">\n                    <div style=\"display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px;\">\n                      <b>${esc(p.token)} — অপরিচিত প্রোডাক্ট/বানান: \"${esc(p.unknownProductText)}\" (পরিমাণ: ${esc(p.orderedQty)})</b>\n                      <span class=\"badge info\">📱 প্রেরকের নম্বর: ${esc(phoneLabel)}</span>\n                    </div>\n                    <div style=\"font-size:0.84rem; margin:6px 0;\">👤 <b>প্রতিনিধি:</b> ${esc(p.daInfo?.name)} (${esc(p.daInfo?.daId)}) | <b>অপরিচিত লাইন:</b> \"${esc(p.rawLine)}\"</div>\n                    <div style=\"font-size:0.8rem; font-weight:700; margin-top:4px;\">📩 সম্পূর্ণ মেসেজ (Full Message):</div>\n                    <div style=\"white-space:pre-wrap; background:#FFFDF7; border:2px solid #000; padding:8px 10px; border-radius:6px; font-family:monospace; font-size:0.82rem; margin:4px 0 8px 0;\">${esc(fullMsg)}</div>\n                    <div style=\"display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;\">\n                      <input type=\"text\" id=\"pendingAns_${esc(p.token)}\" placeholder=\"সঠিক প্রোডাক্টের নাম বা কোড (যেমন: Totifen বা 919)\" style=\"max-width:320px;\" />\n                      <button class=\"btn-primary btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}')\">🧠 বানান শেখান ও সেভ করুন</button>\n                      <button class=\"btn-blue btn-sm\" onclick=\"openEditPendingByIdx(${idx})\">✏️ মেসেজ এডিট ও সাবমিট</button>\n                      <button class=\"btn-danger btn-sm\" onclick=\"resolvePendingFromWeb('${esc(p.token)}', 'skip')\">🗑️ বাদ দিন</button>\n                    </div>\n                  </div>\n                `;\n              }\n            }).join('');\n          }\n        } else {\n          pCard.style.display = 'none';\n        }\n\n        const qrBox = document.getElementById('qrContainer');\n        if (data.waStatus === 'CONNECTED' && data.connectedUser) {\n          qrBox.innerHTML =\n            '<div style=\"font-size:2.4rem; margin-bottom:4px;\">✅</div>' +\n            '<h3 style=\"font-weight:800;\">WhatsApp সচল আছে!</h3>' +\n            '<p style=\"font-size:0.86rem; font-weight:700; margin-top:4px;\">Account: <b>' +\n            esc(data.connectedUser.name) +\n            '</b> (' +\n            esc(data.connectedUser.id.split(':')[0]) +\n            ')</p>' +\n            '<span class=\"badge ok\" style=\"margin-top:10px;\">☁️ Multi-Chunk Cloud Backup Active</span>';\n        } else if (data.qrDataUrl) {\n          qrBox.innerHTML =\n            '<img src=\"' +\n            data.qrDataUrl +\n            '\" alt=\"WhatsApp QR Code\" />' +\n            '<p style=\"font-weight:800; font-size:0.86rem;\">WhatsApp ➔ Linked Devices থেকে স্ক্যান করুন</p>';\n        } else {\n          qrBox.innerHTML = '<p style=\"font-weight:700;\">🔄 WhatsApp কানেক্ট হচ্ছে...</p>';\n        }\n\n        const jsonGrpEl = document.getElementById('jsonSavedGroupLabel');\n        if (jsonGrpEl) {\n          const tg = data.targetGroup || data.botConfig || {};\n          jsonGrpEl.textContent = (tg.targetGroupName || 'All Joined Groups') + (tg.targetGroupId && tg.targetGroupId !== 'ALL' ? ' [' + tg.targetGroupId + ']' : '');\n        }\n        const last5El = document.getElementById('last5MsgIdsLabel');\n        if (last5El) {\n          const ids = data.lastProcessedMsgIds || [];\n          last5El.textContent = ids.length > 0 ? ids.join(', ') : 'এখনো কোনো মেসেজ আইডি সেভ হয়নি';\n        }\n\n        const select = document.getElementById('groupSelect');\n        const groups = data.joinedGroups || [];\n        const savedGroupId = (data.targetGroup && data.targetGroup.targetGroupId) || data.botConfig.targetGroupId || '';\n        const savedGroupName = (data.targetGroup && data.targetGroup.targetGroupName) || data.botConfig.targetGroupName || '';\n        if (!groupInputTouched && document.activeElement !== select) {\n          select.innerHTML = '<option value=\"ALL\">🌐 All Joined Groups (সব গ্রুপ থেকে অর্ডার নিবে)</option>';\n          let matchedOption = (savedGroupId === 'ALL' || !savedGroupId);\n          groups.forEach((g) => {\n            const opt = document.createElement('option');\n            opt.value = g.id;\n            opt.dataset.name = g.subject;\n            opt.textContent = g.subject + ' (' + g.size + ' members)';\n            if (savedGroupId === g.id || (!savedGroupId && savedGroupName && g.subject.toLowerCase().trim() === savedGroupName.toLowerCase().trim())) {\n              opt.selected = true;\n              matchedOption = true;\n            }\n            select.appendChild(opt);\n          });\n          if (!matchedOption && savedGroupId && savedGroupId !== 'ALL') {\n            const pinnedOpt = document.createElement('option');\n            pinnedOpt.value = savedGroupId;\n            pinnedOpt.dataset.name = savedGroupName || savedGroupId;\n            pinnedOpt.textContent = '📌 ' + (savedGroupName || savedGroupId) + ' (Saved in master_db.json)';\n            pinnedOpt.selected = true;\n            select.appendChild(pinnedOpt);\n          }\n        }\n\n        if (!groupInputTouched) {\n          document.getElementById('targetGroupNameInput').value = data.botConfig.targetGroupName || '';\n          document.getElementById('targetGroupIdInput').value = data.botConfig.targetGroupId || '';\n          document.getElementById('autoReactCheckbox').checked = !!data.botConfig.autoReactOnOrder;\n        }\n\n        window.latestRecentOrders = data.recentOrders || [];\n        const tbody = document.getElementById('ordersTableBody');\n        if (data.recentOrders && data.recentOrders.length > 0) {\n          tbody.innerHTML = data.recentOrders\n            .map(\n              (o, oIdx) =>\n                '<tr>' +\n                '<td>' + (o.sheetRowNumber ? '<span class=\"badge ok\">📍 Row ' + esc(o.sheetRowNumber) + '</span>' : '<span class=\"badge warn\">Saved</span>') + '</td>' +\n                '<td><b>' + esc(o.date) + '</b><br/>' + esc(o.time) + '</td>' +\n                '<td><b>' + esc(o.daId) + '</b><br/><span>' + esc(o.daName) + '</span></td>' +\n                '<td><b>' + esc(o.psoCode) + '</b></td>' +\n                '<td>' + esc(o.pharmacyName) + '</td>' +\n                '<td><b>' + esc(o.rawText) + '</b></td>' +\n                '<td><b>[' + esc(o.crpCode) + ']</b> ' + esc(o.productName) + '</td>' +\n                '<td><b>' + esc(o.orderedQty) + '</b></td>' +\n                '<td>৳' + Number(o.unitPrice).toFixed(2) + '</td>' +\n                '<td style=\"font-weight:800;\">৳' + Number(o.totalAmount).toLocaleString('en-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>' +\n                '<td style=\"white-space:nowrap;\">' + esc(o.matchType) + '<br/><button class=\"btn-blue btn-sm\" style=\"margin-top:4px;\" onclick=\"openEditOrderByIdx(' + oIdx + ')\">✏️ Edit</button></td>' +\n                '</tr>'\n            )\n            .join('');\n        } else {\n          tbody.innerHTML = '<tr><td colspan=\"11\" style=\"text-align:center; font-weight:700;\">মেমোরি বাফারে কোনো অর্ডার নেই।</td></tr>';\n        }\n\n        const logBox = document.getElementById('logBox');\n        logBox.innerHTML = (data.logs || []).map((l) => '<div>' + esc(l) + '</div>').join('');\n      } catch (e) {}\n    }\n\n    function onGroupDropdownChange() {\n      const sel = document.getElementById('groupSelect');\n      const opt = sel.options[sel.selectedIndex];\n      if (!opt) return;\n      groupInputTouched = true;\n      if (opt.value === 'ALL') {\n        document.getElementById('targetGroupIdInput').value = 'ALL';\n        document.getElementById('targetGroupNameInput').value = 'All Joined Groups (সব গ্রুপ)';\n      } else {\n        document.getElementById('targetGroupIdInput').value = opt.value;\n        document.getElementById('targetGroupNameInput').value = opt.dataset.name || '';\n      }\n    }\n\n    async function refreshGroups() {\n      const res = await fetch('/api/groups/refresh', { method: 'POST' });\n      const data = await res.json();\n      lastGroupsCount = -1;\n      groupInputTouched = false;\n      await fetchStatus();\n      alert('গ্রুপ লিস্ট আপডেট হয়েছে! মোট গ্রুপ: ' + (data.groups || []).length);\n    }\n\n    async function saveGroupConfig() {\n      const groupId = document.getElementById('targetGroupIdInput').value;\n      const groupName = document.getElementById('targetGroupNameInput').value;\n      const autoReactOnOrder = document.getElementById('autoReactCheckbox').checked;\n\n      const res = await fetch('/api/config/group', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ groupId, groupName, autoReactOnOrder })\n      });\n      const data = await res.json();\n      if (data.ok) {\n        document.getElementById('saveStatusMsg').textContent =\n          '✅ গ্রুপ সেটিংস সেভ হয়েছে: ' + (data.botConfig.targetGroupName || 'All');\n        groupInputTouched = false;\n        fetchStatus();\n      }\n    }\n\n    async function syncSheetStructure() {\n      const res = await fetch('/api/sheets/sync', { method: 'POST' });\n      const data = await res.json();\n      alert(data.ok ? '✅ Google Sheet-এ সব প্রোডাক্ট, DA তালিকা ও ক্লাউড ব্যাকআপ সিঙ্ক হয়েছে!' : '⚠️ Error: ' + data.googleAuthError);\n      fetchStatus();\n    }\n\n    async function clearLiveOrders() {\n      await fetch('/api/orders/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function clearServerLogs() {\n      await fetch('/api/logs/clear', { method: 'POST' });\n      fetchStatus();\n    }\n\n    async function runTestParse(saveToSheet) {\n      const messageText = document.getElementById('testInput').value;\n      const res = await fetch('/api/test-parse', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ messageText, saveToSheet, isImageOrder: true })\n      });\n      const data = await res.json();\n      const box = document.getElementById('testResultBox');\n      let html = '';\n      if (data.daInfo) {\n        html += `<div style=\"margin-bottom:4px;\">👤 <b>DA:</b> ${esc(data.daInfo.name)} (${esc(data.daInfo.daId)}) — ${data.daInfo.isKnownDA ? '✅ পরিচিত' : '❓ অপরিচিত (Admin প্রশ্ন পাঠানো হবে)'}</div>`;\n      }\n      if (data.orders && data.orders.length > 0) {\n        html += `<div style=\"background:#A7F3D0; border:2px solid #000; padding:8px; border-radius:6px; margin-bottom:4px;\">✅ শনাক্তকৃত অর্ডার: ${data.orders.length}টি (PSO: ${esc(data.orders[0].psoCode)})</div>`;\n      }\n      if (data.unrecognizedItems && data.unrecognizedItems.length > 0) {\n        html += `<div style=\"background:#FEF08A; border:2px solid #000; padding:8px; border-radius:6px;\">🤔 অপরিচিত প্রোডাক্ট বানান: ${data.unrecognizedItems.map((u) => esc(u.unknownProductText) + ' (' + u.orderedQty + ')').join(', ')}</div>`;\n      }\n      box.innerHTML = html || 'কোনো অর্ডার পাওয়া যায়নি।';\n      fetchStatus();\n    }\n\n    function renderMessageLogsTable() {\n      const tbody = document.getElementById('messageLogsTableBody');\n      if (!tbody) return;\n      const filterVal = document.getElementById('msgLogFilterSelect')?.value || 'ALL';\n      const q = (document.getElementById('msgLogSearchInput')?.value || '').trim().toLowerCase();\n      const allLogs = window.latestMessageLogs || [];\n      const filtered = allLogs.filter((m) => {\n        if (filterVal === 'SAVED' && !m.isSaved) return false;\n        if (filterVal === 'UNSAVED' && m.isSaved) return false;\n        if (!q) return true;\n        return `${m.whatsappMsgId} ${m.senderPhone} ${m.senderPushName} ${m.daId} ${m.daName} ${m.fullMessage} ${m.sheetRowText} ${m.note}`.toLowerCase().includes(q);\n      });\n      if (filtered.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" style=\"text-align:center; font-weight:700;\">কোনো মেসেজ লগ পাওয়া যায়নি।</td></tr>';\n        return;\n      }\n      tbody.innerHTML = filtered.map((m) => {\n        const origIdx = allLogs.indexOf(m);\n        const statusBadge = m.isSaved\n          ? '<span class=\"badge ok\">✅ সেভ হয়েছে</span>'\n          : '<span class=\"badge err\">❌ সেভ হয়নি</span>';\n        const rowBadge = m.isSaved && m.sheetRowText && !m.sheetRowText.startsWith('❌')\n          ? `<span class=\"badge info\">📍 ${esc(m.sheetRowText)}</span>`\n          : '<span class=\"badge err\">❌ নেই</span>';\n        return `\n          <tr>\n            <td style=\"white-space:nowrap;\">${statusBadge}</td>\n            <td style=\"white-space:nowrap; font-weight:800;\">${rowBadge}</td>\n            <td style=\"white-space:nowrap;\"><b>${esc(m.date)}</b><br/>${esc(m.time)}</td>\n            <td><b>${esc(m.senderPhone || '-')}</b><br/><span style=\"font-size:0.76rem;\">${esc(m.senderPushName || '')}</span></td>\n            <td><b>${esc(m.daId || '-')}</b><br/><span>${esc(m.daName || '-')}</span></td>\n            <td style=\"white-space:pre-wrap; font-family:monospace; font-size:0.79rem; min-width:220px; max-width:360px;\">${esc(m.fullMessage || '-')}</td>\n            <td style=\"font-size:0.78rem; font-weight:700;\">${esc(m.note || '-')}</td>\n            <td style=\"white-space:nowrap;\">\n              <button class=\"btn-blue btn-sm\" onclick=\"openEditLogByIdx(${origIdx})\">✏️ এডিট ও সাবমিট</button>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    function openEditMsgModal(msgId, token, phone, daText, fullText) {\n      document.getElementById('editModalMsgId').value = msgId || '';\n      document.getElementById('editModalToken').value = token || '';\n      document.getElementById('editModalPhone').value = phone && phone !== '-' ? phone : '';\n      document.getElementById('editModalDaText').value = daText && daText !== '-' && !daText.startsWith('UNRESOLVED') ? daText : '';\n      document.getElementById('editModalText').value = fullText || '';\n      document.getElementById('editModalStatus').textContent = '';\n      document.getElementById('editMsgModal').style.display = 'flex';\n    }\n\n    function closeEditMsgModal() {\n      document.getElementById('editMsgModal').style.display = 'none';\n    }\n\n    function openEditPendingByIdx(idx) {\n      const p = (window.latestPendingItems || [])[idx];\n      if (!p) return;\n      const ph = (p.displayPhone && p.displayPhone !== '-' ? p.displayPhone : p.senderPhone) || '';\n      const daStr = p.daInfo && p.daInfo.isKnownDA ? `${p.daInfo.daId} ${p.daInfo.name}` : (p.detectedDaId || '');\n      openEditMsgModal(p.whatsappMsgId || '', p.token || '', ph, daStr, p.rawText || p.rawLine || '');\n    }\n\n    function openEditLogByIdx(idx) {\n      const m = (window.latestMessageLogs || [])[idx];\n      if (!m) return;\n      const daStr = m.daId && m.daId !== '-' && m.daId !== 'UNRESOLVED' ? `${m.daId} ${m.daName !== '-' ? m.daName : ''}`.trim() : '';\n      openEditMsgModal(m.whatsappMsgId || '', '', m.senderPhone || '', daStr, m.fullMessage || '');\n    }\n\n    function openEditOrderByIdx(idx) {\n      const o = (window.latestRecentOrders || [])[idx];\n      if (!o) return;\n      const logMatch = (window.latestMessageLogs || []).find((m) => m.whatsappMsgId === o.whatsappMsgId);\n      const fullTxt = logMatch && logMatch.fullMessage ? logMatch.fullMessage : `${o.daId} ${o.daName}\\nPSO: ${o.psoCode}\\nCus: ${o.pharmacyName}\\n${o.rawText}`;\n      openEditMsgModal(o.whatsappMsgId || '', '', o.senderPhone || '', `${o.daId} ${o.daName}`, fullTxt);\n    }\n\n    async function submitEditedMessageFromWeb() {\n      const whatsappMsgId = document.getElementById('editModalMsgId').value;\n      const pendingToken = document.getElementById('editModalToken').value;\n      const senderPhone = document.getElementById('editModalPhone').value;\n      const overrideDaText = document.getElementById('editModalDaText').value;\n      const editedText = document.getElementById('editModalText').value;\n      const statusEl = document.getElementById('editModalStatus');\n\n      if (!editedText.trim()) {\n        alert('অনুগ্রহ করে মেসেজের লেখা দিন।');\n        return;\n      }\n      statusEl.style.color = '#1d4ed8';\n      statusEl.textContent = '⏳ মেসেজটি পার্স করে Google Sheet-এ সেভ করা হচ্ছে...';\n      try {\n        const res = await fetch('/api/message/edit-submit', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ whatsappMsgId, pendingToken, senderPhone, overrideDaText, editedText })\n        });\n        const data = await res.json();\n        if (!data.ok) {\n          statusEl.style.color = '#b91c1c';\n          statusEl.textContent = '❌ ' + (data.error || 'Error saving edited message');\n          return;\n        }\n        statusEl.style.color = '#047857';\n        statusEl.textContent = data.message || '✅ সফলভাবে সেভ হয়েছে!';\n        setTimeout(() => {\n          closeEditMsgModal();\n          fetchStatus();\n          loadMasterDb();\n        }, 600);\n      } catch (e) {\n        statusEl.style.color = '#b91c1c';\n        statusEl.textContent = '❌ Error: ' + e.message;\n      }\n    }\n\n    async function syncRowsFromSheetNow() {\n      await fetch('/api/message-logs/sync-rows', { method: 'POST' });\n      await fetchStatus();\n    }\n\n    async function logoutWhatsApp() {\n      if (!confirm('নতুন WhatsApp অ্যাকাউন্ট কানেক্ট করতে চান?')) return;\n      await fetch('/api/whatsapp/logout', { method: 'POST' });\n      fetchStatus();\n    }\n\n    fetchStatus();\n    loadMasterDb();\n    setInterval(fetchStatus, 3500);\n  </script>\n</body>\n</html>");
 });
 
 // ============================================================================
@@ -5888,22 +7072,18 @@ async function bootstrap() {
   loadLocalMasterDb();
   syncTargetGroupFromMasterDbToBotConfig();
   app.listen(PORT, '0.0.0.0', () => {
-    addLog(`🚀 Renata CRP Order Tracker v5.9 running on port ${PORT}`);
+    addLog(`🚀 Renata CRP Order Tracker v6.0 running on port ${PORT}`);
   });
 
   await initGoogleSheetsClient();
   if (googleAuthReady) {
-    // 1. Restore saved group config, Master DB & WhatsApp auth session FIRST
     await restoreAuthAndConfigFromSheet();
     syncTargetGroupFromMasterDbToBotConfig();
-    // 2. Ensure spreadsheet tabs & official trade prices exist
     await ensureSpreadsheetStructure(true);
-    // 3. Load existing WhatsApp Msg IDs & sync Live_Orders Row Numbers into All_Message_Logs
     await syncExistingSheetMessageIds();
     await syncLiveSheetRowNumbers();
   }
 
-  // Auto-sync Google Sheet Row numbers every 15 seconds so if any row is deleted in Google Sheets, Row numbers update automatically!
   setInterval(() => {
     if (googleAuthReady) {
       syncLiveSheetRowNumbers().catch(() => {});
