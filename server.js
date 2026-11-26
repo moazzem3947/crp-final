@@ -4917,22 +4917,8 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
     return;
   }
 
+  // STRICT ADMIN-ONLY DELIVERY: Never send unknown DA or wrong product prompts to any WhatsApp group or non-admin!
   const sentToJids = new Set();
-  const senderNormPhone = normalizeBdPhone(item.senderPhone || '');
-
-  if (item.originRemoteJid) {
-    const sentOrigin = await safeSendMessage(
-      item.originRemoteJid,
-      { text: promptText },
-      item.originMsg ? { quoted: item.originMsg } : undefined
-    );
-    if (sentOrigin?.key?.id) {
-      pendingQuestionMsgIdMap.set(sentOrigin.key.id, item.token);
-    }
-    sentToJids.add(item.originRemoteJid);
-    addLog(`📲 Sent prompt [${item.token}] in origin chat (${item.originRemoteJid})`);
-  }
-
   const adminPhones = getAdminAlertPhones();
   for (const ph of adminPhones) {
     const normPh = normalizeBdPhone(ph);
@@ -4940,20 +4926,12 @@ async function sendInteractivePromptToAdminAndOrigin(item, promptText) {
     const dmJid = `${normPh}@s.whatsapp.net`;
     if (sentToJids.has(dmJid)) continue;
 
-    const originRaw = (item.originRemoteJid || '').split('@')[0].split(':')[0];
-    if (lidToPhoneMap.get(originRaw) === normPh || normalizeBdPhone(originRaw) === normPh) {
-      continue;
-    }
-    if (item.originRemoteJid && senderNormPhone === normPh) {
-      continue;
-    }
-
     const sentDm = await safeSendMessage(dmJid, { text: promptText });
     if (sentDm?.key?.id) {
       pendingQuestionMsgIdMap.set(sentDm.key.id, item.token);
     }
     sentToJids.add(dmJid);
-    addLog(`📲 Sent prompt [${item.token}] to Admin DM +${normPh}`);
+    addLog(`📲 Sent prompt [${item.token}] strictly to Admin DM +${normPh} (Group muted)`);
   }
 }
 
@@ -5874,7 +5852,15 @@ async function startWhatsApp() {
 
               if (sock && resOut?.message) {
                 try {
-                  const sentConfirm = await safeSendMessage(remoteJid, { text: resOut.message }, { quoted: msg });
+                  // Only reply directly in private Admin DM — NEVER post resolution messages in any WhatsApp group!
+                  const replyTargetJid = remoteJid.endsWith('@g.us')
+                    ? `${normalizeBdPhone(getAdminAlertPhones()[0] || '8801793362829')}@s.whatsapp.net`
+                    : remoteJid;
+                  const sentConfirm = await safeSendMessage(
+                    replyTargetJid,
+                    { text: resOut.message },
+                    !remoteJid.endsWith('@g.us') ? { quoted: msg } : undefined
+                  );
                   if (sentConfirm?.key?.id) {
                     if (resOut.needsMoreInput && resOut.nextPromptToken) {
                       pendingQuestionMsgIdMap.set(sentConfirm.key.id, resOut.nextPromptToken);
@@ -5882,15 +5868,13 @@ async function startWhatsApp() {
                       cancellableOrderMap.set(sentConfirm.key.id, pItem.whatsappMsgId);
                     }
                   }
-                  if (!resOut.needsMoreInput && resOut.ok && pItem?.originRemoteJid && pItem.originRemoteJid !== remoteJid) {
-                    const sentGrp = await safeSendMessage(
-                      pItem.originRemoteJid,
-                      { text: resOut.message },
-                      pItem.originMsg ? { quoted: pItem.originMsg } : undefined
-                    );
-                    if (sentGrp?.key?.id && pItem?.whatsappMsgId) {
-                      cancellableOrderMap.set(sentGrp.key.id, pItem.whatsappMsgId);
-                    }
+                  // Silently react ✅ on the original group message when saved (no text sent to the group)
+                  if (!resOut.needsMoreInput && resOut.ok && botConfig.autoReactOnOrder && pItem?.originRemoteJid && pItem?.originMsg?.key) {
+                    try {
+                      await sock.sendMessage(pItem.originRemoteJid, {
+                        react: { text: '✅', key: pItem.originMsg.key }
+                      });
+                    } catch (e) {}
                   }
                 } catch (e) {}
               }
